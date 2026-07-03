@@ -1,8 +1,25 @@
 import * as THREE from 'three';
-import { JOINTS, JOINT_BY_NAME, DEG, clampAngle } from './skeletonDef.js';
+import {
+  JOINTS, JOINT_BY_NAME, DEG, clampAngle, FOOT_CORNERS_L, FOOT_CORNERS_R,
+} from './skeletonDef.js';
 import { buildSkeleton, buildMuscles } from './anatomy.js';
 
 const Y_AXIS = new THREE.Vector3(0, 1, 0);
+const _floorPt = new THREE.Vector3();
+
+// Flesh clearance around each joint (fraction of height) used for floor
+// contact; the foot soles are handled separately via FOOT_CORNERS.
+const FLOOR_CLEARANCE = {
+  head: 0.055, headTop: 0.01, neck: 0.04,
+  pelvis: 0.075, spine: 0.08, chest: 0.08,
+  shoulder_L: 0.045, shoulder_R: 0.045,
+  elbow_L: 0.03, elbow_R: 0.03,
+  wrist_L: 0.025, wrist_R: 0.025,
+  hand_L: 0.012, hand_R: 0.012,
+  hip_L: 0.055, hip_R: 0.055,
+  knee_L: 0.042, knee_R: 0.042,
+  toe_L: 0.004, toe_R: 0.004,
+};
 
 // Body-view capsule radii per segment (fractions of height).
 const BODY_RADII = {
@@ -245,6 +262,42 @@ export class Figure {
 
   worldPos(jointName, target = new THREE.Vector3()) {
     return this.nodes[jointName].getWorldPosition(target);
+  }
+
+  // Lowest floor-relevant point of the body: foot sole corners plus every
+  // joint padded by its flesh clearance.
+  lowestPointY() {
+    this.group.updateMatrixWorld(true);
+    const H = this.height;
+    let minY = Infinity;
+    for (const [ankle, corners] of [['ankle_L', FOOT_CORNERS_L], ['ankle_R', FOOT_CORNERS_R]]) {
+      const node = this.nodes[ankle];
+      for (const [x, y, z] of corners) {
+        _floorPt.set(x * H, y * H, z * H);
+        node.localToWorld(_floorPt);
+        if (_floorPt.y < minY) minY = _floorPt.y;
+      }
+    }
+    for (const def of JOINTS) {
+      this.nodes[def.name].getWorldPosition(_floorPt);
+      const y = _floorPt.y - (FLOOR_CLEARANCE[def.name] ?? 0.02) * H;
+      if (y < minY) minY = y;
+    }
+    return minY;
+  }
+
+  // Keep the body out of the floor: lift the root if anything is below it,
+  // and settle back down only by undoing a previous lift (group.position.y
+  // is 0 unless collision or a closed-chain edit moved it).
+  clampToFloor() {
+    const minY = this.lowestPointY();
+    if (minY < -1e-4) {
+      this.group.position.y -= minY;
+      this.group.updateMatrixWorld(true);
+    } else if (this.group.position.y > 1e-4 && minY > 1e-4) {
+      this.group.position.y -= Math.min(minY, this.group.position.y);
+      this.group.updateMatrixWorld(true);
+    }
   }
 
   setHeight(h) {

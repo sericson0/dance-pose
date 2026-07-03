@@ -35,6 +35,15 @@ export function initUI(app) {
     });
   }
 
+  // ---------------------------------------------------------------- tools
+  const undoBtn = $('undo-btn');
+  undoBtn.addEventListener('click', () => app.undo());
+  $('ground-btn').addEventListener('click', () => app.groundFeet());
+  $('link-couple').addEventListener('change', (e) => { app.linkCouple = e.target.checked; });
+  for (const btn of document.querySelectorAll('#view-buttons button')) {
+    btn.addEventListener('click', () => app.setView(btn.dataset.view));
+  }
+
   // ---------------------------------------------------------------- layers
   const syncLayers = () => {
     const layers = {
@@ -88,6 +97,8 @@ export function initUI(app) {
         <div class="range-hint"><span>${min}°</span><span>${max}°</span></div>`;
       const input = row.querySelector('input');
       const valEl = row.querySelector('.val');
+      input.addEventListener('pointerdown', () => app.pushHistory());
+      input.addEventListener('focus', () => app.pushHistory());
       input.addEventListener('input', () => {
         app.editJoint(figure, jointName, () => { node.rotation[axis] = Number(input.value) * D2R; });
         valEl.textContent = `${(node.rotation[axis] * R2D).toFixed(0)}°`;
@@ -108,6 +119,8 @@ export function initUI(app) {
         <div class="range-hint"><span>low</span><span>tall</span></div>`;
       const input = row.querySelector('input');
       const valEl = row.querySelector('.val');
+      input.addEventListener('pointerdown', () => app.pushHistory());
+      input.addEventListener('focus', () => app.pushHistory());
       input.addEventListener('input', () => {
         app.editJoint(figure, jointName, () => { node.position.y = Number(input.value) / 100; });
         valEl.textContent = `${Number(input.value).toFixed(0)} cm`;
@@ -118,6 +131,7 @@ export function initUI(app) {
     const reset = document.createElement('button');
     reset.textContent = 'Reset this joint';
     reset.addEventListener('click', () => {
+      app.pushHistory();
       app.editJoint(figure, jointName, () => {
         node.rotation.set(0, 0, 0);
         if (jointName === 'pelvis') node.position.y = 0.53 * figure.height;
@@ -229,8 +243,13 @@ export function initUI(app) {
 
   $('snap-a').addEventListener('click', () => takeSnapshot('A'));
   $('snap-b').addEventListener('click', () => takeSnapshot('B'));
-  $('recall-a').addEventListener('click', () => snaps.A && app.applyCoupleState(snaps.A));
-  $('recall-b').addEventListener('click', () => snaps.B && app.applyCoupleState(snaps.B));
+  const recallSnap = (which) => {
+    if (!snaps[which]) return;
+    app.pushHistory();
+    app.applyCoupleState(snaps[which]);
+  };
+  $('recall-a').addEventListener('click', () => recallSnap('A'));
+  $('recall-b').addEventListener('click', () => recallSnap('B'));
 
   // ---------------------------------------------------------------- presets
   const presetSelect = $('preset-select');
@@ -267,7 +286,10 @@ export function initUI(app) {
       row.innerHTML = `<span class="name">${name}</span>`;
       const load = document.createElement('button');
       load.textContent = 'Load';
-      load.addEventListener('click', () => app.applyCoupleState(lib[name]));
+      load.addEventListener('click', () => {
+        app.pushHistory();
+        app.applyCoupleState(lib[name]);
+      });
       const del = document.createElement('button');
       del.textContent = '✕';
       del.title = 'Delete';
@@ -306,6 +328,7 @@ export function initUI(app) {
     try {
       const state = JSON.parse(await file.text());
       if (!state.figures) throw new Error('not a pose file');
+      app.pushHistory();
       app.applyCoupleState(state);
       const lib = loadLibrary();
       lib[state.name || file.name.replace(/\.json$/i, '')] = state;
@@ -348,6 +371,9 @@ export function initUI(app) {
     onSelectionChanged: renderJointPanel,
     onPoseChanged() {
       renderJointPanel();
+    },
+    onHistoryChanged() {
+      undoBtn.disabled = app.history.length === 0;
     },
     refreshJointValues,
     updateStats,

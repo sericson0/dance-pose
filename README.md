@@ -25,9 +25,13 @@ hosted anywhere (or opened via `npm run preview`).
 | Rotate a joint | **Rotate joints** mode → click a joint → drag the rings, or use the sliders in the panel |
 | Pose a whole limb | **Drag hand/foot** mode → click a hand or foot → drag the target; the arm/leg follows with natural elbow/knee bend |
 | Move / turn a dancer | **Move figure** / **Turn figure** modes → click a dancer → drag |
+| Move the couple as one | tick **Move as couple** in the top bar, then Move/Turn either dancer — the partner follows, the embrace turns as a unit |
+| Undo a change | **↩ Undo** button or `Ctrl+Z` (works for gizmo drags, sliders, presets, loads) |
+| Re-ground the feet | **Feet to floor** button — drops the shown dancers' feet back to the floor, soles flat |
 | Crouch / rise | select the pelvis → "Hip height" slider |
 | Show one or both | top bar **Both / Leader / Follower** |
 | Change views | View section: Skeleton / Body / Muscles (any combination) |
+| Camera angles | View section: **Front / Side / Top / ¾ view** buttons |
 | Compare two poses | pose → **Set A** → change the pose → **Set B**; the table lists every joint change ≥ 3° |
 | Save & share poses | Poses section: save to the browser, or Export/Import `.json` files |
 
@@ -35,6 +39,16 @@ Every joint respects a simplified anatomical range of motion — the knee is a
 pure hinge, the hip and shoulder are ball joints with realistic limits, the
 spine bends across three segments. You cannot put a figure into an impossible
 position with either the gizmo or the sliders.
+
+### The floor is solid
+
+No body part can go below the wooden floor: if an edit would push a foot (or a
+hand, or the head) through it, the whole dancer is lifted just enough to stay
+on top, and settles back down when the pose allows. Feet are otherwise free —
+they can point, rise to demi-pointe (point both ankles while standing and the
+dancer rises onto the toes), or lift off entirely for boleos and ganchos.
+Nothing forces a foot onto the floor except the explicit **Feet to floor**
+button.
 
 ### Open vs. closed kinetic chain
 
@@ -89,7 +103,8 @@ body part, muscle, bone, joint limit, or movement without touching the rest:
 - `src/ik.js` — analytic two-bone IK (open-chain limb dragging) and the
   closed-chain anchor math (`editWithAnchor`, `pinAnchor`); feet-to-floor helper.
 - `src/analysis.js` — COG, foot contacts, convex hull, stability margin, key angles.
-- `src/presets.js` — starting poses (embrace, walk, apilado, dissociation).
+- `src/presets.js` — starting poses (embrace, walk, apilado, cruzada,
+  forward ocho, dissociation).
 - `src/main.js` — scene, picking, gizmos, interaction modes, balance visuals.
 - `src/ui.js` — side panel: sliders, stats, A/B compare, pose library.
 

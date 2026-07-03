@@ -28,6 +28,13 @@
         <button data-show="leader">Leader</button>
         <button data-show="follower">Follower</button>
       </div>
+      <div class="btn-group">
+        <button id="undo-btn" disabled title="Undo the last pose change (Ctrl+Z)">↩ Undo</button>
+        <button id="ground-btn" title="Drop the shown dancers' feet back onto the floor, soles flat">Feet to floor</button>
+      </div>
+      <label class="topbar-check" title="In Move/Turn mode, drag one dancer and the partner follows — the embrace moves as one unit">
+        <input type="checkbox" id="link-couple" /> Move as couple
+      </label>
     </header>
 
     <aside id="sidebar">
@@ -44,6 +51,12 @@
         </div>
         <div class="check-row">
           <label><input type="checkbox" id="show-couple-cog" checked /> Couple COG</label>
+        </div>
+        <div class="btn-row" id="view-buttons">
+          <button data-view="front" title="Look along the line of dance">Front</button>
+          <button data-view="side" title="Profile view — read posture and lean">Side</button>
+          <button data-view="top" title="Bird's eye — read foot placement and hip/shoulder rotation">Top</button>
+          <button data-view="three" title="Default ¾ view">¾ view</button>
         </div>
       </section>
 

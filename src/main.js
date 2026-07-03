@@ -3,7 +3,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { Figure } from './figure.js';
 import { IK_CHAINS, JOINT_BY_NAME, ANCHOR_FOR } from './skeletonDef.js';
-import { solveTwoBone, editWithAnchor, pinAnchor } from './ik.js';
+import { solveTwoBone, editWithAnchor, pinAnchor, feetToFloor } from './ik.js';
 import { balanceReport, coupleReport } from './analysis.js';
 import { PRESETS } from './presets.js';
 import { initUI } from './ui.js';
@@ -43,16 +43,75 @@ sun.shadow.camera.near = 0.5; sun.shadow.camera.far = 12;
 sun.shadow.bias = -0.0004;
 scene.add(sun);
 
+// Wooden dance floor: procedural plank texture drawn once on a canvas.
+function makeWoodTexture(size = 1024, planks = 16) {
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  let seed = 9;
+  const rand = () => { // deterministic so the floor looks the same every load
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return seed / 2147483648;
+  };
+  const plankH = size / planks;
+  for (let row = 0; row < planks; row++) {
+    const y = row * plankH;
+    let x = -rand() * size * 0.5; // stagger the butt joints per row
+    while (x < size) {
+      const len = size * (0.45 + rand() * 0.45);
+      const light = 33 + rand() * 7;
+      const hue = 25 + rand() * 6;
+      ctx.fillStyle = `hsl(${hue}, ${36 + rand() * 8}%, ${light}%)`;
+      ctx.fillRect(x, y, len, plankH);
+      // Grain: faint darker streaks running along the plank.
+      for (let g = 0; g < 14; g++) {
+        const gy = y + rand() * plankH;
+        ctx.strokeStyle = `hsla(${hue - 4}, 45%, ${light - 6 - rand() * 8}%, ${0.10 + rand() * 0.14})`;
+        ctx.lineWidth = 0.5 + rand() * 1.2;
+        ctx.beginPath();
+        ctx.moveTo(x, gy);
+        const wob = 2 + rand() * 4;
+        ctx.bezierCurveTo(
+          x + len * 0.33, gy + (rand() - 0.5) * wob,
+          x + len * 0.66, gy + (rand() - 0.5) * wob,
+          x + len, gy + (rand() - 0.5) * wob,
+        );
+        ctx.stroke();
+      }
+      // Occasional knot.
+      if (rand() < 0.2) {
+        const kx = x + len * (0.2 + rand() * 0.6);
+        const ky = y + plankH * (0.25 + rand() * 0.5);
+        ctx.fillStyle = `hsla(${hue - 6}, 40%, ${light - 14}%, 0.45)`;
+        ctx.beginPath();
+        ctx.ellipse(kx, ky, 2 + rand() * 4, 1.5 + rand() * 2.5, rand() * Math.PI, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      // Butt-joint seam at the end of the board.
+      ctx.fillStyle = 'rgba(28, 16, 8, 0.8)';
+      ctx.fillRect(x + len - 1, y, 2, plankH);
+      x += len;
+    }
+    // Long seam between plank rows.
+    ctx.fillStyle = 'rgba(28, 16, 8, 0.85)';
+    ctx.fillRect(0, y - 0.75, size, 1.5);
+  }
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return tex;
+}
+
+const woodTex = makeWoodTexture();
+woodTex.repeat.set(2, 2); // 8 m diameter → ~25 cm boards
 const floor = new THREE.Mesh(
-  new THREE.CircleGeometry(4, 48),
-  new THREE.MeshStandardMaterial({ color: 0x262a33, roughness: 0.95 }),
+  new THREE.CircleGeometry(4, 64),
+  new THREE.MeshStandardMaterial({ map: woodTex, roughness: 0.4, metalness: 0.05 }),
 );
 floor.rotation.x = -Math.PI / 2;
 floor.receiveShadow = true;
 scene.add(floor);
-const grid = new THREE.GridHelper(8, 32, 0x3a4150, 0x2a2f3a);
-grid.position.y = 0.001;
-scene.add(grid);
 
 // ---------------------------------------------------------------- figures
 const leader = new Figure({ name: 'Leader', height: 1.78, mass: 75, color: 0x4d8fd1 });
@@ -148,7 +207,36 @@ const app = {
   selected: null, // { figure, jointName }
   ikState: null, // { figure, chain }
   ckc: null, // { node, matrix } captured while dragging in closed-chain mode
+  linkCouple: false, // move/turn drags both dancers as one unit
+  coupleDrag: null, // start transforms captured while dragging a linked couple
+  figDragY: null, // root height captured when a figure drag starts
+  history: [], // undo stack of serialized couple states
   ui: null,
+
+  // Undo: call before any change; Ctrl+Z / the Undo button walks back.
+  pushHistory() {
+    const s = JSON.stringify(this.getCoupleState('undo'));
+    if (this.history[this.history.length - 1] === s) return;
+    this.history.push(s);
+    if (this.history.length > 60) this.history.shift();
+    if (this.ui) this.ui.onHistoryChanged();
+  },
+
+  undo() {
+    const s = this.history.pop();
+    if (s) this.applyCoupleState(JSON.parse(s));
+    if (this.ui) this.ui.onHistoryChanged();
+  },
+
+  // Drop the shown dancers' feet back onto the floor, soles flat.
+  groundFeet() {
+    this.pushHistory();
+    for (const f of this.visibleFigures()) {
+      feetToFloor(f);
+      f.clampToFloor();
+    }
+    if (this.ui) this.ui.onPoseChanged();
+  },
 
   setMode(mode) {
     this.mode = mode;
@@ -183,6 +271,20 @@ const app = {
       figure.clampJoint(jointName);
       figure.group.updateMatrixWorld(true);
     }
+  },
+
+  // Standard teaching camera angles.
+  setView(name) {
+    const views = {
+      front: [0, 1.35, 3.4],
+      side: [3.4, 1.35, 0],
+      top: [0, 4.6, 0.6],
+      three: [1.9, 1.5, 2.7],
+    };
+    const p = views[name];
+    if (!p) return;
+    camera.position.set(...p);
+    orbit.target.set(0, name === 'top' ? 0 : 1.05, 0);
   },
 
   // Show 'both' | 'leader' | 'follower'.
@@ -261,6 +363,7 @@ const app = {
   applyPreset(index) {
     const preset = PRESETS[index];
     if (!preset) return;
+    this.pushHistory();
     this.deselect();
     preset.apply(leader, follower);
     if (this.ui) this.ui.onPoseChanged();
@@ -294,10 +397,15 @@ const app = {
   },
 };
 
-// When a closed-chain drag begins, remember where the anchor is so we can pin
-// it back each frame.
+// When a drag begins: snapshot for undo, remember the closed-chain anchor so
+// we can pin it back each frame, and capture start transforms for a linked
+// couple drag.
 tcontrols.addEventListener('dragging-changed', (e) => {
-  if (!e.value) { app.ckc = null; return; }
+  if (!e.value) { app.ckc = null; app.coupleDrag = null; app.figDragY = null; return; }
+  app.pushHistory();
+  if (!app.selected && tcontrols.object?.userData.figure) {
+    app.figDragY = tcontrols.object.position.y;
+  }
   if (app.selected && !app.ikState && app.chainMode === 'closed') {
     const node = app.anchorNode(app.selected.figure, app.selected.jointName);
     if (node) {
@@ -305,17 +413,47 @@ tcontrols.addEventListener('dragging-changed', (e) => {
       app.ckc = { figure: app.selected.figure, node, matrix: node.matrixWorld.clone() };
     }
   }
+  if (app.linkCouple && !app.selected && tcontrols.object?.userData.figure) {
+    const dragged = tcontrols.object.userData.figure;
+    const other = app.figures.find((f) => f !== dragged);
+    app.coupleDrag = {
+      dragged, other,
+      draggedPos: dragged.group.position.clone(),
+      draggedYaw: dragged.group.rotation.y,
+      otherPos: other.group.position.clone(),
+      otherYaw: other.group.rotation.y,
+    };
+  }
 });
+
+const _yAxis = new THREE.Vector3(0, 1, 0);
 
 tcontrols.addEventListener('objectChange', () => {
   if (app.ikState) {
+    // Keep the IK target where the limb can reach without going underground.
+    const H = app.ikState.figure.height;
+    const minY = app.ikState.chain.effector.startsWith('ankle') ? 0.039 * H : 0.115 * H;
+    if (ikTarget.position.y < minY) ikTarget.position.y = minY;
     solveTwoBone(app.ikState.figure, app.ikState.chain, ikTarget.position);
   } else if (app.selected) {
     app.selected.figure.clampJoint(app.selected.jointName);
     if (app.ckc) pinAnchor(app.ckc.figure, app.ckc.node, app.ckc.matrix);
     if (app.ui) app.ui.refreshJointValues();
   } else if (tcontrols.object) {
-    tcontrols.object.position.y = 0; // figures stay on the floor
+    // Figures stay at their drag-start height (usually the floor).
+    if (app.figDragY !== null) tcontrols.object.position.y = app.figDragY;
+    if (app.coupleDrag) {
+      // Mirror the drag onto the partner: same translation, and rotation
+      // about the dragged dancer so the embrace turns as one unit.
+      const { dragged, other, draggedPos, draggedYaw, otherPos, otherYaw } = app.coupleDrag;
+      const dYaw = dragged.group.rotation.y - draggedYaw;
+      const rel = otherPos.clone().sub(draggedPos).applyAxisAngle(_yAxis, dYaw);
+      other.group.position.copy(draggedPos).add(rel);
+      other.group.position.x += dragged.group.position.x - draggedPos.x;
+      other.group.position.z += dragged.group.position.z - draggedPos.z;
+      other.group.position.y = otherPos.y;
+      other.group.rotation.y = otherYaw + dYaw;
+    }
   }
 });
 
@@ -366,6 +504,8 @@ function handleClick(e) {
 // ---------------------------------------------------------------- UI + loop
 app.ui = initUI(app);
 app.applyPreset(1); // start in the close embrace
+app.history.length = 0; // the pre-preset construction state is not a useful undo target
+app.ui.onHistoryChanged();
 
 const clock = new THREE.Clock();
 let statsTimer = 0;
@@ -382,6 +522,11 @@ function animate() {
   requestAnimationFrame(animate);
   const dt = clock.getDelta();
   orbit.update();
+
+  // Floor collision: no body part may end up below the dance floor,
+  // whatever edit produced the pose (gizmo, slider, IK, preset, import).
+  leader.clampToFloor();
+  follower.clampToFloor();
 
   const both = leader.group.visible && follower.group.visible;
   const rA = leader.group.visible ? balanceReport(leader) : null;
@@ -409,6 +554,15 @@ app.setViz = (flags) => {
 };
 app.setVisibleFiguresRefresh = applyVizVisibility;
 app.setViz(vizFlags);
+
+window.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA') && t.type !== 'range') return;
+    e.preventDefault();
+    app.undo();
+  }
+});
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
