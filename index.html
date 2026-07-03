@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tango Pose Studio</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💃</text></svg>" />
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="viewport"></div>
+
+    <header id="topbar">
+      <h1>Tango Pose Studio</h1>
+      <div id="mode-buttons" class="btn-group">
+        <button data-mode="rotate" class="active" title="Click a joint, then drag the rings to rotate it (within anatomical limits)">Rotate joints</button>
+        <button data-mode="ik" title="Click a hand or foot, then drag the target to pose the whole limb">Drag hand/foot</button>
+        <button data-mode="move" title="Click a figure, then drag to move it on the floor">Move figure</button>
+        <button data-mode="turn" title="Click a figure, then drag the ring to turn it">Turn figure</button>
+      </div>
+    </header>
+
+    <aside id="sidebar">
+      <section>
+        <h2>View</h2>
+        <div class="check-row">
+          <label><input type="checkbox" id="layer-skeleton" /> Skeleton</label>
+          <label><input type="checkbox" id="layer-body" checked /> Body</label>
+          <label><input type="checkbox" id="layer-muscle" /> Muscles</label>
+        </div>
+        <div class="check-row">
+          <label><input type="checkbox" id="show-cog" checked /> Center of gravity</label>
+          <label><input type="checkbox" id="show-support" checked /> Support base</label>
+        </div>
+        <div class="check-row">
+          <label><input type="checkbox" id="show-couple-cog" checked /> Couple COG</label>
+        </div>
+      </section>
+
+      <section id="joint-section">
+        <h2>Selected joint</h2>
+        <div id="joint-panel" class="muted">Click a joint on a figure to select it.</div>
+      </section>
+
+      <section>
+        <h2>Balance &amp; angles</h2>
+        <div id="stats-panel"></div>
+      </section>
+
+      <section>
+        <h2>Compare poses</h2>
+        <div class="btn-row">
+          <button id="snap-a">Set A</button>
+          <button id="snap-b">Set B</button>
+          <button id="recall-a" disabled>Show A</button>
+          <button id="recall-b" disabled>Show B</button>
+        </div>
+        <div id="compare-panel" class="muted">Snapshot two poses to see joint-angle and COG changes.</div>
+      </section>
+
+      <section>
+        <h2>Poses</h2>
+        <div class="row">
+          <select id="preset-select"></select>
+          <button id="preset-apply">Apply</button>
+        </div>
+        <div class="row">
+          <input type="text" id="pose-name" placeholder="Pose name…" />
+          <button id="pose-save">Save</button>
+        </div>
+        <div id="pose-list"></div>
+        <div class="btn-row">
+          <button id="pose-export">Export file</button>
+          <button id="pose-import">Import file</button>
+          <input type="file" id="pose-file" accept=".json" hidden />
+        </div>
+      </section>
+
+      <section>
+        <h2>Dancers</h2>
+        <div id="figure-config"></div>
+      </section>
+    </aside>
+
+    <div id="hint">Click a joint to select · drag the gizmo to pose · right-drag to orbit · scroll to zoom</div>
+  </div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
