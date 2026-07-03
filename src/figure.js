@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import {
   JOINTS, JOINT_BY_NAME, DEG, clampAngle, FOOT_CORNERS_L, FOOT_CORNERS_R,
+  PART_OF_NODE,
 } from './skeletonDef.js';
 import { buildSkeleton, buildMuscles } from './anatomy.js';
 
@@ -184,6 +185,52 @@ export class Figure {
     return mesh;
   }
 
+  // ------------------------------------------------------------- highlight
+  // Highlight the given body parts (Set of BODY_PARTS ids): their meshes get
+  // an emissive glow, everything else goes ghost-translucent. Works on every
+  // layer because materials are swapped per mesh, not per layer.
+
+  #highlightVariant(base, kind) {
+    this._hlCache ??= new Map();
+    let pair = this._hlCache.get(base);
+    if (!pair) {
+      const lit = base.clone();
+      lit.emissive = new THREE.Color(0xcc8a22);
+      lit.emissiveIntensity = 0.45;
+      lit.transparent = false;
+      lit.opacity = 1;
+      const dim = base.clone();
+      dim.transparent = true;
+      dim.opacity = 0.13;
+      dim.depthWrite = false;
+      pair = { lit, dim };
+      this._hlCache.set(base, pair);
+    }
+    return pair[kind];
+  }
+
+  setHighlight(parts) {
+    this.highlightParts = parts && parts.size ? new Set(parts) : null;
+    this.#applyHighlight();
+  }
+
+  #applyHighlight() {
+    const parts = this.highlightParts;
+    this.group.traverse((o) => {
+      if (!o.isMesh || o.userData.isPick) return;
+      o.userData.baseMaterial ??= o.material;
+      const base = o.userData.baseMaterial;
+      if (!parts) {
+        o.material = base;
+        return;
+      }
+      let n = o;
+      while (n && n.userData.jointName === undefined) n = n.parent;
+      const part = n ? PART_OF_NODE[n.userData.jointName] : null;
+      o.material = this.#highlightVariant(base, parts.has(part) ? 'lit' : 'dim');
+    });
+  }
+
   setLayers({ skeleton, body, muscle }) {
     this.layers = { skeleton, body, muscle };
     for (const m of this.layerMeshes.skeleton) m.visible = skeleton;
@@ -312,6 +359,7 @@ export class Figure {
     this.#build();
     this.setPose(pose);
     this.setLayers(layers);
+    this.#applyHighlight();
   }
 
   dispose() {

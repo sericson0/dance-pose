@@ -83,6 +83,13 @@ button:hover { border-color: var(--accent); }
 button:disabled { opacity: 0.45; cursor: default; }
 button:disabled:hover { border-color: var(--border); }
 
+/* Highlight chips */
+.chip-row { display: flex; gap: 5px; flex-wrap: wrap; margin-bottom: 8px; }
+.chip {
+  padding: 4px 9px; font-size: 11.5px; border-radius: 12px;
+}
+.chip.active { background: #8a6215; border-color: #c9962e; color: #fff; }
+
 /* Joint panel */
 .joint-title { font-weight: 600; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
 .joint-title .fig-tag { font-size: 11px; padding: 2px 8px; border-radius: 10px; color: #fff; }

@@ -247,6 +247,12 @@ const app = {
     this.chainMode = mode;
   },
 
+  // Highlight body parts (Set of BODY_PARTS ids, empty/null clears).
+  setHighlight(parts) {
+    this.highlightParts = parts;
+    for (const f of this.figures) f.setHighlight(parts);
+  },
+
   // The distal node kept fixed when `jointName` is edited in closed-chain mode,
   // or null if this joint has no grounded anchor.
   anchorNode(figure, jointName) {

@@ -243,14 +243,22 @@ const MUSCLES_LEFT = [
   { node: 'hip_L', pa: [0.03, -0.03, 0.02], pb: [0.016, -0.20, 0.024], r: 0.024, name: 'Vastus lateralis' },
   { node: 'hip_L', pa: [-0.02, -0.05, 0.018], pb: [-0.006, -0.20, 0.024], r: 0.02, name: 'Vastus medialis' },
   { node: 'hip_L', pa: [0.004, -0.03, -0.03], pb: [0.002, -0.215, -0.024], r: 0.03, name: 'Hamstrings' },
-  { node: 'hip_L', pa: [0.012, 0.012, -0.032], pb: [0.004, -0.06, -0.03], r: 0.05, name: 'Gluteus maximus' },
+  // Glute max: sacrum/posterior ilium (above the joint) down-and-out to the
+  // gluteal tuberosity about a third of the way down the femur.
+  { node: 'hip_L', pa: [0.006, 0.025, -0.038], pb: [0.014, -0.085, -0.022], r: 0.042, name: 'Gluteus maximus' },
+  // Glute med: lateral hip stabiliser, iliac crest to greater trochanter.
+  { node: 'hip_L', pa: [0.030, 0.028, -0.006], pb: [0.033, -0.028, -0.004], r: 0.021, name: 'Gluteus medius' },
+  // Iliopsoas: crosses the front of the hip to the lesser trochanter (medial).
+  { node: 'hip_L', pa: [0.004, 0.030, 0.018], pb: [-0.002, -0.045, 0.030], r: 0.016, name: 'Iliopsoas' },
   { node: 'hip_L', pa: [-0.018, -0.02, 0.0], pb: [-0.006, -0.18, 0.008], r: 0.024, name: 'Adductors' },
   { node: 'hip_L', pa: [0.028, -0.01, 0.026], pb: [-0.012, -0.2, 0.014], r: 0.011, name: 'Sartorius' },
-  // Shank.
-  { node: 'knee_L', pa: [0.014, -0.02, -0.028], pb: [0.01, -0.12, -0.02], r: 0.026, name: 'Gastrocnemius (lat)' },
-  { node: 'knee_L', pa: [-0.014, -0.02, -0.028], pb: [-0.01, -0.12, -0.02], r: 0.026, name: 'Gastrocnemius (med)' },
-  { node: 'knee_L', pa: [0.0, -0.06, -0.025], pb: [0.0, -0.17, -0.016], r: 0.02, name: 'Soleus' },
-  { node: 'knee_L', pa: [0.012, -0.03, 0.022], pb: [0.006, -0.18, 0.014], r: 0.014, name: 'Tibialis anterior' },
+  // Shank. Gastroc heads originate on the femoral condyles (knee level);
+  // soleus runs on toward the Achilles.
+  { node: 'knee_L', pa: [0.014, -0.004, -0.028], pb: [0.01, -0.12, -0.02], r: 0.026, name: 'Gastrocnemius (lat)' },
+  { node: 'knee_L', pa: [-0.014, -0.004, -0.028], pb: [-0.01, -0.12, -0.02], r: 0.026, name: 'Gastrocnemius (med)' },
+  { node: 'knee_L', pa: [0.0, -0.06, -0.025], pb: [0.0, -0.195, -0.02], r: 0.02, name: 'Soleus' },
+  // Tib ant: lateral upper tibia, crossing to insert at the medial ankle.
+  { node: 'knee_L', pa: [0.012, -0.03, 0.022], pb: [-0.004, -0.19, 0.016], r: 0.014, name: 'Tibialis anterior' },
   // Upper arm.
   { node: 'shoulder_L', pa: [0.016, 0.014, 0], pb: [0.006, -0.06, 0], r: 0.032, name: 'Deltoid' },
   { node: 'shoulder_L', pa: [0.004, -0.05, 0.02], pb: [0.002, -0.16, 0.014], r: 0.022, name: 'Biceps' },
@@ -266,16 +274,22 @@ const MUSCLES_CENTER = [
   { node: 'chest', pa: [-0.085, 0.09, 0.04], pb: [-0.012, 0.055, 0.055], r: 0.03, name: 'Pectoralis R' },
   { node: 'chest', pa: [0.05, 0.12, -0.03], pb: [0.01, 0.02, -0.03], r: 0.026, name: 'Trapezius L' },
   { node: 'chest', pa: [-0.05, 0.12, -0.03], pb: [-0.01, 0.02, -0.03], r: 0.026, name: 'Trapezius R' },
-  { node: 'chest', pa: [0.07, 0.0, -0.02], pb: [0.02, -0.12, 0.0], r: 0.024, name: 'Latissimus L' },
-  { node: 'chest', pa: [-0.07, 0.0, -0.02], pb: [-0.02, -0.12, 0.0], r: 0.024, name: 'Latissimus R' },
-  { node: 'spine', pa: [0.02, 0.0, 0.05], pb: [0.02, 0.095, 0.048], r: 0.022, name: 'Rectus abdominis L' },
-  { node: 'spine', pa: [-0.02, 0.0, 0.05], pb: [-0.02, 0.095, 0.048], r: 0.022, name: 'Rectus abdominis R' },
+  // Lats sweep from the armpit down to the thoracolumbar fascia — they stay
+  // on the back, so the lower end keeps a negative z.
+  { node: 'chest', pa: [0.07, 0.0, -0.02], pb: [0.02, -0.12, -0.028], r: 0.024, name: 'Latissimus L' },
+  { node: 'chest', pa: [-0.07, 0.0, -0.02], pb: [-0.02, -0.12, -0.028], r: 0.024, name: 'Latissimus R' },
+  // Rectus abdominis runs pubis → ribs; start below the spine node to reach
+  // toward the pubic attachment.
+  { node: 'spine', pa: [0.02, -0.04, 0.05], pb: [0.02, 0.095, 0.048], r: 0.022, name: 'Rectus abdominis L' },
+  { node: 'spine', pa: [-0.02, -0.04, 0.05], pb: [-0.02, 0.095, 0.048], r: 0.022, name: 'Rectus abdominis R' },
   { node: 'spine', pa: [0.05, 0.005, 0.014], pb: [0.038, 0.085, 0.032], r: 0.02, name: 'Obliques L' },
   { node: 'spine', pa: [-0.05, 0.005, 0.014], pb: [-0.038, 0.085, 0.032], r: 0.02, name: 'Obliques R' },
   { node: 'spine', pa: [0.02, 0.0, -0.046], pb: [0.02, 0.095, -0.046], r: 0.017, name: 'Erector spinae L' },
   { node: 'spine', pa: [-0.02, 0.0, -0.046], pb: [-0.02, 0.095, -0.046], r: 0.017, name: 'Erector spinae R' },
-  { node: 'neck', pa: [0.02, 0.005, 0.03], pb: [0.04, 0.09, -0.01], r: 0.012, name: 'Sternocleidomastoid L' },
-  { node: 'neck', pa: [-0.02, 0.005, 0.03], pb: [-0.04, 0.09, -0.01], r: 0.012, name: 'Sternocleidomastoid R' },
+  // SCM: sternum/clavicle up to the mastoid process just behind the ear
+  // (head node sits at neck-local y=0.05, mastoid a little above that).
+  { node: 'neck', pa: [0.02, 0.005, 0.03], pb: [0.04, 0.075, -0.01], r: 0.012, name: 'Sternocleidomastoid L' },
+  { node: 'neck', pa: [-0.02, 0.005, 0.03], pb: [-0.04, 0.075, -0.01], r: 0.012, name: 'Sternocleidomastoid R' },
 ];
 
 const MUSCLES = [

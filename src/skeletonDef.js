@@ -160,6 +160,26 @@ export const IK_CHAINS = {
   toe_R: { root: 'hip_R', mid: 'knee_R', effector: 'ankle_R', hingeSign: 1 },
 };
 
+// Highlightable body parts: every mesh attached under one of `nodes` belongs
+// to the part. Bones/muscles that span a joint live on the proximal node, so
+// e.g. the thigh (attached to hip_L) highlights with the left leg.
+export const BODY_PARTS = [
+  { id: 'head', title: 'Head & neck', nodes: ['neck', 'head', 'headTop'] },
+  { id: 'torso', title: 'Torso', nodes: ['spine', 'chest'] },
+  { id: 'pelvis', title: 'Pelvis', nodes: ['pelvis'] },
+  { id: 'arm_L', title: 'Left arm', nodes: ['shoulder_L', 'elbow_L', 'wrist_L', 'hand_L'] },
+  { id: 'arm_R', title: 'Right arm', nodes: ['shoulder_R', 'elbow_R', 'wrist_R', 'hand_R'] },
+  { id: 'leg_L', title: 'Left leg', nodes: ['hip_L', 'knee_L'] },
+  { id: 'leg_R', title: 'Right leg', nodes: ['hip_R', 'knee_R'] },
+  { id: 'foot_L', title: 'Left foot', nodes: ['ankle_L', 'toe_L'] },
+  { id: 'foot_R', title: 'Right foot', nodes: ['ankle_R', 'toe_R'] },
+];
+
+export const PART_OF_NODE = {};
+for (const part of BODY_PARTS) {
+  for (const node of part.nodes) PART_OF_NODE[node] = part.id;
+}
+
 export function clampAngle(value, [min, max]) {
   return Math.min(max * DEG, Math.max(min * DEG, value));
 }

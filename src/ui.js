@@ -1,4 +1,4 @@
-import { JOINT_BY_NAME, JOINT_TITLES } from './skeletonDef.js';
+import { JOINT_BY_NAME, JOINT_TITLES, BODY_PARTS } from './skeletonDef.js';
 import { keyAngles } from './analysis.js';
 
 const R2D = 180 / Math.PI;
@@ -61,6 +61,33 @@ export function initUI(app) {
     couple: $('show-couple-cog').checked,
   });
   ['show-cog', 'show-support', 'show-couple-cog'].forEach((id) => $(id).addEventListener('change', syncViz));
+
+  // ---------------------------------------------------------------- highlight
+  const highlightChips = $('highlight-chips');
+  const highlightClear = $('highlight-clear');
+  const highlighted = new Set();
+
+  const syncHighlight = () => {
+    app.setHighlight(highlighted);
+    highlightClear.disabled = highlighted.size === 0;
+  };
+  for (const part of BODY_PARTS) {
+    const chip = document.createElement('button');
+    chip.className = 'chip';
+    chip.textContent = part.title;
+    chip.addEventListener('click', () => {
+      if (highlighted.has(part.id)) highlighted.delete(part.id);
+      else highlighted.add(part.id);
+      chip.classList.toggle('active', highlighted.has(part.id));
+      syncHighlight();
+    });
+    highlightChips.appendChild(chip);
+  }
+  highlightClear.addEventListener('click', () => {
+    highlighted.clear();
+    highlightChips.querySelectorAll('.chip').forEach((c) => c.classList.remove('active'));
+    syncHighlight();
+  });
 
   // ---------------------------------------------------------------- joint panel
   const jointPanel = $('joint-panel');
