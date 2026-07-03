@@ -163,3 +163,17 @@ export const IK_CHAINS = {
 export function clampAngle(value, [min, max]) {
   return Math.min(max * DEG, Math.max(min * DEG, value));
 }
+
+// For closed-chain editing: which distal endpoint stays planted when this joint
+// is rotated. Leg joints anchor their own foot; arm joints their own hand;
+// pelvis anchors a foot chosen at runtime (its descendants include both legs).
+// Axial joints (spine/neck/head) have no grounded descendant, so they fall back
+// to open-chain behaviour (value null).
+export const ANCHOR_FOR = {
+  hip_L: 'ankle_L', knee_L: 'ankle_L', ankle_L: 'ankle_L',
+  hip_R: 'ankle_R', knee_R: 'ankle_R', ankle_R: 'ankle_R',
+  shoulder_L: 'wrist_L', elbow_L: 'wrist_L', wrist_L: 'wrist_L',
+  shoulder_R: 'wrist_R', elbow_R: 'wrist_R', wrist_R: 'wrist_R',
+  pelvis: 'support-foot', // resolved to the lower ankle at runtime
+  spine: null, chest: null, neck: null, head: null,
+};

@@ -2,9 +2,9 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { Figure } from './figure.js';
-import { IK_CHAINS, JOINT_BY_NAME } from './skeletonDef.js';
-import { solveTwoBone } from './ik.js';
-import { coupleReport } from './analysis.js';
+import { IK_CHAINS, JOINT_BY_NAME, ANCHOR_FOR } from './skeletonDef.js';
+import { solveTwoBone, editWithAnchor, pinAnchor } from './ik.js';
+import { balanceReport, coupleReport } from './analysis.js';
 import { PRESETS } from './presets.js';
 import { initUI } from './ui.js';
 
@@ -144,13 +144,58 @@ const app = {
   figures: [leader, follower],
   presets: PRESETS,
   mode: 'rotate',
+  chainMode: 'open', // 'open' (move distal) | 'closed' (anchor foot, move proximal)
   selected: null, // { figure, jointName }
   ikState: null, // { figure, chain }
+  ckc: null, // { node, matrix } captured while dragging in closed-chain mode
   ui: null,
 
   setMode(mode) {
     this.mode = mode;
     this.deselect();
+  },
+
+  setChainMode(mode) {
+    this.chainMode = mode;
+  },
+
+  // The distal node kept fixed when `jointName` is edited in closed-chain mode,
+  // or null if this joint has no grounded anchor.
+  anchorNode(figure, jointName) {
+    const key = ANCHOR_FOR[jointName];
+    if (!key) return null;
+    if (key === 'support-foot') {
+      figure.group.updateMatrixWorld(true);
+      const lY = figure.worldPos('ankle_L').y;
+      const rY = figure.worldPos('ankle_R').y;
+      return figure.nodes[lY <= rY ? 'ankle_L' : 'ankle_R'];
+    }
+    return figure.nodes[key];
+  },
+
+  // Edit a joint honouring the current chain mode. `mutate` changes rotations.
+  editJoint(figure, jointName, mutate) {
+    const anchor = this.chainMode === 'closed' ? this.anchorNode(figure, jointName) : null;
+    if (anchor) {
+      editWithAnchor(figure, anchor, () => { mutate(); figure.clampJoint(jointName); });
+    } else {
+      mutate();
+      figure.clampJoint(jointName);
+      figure.group.updateMatrixWorld(true);
+    }
+  },
+
+  // Show 'both' | 'leader' | 'follower'.
+  setVisibleFigures(which) {
+    this.shown = which;
+    leader.group.visible = which === 'both' || which === 'leader';
+    follower.group.visible = which === 'both' || which === 'follower';
+    if (this.selected && !this.selected.figure.group.visible) this.deselect();
+    this.setVisibleFiguresRefresh?.();
+  },
+
+  visibleFigures() {
+    return this.figures.filter((f) => f.group.visible);
   },
 
   deselect() {
@@ -223,7 +268,7 @@ const app = {
 
   getCoupleState(name = '') {
     return {
-      app: 'tango-pose-studio',
+      app: 'tangle',
       version: 1,
       name,
       meta: {
@@ -249,11 +294,25 @@ const app = {
   },
 };
 
+// When a closed-chain drag begins, remember where the anchor is so we can pin
+// it back each frame.
+tcontrols.addEventListener('dragging-changed', (e) => {
+  if (!e.value) { app.ckc = null; return; }
+  if (app.selected && !app.ikState && app.chainMode === 'closed') {
+    const node = app.anchorNode(app.selected.figure, app.selected.jointName);
+    if (node) {
+      app.selected.figure.group.updateMatrixWorld(true);
+      app.ckc = { figure: app.selected.figure, node, matrix: node.matrixWorld.clone() };
+    }
+  }
+});
+
 tcontrols.addEventListener('objectChange', () => {
   if (app.ikState) {
     solveTwoBone(app.ikState.figure, app.ikState.chain, ikTarget.position);
   } else if (app.selected) {
     app.selected.figure.clampJoint(app.selected.jointName);
+    if (app.ckc) pinAnchor(app.ckc.figure, app.ckc.node, app.ckc.matrix);
     if (app.ui) app.ui.refreshJointValues();
   } else if (tcontrols.object) {
     tcontrols.object.position.y = 0; // figures stay on the floor
@@ -277,8 +336,9 @@ function handleClick(e) {
   pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
 
+  const visible = app.visibleFigures();
   if (app.mode === 'move' || app.mode === 'turn') {
-    const hits = raycaster.intersectObjects([leader.group, follower.group], true);
+    const hits = raycaster.intersectObjects(visible.map((f) => f.group), true);
     const hit = hits.find((h) => h.object.visible);
     if (hit) {
       let o = hit.object;
@@ -288,7 +348,7 @@ function handleClick(e) {
     return;
   }
 
-  const spheres = [...leader.pickSpheres, ...follower.pickSpheres];
+  const spheres = visible.flatMap((f) => f.pickSpheres);
   const hits = raycaster.intersectObjects(spheres, false);
   if (hits.length === 0) {
     app.deselect();
@@ -309,32 +369,46 @@ app.applyPreset(1); // start in the close embrace
 
 const clock = new THREE.Clock();
 let statsTimer = 0;
+let vizFlags = { cog: true, support: true, couple: true };
+
+function applyVizVisibility() {
+  const both = leader.group.visible && follower.group.visible;
+  vizLeader.setVisible(vizFlags.cog && leader.group.visible, vizFlags.support && leader.group.visible);
+  vizFollower.setVisible(vizFlags.cog && follower.group.visible, vizFlags.support && follower.group.visible);
+  vizCouple.setVisible(vizFlags.couple && both, vizFlags.couple && vizFlags.support && both);
+}
 
 function animate() {
   requestAnimationFrame(animate);
   const dt = clock.getDelta();
   orbit.update();
 
-  const report = coupleReport(leader, follower);
-  vizLeader.update(report.a);
-  vizFollower.update(report.b);
-  vizCouple.update(report);
+  const both = leader.group.visible && follower.group.visible;
+  const rA = leader.group.visible ? balanceReport(leader) : null;
+  const rB = follower.group.visible ? balanceReport(follower) : null;
+  if (rA) vizLeader.update(rA);
+  if (rB) vizFollower.update(rB);
+  let couple = null;
+  if (both) {
+    couple = coupleReport(leader, follower);
+    vizCouple.update(couple);
+  }
 
   statsTimer += dt;
   if (statsTimer > 0.25) {
     statsTimer = 0;
-    app.ui.updateStats(report);
+    app.ui.updateStats({ a: rA, b: rB, couple });
   }
 
   renderer.render(scene, camera);
 }
 
-app.setViz = ({ cog, support, couple }) => {
-  vizLeader.setVisible(cog, support);
-  vizFollower.setVisible(cog, support);
-  vizCouple.setVisible(couple, couple && support);
+app.setViz = (flags) => {
+  vizFlags = flags;
+  applyVizVisibility();
 };
-app.setViz({ cog: true, support: true, couple: true });
+app.setVisibleFiguresRefresh = applyVizVisibility;
+app.setViz(vizFlags);
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;

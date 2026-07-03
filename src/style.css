@@ -28,7 +28,7 @@ body {
 
 #topbar {
   position: absolute; top: 0; left: 0; right: 320px;
-  display: flex; align-items: center; gap: 16px;
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
   padding: 10px 14px;
   pointer-events: none;
 }

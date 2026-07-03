@@ -19,6 +19,22 @@ export function initUI(app) {
     });
   }
 
+  const chainButtons = [...document.querySelectorAll('#chain-buttons button')];
+  for (const btn of chainButtons) {
+    btn.addEventListener('click', () => {
+      chainButtons.forEach((b) => b.classList.toggle('active', b === btn));
+      app.setChainMode(btn.dataset.chain);
+    });
+  }
+
+  const showButtons = [...document.querySelectorAll('#show-buttons button')];
+  for (const btn of showButtons) {
+    btn.addEventListener('click', () => {
+      showButtons.forEach((b) => b.classList.toggle('active', b === btn));
+      app.setVisibleFigures(btn.dataset.show);
+    });
+  }
+
   // ---------------------------------------------------------------- layers
   const syncLayers = () => {
     const layers = {
@@ -73,9 +89,9 @@ export function initUI(app) {
       const input = row.querySelector('input');
       const valEl = row.querySelector('.val');
       input.addEventListener('input', () => {
-        node.rotation[axis] = Number(input.value) * D2R;
-        figure.clampJoint(jointName);
-        valEl.textContent = `${Number(input.value).toFixed(0)}°`;
+        app.editJoint(figure, jointName, () => { node.rotation[axis] = Number(input.value) * D2R; });
+        valEl.textContent = `${(node.rotation[axis] * R2D).toFixed(0)}°`;
+        refreshJointValues();
       });
       jointPanel.appendChild(row);
       sliderRefs.push({ input, valEl, node, axis });
@@ -93,7 +109,7 @@ export function initUI(app) {
       const input = row.querySelector('input');
       const valEl = row.querySelector('.val');
       input.addEventListener('input', () => {
-        node.position.y = Number(input.value) / 100;
+        app.editJoint(figure, jointName, () => { node.position.y = Number(input.value) / 100; });
         valEl.textContent = `${Number(input.value).toFixed(0)} cm`;
       });
       jointPanel.appendChild(row);
@@ -102,8 +118,10 @@ export function initUI(app) {
     const reset = document.createElement('button');
     reset.textContent = 'Reset this joint';
     reset.addEventListener('click', () => {
-      node.rotation.set(0, 0, 0);
-      if (jointName === 'pelvis') node.position.y = 0.53 * figure.height;
+      app.editJoint(figure, jointName, () => {
+        node.rotation.set(0, 0, 0);
+        if (jointName === 'pelvis') node.position.y = 0.53 * figure.height;
+      });
       refreshJointValues();
     });
     jointPanel.appendChild(reset);
@@ -141,19 +159,19 @@ export function initUI(app) {
     </div>`;
   }
 
-  function updateStats(report) {
-    const sep = Math.hypot(
-      report.a.cog.x - report.b.cog.x,
-      report.a.cog.z - report.b.cog.z,
-    );
-    statsPanel.innerHTML =
-      figureBlock(app.leader, report.a, '#7fb3e8')
-      + figureBlock(app.follower, report.b, '#e89ab8')
-      + `<div class="stat-block">
+  function updateStats({ a, b, couple }) {
+    let html = '';
+    if (a) html += figureBlock(app.leader, a, '#7fb3e8');
+    if (b) html += figureBlock(app.follower, b, '#e89ab8');
+    if (couple) {
+      const sep = Math.hypot(couple.a.cog.x - couple.b.cog.x, couple.a.cog.z - couple.b.cog.z);
+      html += `<div class="stat-block">
           <h3><span class="dot" style="background:#ffe08a"></span>Couple</h3>
-          <div class="stat-line"><span>Combined balance</span><span class="v">${balanceLine(report.margin)}</span></div>
+          <div class="stat-line"><span>Combined balance</span><span class="v">${balanceLine(couple.margin)}</span></div>
           <div class="stat-line"><span>COG separation</span><span class="v">${(sep * 100).toFixed(1)} cm</span></div>
         </div>`;
+    }
+    statsPanel.innerHTML = html;
   }
 
   // ---------------------------------------------------------------- compare

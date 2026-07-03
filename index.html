@@ -12,12 +12,21 @@
     <div id="viewport"></div>
 
     <header id="topbar">
-      <h1>Tango Pose Studio</h1>
+      <h1>TAngle</h1>
       <div id="mode-buttons" class="btn-group">
         <button data-mode="rotate" class="active" title="Click a joint, then drag the rings to rotate it (within anatomical limits)">Rotate joints</button>
         <button data-mode="ik" title="Click a hand or foot, then drag the target to pose the whole limb">Drag hand/foot</button>
         <button data-mode="move" title="Click a figure, then drag to move it on the floor">Move figure</button>
         <button data-mode="turn" title="Click a figure, then drag the ring to turn it">Turn figure</button>
+      </div>
+      <div id="chain-buttons" class="btn-group" title="Open: rotating a joint moves the limb below it. Closed: the foot/hand stays planted and the body above moves.">
+        <button data-chain="open" class="active">Open chain</button>
+        <button data-chain="closed">Closed chain</button>
+      </div>
+      <div id="show-buttons" class="btn-group" title="Show one dancer or both">
+        <button data-show="both" class="active">Both</button>
+        <button data-show="leader">Leader</button>
+        <button data-show="follower">Follower</button>
       </div>
     </header>
 

@@ -62,6 +62,35 @@ export function feetToFloor(figure) {
   }
 }
 
+// ---------------------------------------------------------------- closed chain
+//
+// In a *closed kinetic chain* the distal end (a planted foot, a joined hand) is
+// fixed in space, so rotating a joint moves everything *proximal* — bend the
+// knee and the pelvis/torso lower over a stationary foot. We model this by
+// letting the joint rotate normally (which moves its distal subtree, including
+// the anchor) and then applying a single rigid transform to the whole figure so
+// the anchor snaps back to where it was. Everything except the anchor and its
+// distal subtree ends up moved; the anchor stays put in both position and
+// orientation (so a planted foot also stays flat).
+
+// Move the figure so `anchorNode` sits at `targetMatrix` (a world matrix).
+export function pinAnchor(figure, anchorNode, targetMatrix) {
+  figure.group.updateMatrixWorld(true);
+  // delta · anchorWorld = target  ⇒  delta = target · anchorWorld⁻¹
+  const delta = targetMatrix.clone().multiply(anchorNode.matrixWorld.clone().invert());
+  figure.group.matrix.premultiply(delta);
+  figure.group.matrix.decompose(figure.group.position, figure.group.quaternion, figure.group.scale);
+  figure.group.updateMatrixWorld(true);
+}
+
+// Run `mutate` (a joint edit) while keeping `anchorNode` fixed in world space.
+export function editWithAnchor(figure, anchorNode, mutate) {
+  figure.group.updateMatrixWorld(true);
+  const before = anchorNode.matrixWorld.clone();
+  mutate();
+  pinAnchor(figure, anchorNode, before);
+}
+
 // One-step correction that pitches the ankle so the sole sits level.
 export function flattenFoot(figure, side) {
   const ankleNode = figure.nodes[`ankle_${side}`];

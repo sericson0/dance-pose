@@ -1,6 +1,7 @@
+// Dev check: screenshots of each view + the new controls. Saves to argv[2].
 import puppeteer from 'puppeteer-core';
 
-const outDir = process.argv[2];
+const outDir = process.argv[2] || '.';
 const browser = await puppeteer.launch({
   executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
   headless: 'new',
@@ -8,43 +9,49 @@ const browser = await puppeteer.launch({
 });
 const page = await browser.newPage();
 await page.setViewport({ width: 1500, height: 950 });
-
 const logs = [];
-page.on('console', (m) => logs.push(`[${m.type()}] ${m.text()}`));
-page.on('pageerror', (e) => logs.push(`[PAGEERROR] ${e.message}`));
+page.on('console', (m) => { if (m.type() === 'error') logs.push(m.text()); });
+page.on('pageerror', (e) => logs.push(`PAGEERROR: ${e.message}`));
 
 await page.goto('http://localhost:5173', { waitUntil: 'networkidle0', timeout: 20000 });
 await new Promise((r) => setTimeout(r, 2500));
-await page.screenshot({ path: `${outDir}/1-embrace-body.png` });
+await page.screenshot({ path: `${outDir}/a-body.png` });
 
-// Skeleton + muscle view
+const setLayers = (sk, bo, mu) => page.evaluate((s, b, m) => {
+  document.getElementById('layer-skeleton').checked = s;
+  document.getElementById('layer-body').checked = b;
+  document.getElementById('layer-muscle').checked = m;
+  for (const id of ['layer-skeleton', 'layer-body', 'layer-muscle'])
+    document.getElementById(id).dispatchEvent(new Event('change'));
+}, sk, bo, mu);
+
+// Skeleton only, zoomed on one dancer.
+await setLayers(true, false, false);
+await page.evaluate(() => window.__app.setVisibleFigures('leader'));
 await page.evaluate(() => {
-  document.getElementById('layer-body').click();
-  document.getElementById('layer-skeleton').click();
-  document.getElementById('layer-muscle').click();
+  const a = window.__app;
+  a.camera.position.set(0.6, 1.4, 1.9);
+  a.orbit.target.set(-0.35, 1.0, 0);
 });
-await new Promise((r) => setTimeout(r, 600));
-await page.screenshot({ path: `${outDir}/2-skeleton-muscle.png` });
+await new Promise((r) => setTimeout(r, 500));
+await page.screenshot({ path: `${outDir}/b-skeleton.png` });
 
-// Walk preset, body view again
+// Muscles only.
+await setLayers(false, false, true);
+await new Promise((r) => setTimeout(r, 400));
+await page.screenshot({ path: `${outDir}/c-muscle.png` });
+
+// Closed-chain: bend the leader's knee, foot should stay planted.
 await page.evaluate(() => {
-  document.getElementById('layer-muscle').click();
-  document.getElementById('layer-skeleton').click();
-  document.getElementById('layer-body').click();
-  document.getElementById('preset-select').value = '2';
-  document.getElementById('preset-apply').click();
+  const a = window.__app;
+  a.setVisibleFigures('leader');
+  a.setChainMode('closed');
+  a.selectJoint(a.leader, 'knee_L');
+  a.editJoint(a.leader, 'knee_L', () => { a.leader.nodes.knee_L.rotation.x = 1.0; });
 });
-await new Promise((r) => setTimeout(r, 600));
-await page.screenshot({ path: `${outDir}/3-walk.png` });
+await setLayers(false, true, false);
+await new Promise((r) => setTimeout(r, 400));
+await page.screenshot({ path: `${outDir}/d-closedchain.png` });
 
-// Apilado preset
-await page.evaluate(() => {
-  document.getElementById('preset-select').value = '3';
-  document.getElementById('preset-apply').click();
-});
-await new Promise((r) => setTimeout(r, 600));
-await page.screenshot({ path: `${outDir}/4-apilado.png` });
-
-console.log('CONSOLE LOG DUMP:');
-console.log(logs.join('\n') || '(no console messages)');
+console.log(logs.length ? `ERRORS:\n${logs.join('\n')}` : 'No console errors.');
 await browser.close();
