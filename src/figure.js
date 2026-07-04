@@ -4,11 +4,23 @@ import {
   TOE_CORNERS_L, TOE_CORNERS_R, PART_OF_NODE,
 } from './skeletonDef.js';
 import { buildSkeleton, buildMuscles } from './anatomy.js';
-import { LIMB_BASES, reverseWinding } from './skeletonMesh.js';
+import { LIMB_BASES, reverseWinding, BODY_RETARGET, normBoneName } from './skeletonMesh.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 
 const Y_AXIS = new THREE.Vector3(0, 1, 0);
 const _floorPt = new THREE.Vector3();
+
+// Scratch objects for per-frame muscle skinning (updateMuscleSkin), reused so
+// the hot loop allocates nothing.
+const _gInv = new THREE.Matrix4();
+const _dA = new THREE.Matrix4();
+const _dB = new THREE.Matrix4();
+const _qA = new THREE.Quaternion();
+const _qB = new THREE.Quaternion();
+const _tA = new THREE.Vector3();
+const _tB = new THREE.Vector3();
+const _scl = new THREE.Vector3();
 
 // Flesh clearance around each joint (fraction of height) used for floor
 // contact; the foot soles are handled separately via FOOT_CORNERS.
@@ -47,7 +59,7 @@ const SHANK_PROFILE = [
 ];
 
 export class Figure {
-  constructor({ name, height = 1.72, mass = 70, color = 0x4d8fd1, skin = 0xd9a68a, skeleton = null, muscles = null }) {
+  constructor({ name, height = 1.72, mass = 70, color = 0x4d8fd1, skin = 0xd9a68a, skeleton = null, muscles = null, body = null }) {
     this.name = name;
     this.height = height;
     this.mass = mass;
@@ -55,6 +67,7 @@ export class Figure {
     this.skin = skin;
     this.skeletonMesh = skeleton; // parsed atlas bones, or null → procedural bones
     this.muscleMesh = muscles; // parsed atlas muscles (needs skeleton), or null → procedural
+    this.bodyMesh = body; // parsed clothed avatar (skinned), or null → procedural mannequin
 
     this.group = new THREE.Group(); // root: position (x,z) + facing (rotation.y)
     this.group.userData.figure = this;
@@ -62,6 +75,8 @@ export class Figure {
     this.pickSpheres = [];
     this.layerMeshes = { skeleton: [], body: [], muscle: [] };
     this.jointSphereByName = {};
+    // Bi-articular muscles that skin between two joints (see updateMuscleSkin).
+    this._skinMuscles = [];
 
     this.#buildMaterials();
     this.#build();
@@ -122,7 +137,10 @@ export class Figure {
       this.jointSphereByName[def.name] = s;
     }
 
-    this.#buildBody();
+    // --- Body layer: imported clothed avatar if available, else the
+    // procedural mannequin volumes ---
+    if (this.bodyMesh) this.#buildMeshBody();
+    else this.#buildBody();
     // Muscle layer: imported atlas muscles (share the skeleton's frame, so they
     // need it too), else the procedural bellies in anatomy.js.
     if (this.muscleMesh && this.skeletonMesh) this.#buildMeshMuscles();
@@ -184,9 +202,11 @@ export class Figure {
   // Attach the imported atlas muscles to our joint tree. They live in the same
   // atlas frame as the bones, so they bake with the *skeleton's* atlas scale
   // (a limb-only muscle file has no full-body extent of its own). Each right-
-  // side belly is placed on its node and also mirrored to the left; muscles
-  // stay individual (not merged) so each keeps its name for future labelling
-  // and a distinct tint for readability.
+  // side belly is placed and also mirrored to the left; muscles stay individual
+  // (not merged) so each keeps its name and a distinct tint. A belly that only
+  // rides one bone is parented rigidly to its joint node; one that crosses an
+  // articulated joint (has an `insert`) is skinned between its two joints so it
+  // stretches and bends as they move (see updateMuscleSkin).
   #buildMeshMuscles() {
     const { atlasMinY, atlasHeight } = this.skeletonMesh;
     const s = this.height / atlasHeight;
@@ -194,25 +214,407 @@ export class Figure {
     const settle = new THREE.Matrix4().makeTranslation(0, -atlasMinY * s, 0);
     const Tpos = settle.clone().multiply(new THREE.Matrix4().makeScale(s, s, s));
     const Tneg = settle.clone().multiply(new THREE.Matrix4().makeScale(-s, s, s)); // mirror
+    // Resolve a limb base to a concrete side; central nodes pass through.
+    const resolve = (base, side) => (LIMB_BASES.has(base) ? `${base}_${side}` : base);
 
     this.muscleMesh.muscles.forEach((m, i) => {
       const material = i % 2 ? this.materials.muscleA : this.materials.muscleB;
-      const isLimb = LIMB_BASES.has(m.node);
-      const targets = isLimb
-        ? [[`${m.node}_R`, Tpos, false], [`${m.node}_L`, Tneg, true]]
-        : [[m.node, Tpos, false], [m.node, Tneg, true]];
-      for (const [nodeName, T, mirror] of targets) {
+      // Every shipped belly is right-side: place it (Tpos) and mirror to the
+      // left (Tneg). The node side follows the copy's side.
+      for (const [side, T, mirror] of [['R', Tpos, false], ['L', Tneg, true]]) {
+        const nodeName = resolve(m.node, side);
         const node = this.nodes[nodeName];
         if (!node) continue;
-        const g = m.geometry.clone();
-        const X = node.matrixWorld.clone().invert().multiply(this.group.matrixWorld).multiply(T);
-        g.applyMatrix4(X);
-        if (mirror) reverseWinding(g);
-        const mesh = new THREE.Mesh(g, material);
-        mesh.userData.muscleName = m.label;
-        this.addMesh(nodeName, mesh, 'muscle', true);
+        const insNode = m.insert ? this.nodes[resolve(m.insert, side)] : null;
+        if (insNode) {
+          // Skinned: bake into figure-local space and let updateMuscleSkin blend
+          // each vertex between the two joints every frame.
+          const g = m.geometry.clone();
+          g.applyMatrix4(T);
+          if (mirror) reverseWinding(g);
+          this.#addSkinnedMuscle(g, node, insNode, material, m.label, nodeName);
+        } else {
+          // Rigid: bake into the node's local frame and hang it there.
+          const g = m.geometry.clone();
+          const X = node.matrixWorld.clone().invert().multiply(this.group.matrixWorld).multiply(T);
+          g.applyMatrix4(X);
+          if (mirror) reverseWinding(g);
+          const mesh = new THREE.Mesh(g, material);
+          mesh.userData.muscleName = m.label;
+          this.addMesh(nodeName, mesh, 'muscle', true);
+        }
       }
     });
+  }
+
+  // Register a bi-articular belly for two-bone skinning. `g` is baked in
+  // figure-local (group) space. Anatomically a muscle's flesh is rigid on the
+  // bone it lies on and only its tendon crosses a joint, so we split the weights
+  // *at the articulating joint* the muscle spans — the deeper (child) of its two
+  // nodes — rather than blending along the whole length. Flesh on the distal
+  // side of that joint follows the child bone; flesh on the proximal side
+  // follows the parent. The split is measured along the muscle's home-bone axis
+  // (the bone its belly rides), which stays well-defined even when the two joint
+  // pivots sit close together (adductors, lats) — a plain pivot-to-pivot ramp
+  // degenerates there and lets the whole belly swing. Result: bellies stay
+  // welded to their bone and only the short crossing band deforms. Each frame
+  // updateMuscleSkin re-blends the baked positions/normals by that weight. The
+  // mesh hangs off `group` (not a joint node) so its own frame never moves — all
+  // motion comes through the two joints, keeping the skin correct even as the
+  // whole dancer translates or turns.
+  #addSkinnedMuscle(g, nodeA, nodeB, material, label, originNode) {
+    const pos = g.attributes.position;
+    const nrm = g.attributes.normal;
+    const count = pos.count;
+    const gInv = _gInv.copy(this.group.matrixWorld).invert();
+    const a = new THREE.Vector3().setFromMatrixPosition(nodeA.matrixWorld).applyMatrix4(gInv);
+    const b = new THREE.Vector3().setFromMatrixPosition(nodeB.matrixWorld).applyMatrix4(gInv);
+    // The muscle spans the deeper (child) of its two joints. Pick the crossed
+    // joint pivot, the home-bone axis to measure along, and how the distal-side
+    // weight maps onto "blend toward nodeB".
+    const child = this.#deeperJointNode(nodeA, nodeB);
+    let cross, home, distalIsB;
+    if (child === nodeB) {
+      cross = b;                                     // belly on nodeA's bone (a→b)
+      home = new THREE.Vector3().subVectors(b, a);
+      distalIsB = true;                              // past the joint → nodeB
+    } else {
+      cross = a;                                     // belly on nodeA's own bone
+      home = this.#distalBoneDir(nodeA, gInv) || new THREE.Vector3().subVectors(a, b);
+      distalIsB = false;                             // past the joint → nodeA
+    }
+    const boneLen = Math.max(home.length(), 1e-6);
+    home.multiplyScalar(1 / boneLen);
+    // Pass 1: signed distance of each vertex from the crossed joint along the
+    // home-bone axis (s > 0 on the distal / child-bone side), and how far the
+    // muscle reaches on each side.
+    const sArr = new Float32Array(count);
+    let sMin = Infinity, sMax = -Infinity;
+    const v = new THREE.Vector3();
+    for (let i = 0; i < count; i++) {
+      const s = v.fromBufferAttribute(pos, i).sub(cross).dot(home);
+      sArr[i] = s;
+      if (s < sMin) sMin = s;
+      if (s > sMax) sMax = s;
+    }
+    // Transition half-width: a fraction of the bone, but never wider than the
+    // shorter side reaches, so the short tendon side saturates to full weight
+    // (otherwise it never fully commits to its bone and tears away at the joint).
+    let band = 0.16 * boneLen;
+    if (sMax > 1e-5) band = Math.min(band, 0.85 * sMax);
+    if (sMin < -1e-5) band = Math.min(band, -0.85 * sMin);
+    band = Math.max(band, 1e-4);
+    // Pass 2: smoothstep across the joint, mapped to "blend toward nodeB".
+    const weight = new Float32Array(count);
+    for (let i = 0; i < count; i++) {
+      const t = THREE.MathUtils.clamp((sArr[i] + band) / (2 * band), 0, 1);
+      const distal = t * t * (3 - 2 * t);
+      weight[i] = distalIsB ? distal : 1 - distal;
+    }
+    const bindPos = new Float32Array(pos.array);
+    const bindNrm = new Float32Array(nrm.array);
+    // Inverse of each joint's figure-local matrix at bind: brings a baked vertex
+    // into the joint's frame so the joint's later motion can carry it.
+    const invA = new THREE.Matrix4().multiplyMatrices(gInv, nodeA.matrixWorld).invert();
+    const invB = new THREE.Matrix4().multiplyMatrices(gInv, nodeB.matrixWorld).invert();
+    const mesh = new THREE.Mesh(g, material);
+    mesh.castShadow = true;
+    mesh.frustumCulled = false; // vertices leave the baked bounds as joints move
+    mesh.userData.muscleName = label;
+    mesh.userData.skinNode = originNode; // highlight groups it with this joint
+    this.group.add(mesh);
+    this.layerMeshes.muscle.push(mesh);
+    this._skinMuscles.push({ mesh, nodeA, nodeB, weight, bindPos, bindNrm, invA, invB });
+    return mesh;
+  }
+
+  // The deeper (child) of two hierarchy-adjacent joint nodes — the joint the
+  // muscle spanning them actually crosses.
+  #deeperJointNode(nodeA, nodeB) {
+    for (let n = nodeA.parent; n; n = n.parent) if (n === nodeB) return nodeA;
+    return nodeB;
+  }
+
+  // Figure-local direction from a joint to its distal child joint(s), i.e. along
+  // the bone it carries; null if it has no joint children. Used as the home-bone
+  // axis when a muscle's belly rides this joint's own bone.
+  #distalBoneDir(node, gInv) {
+    const here = new THREE.Vector3().setFromMatrixPosition(node.matrixWorld).applyMatrix4(gInv);
+    const acc = new THREE.Vector3();
+    let n = 0;
+    for (const ch of node.children) {
+      if (!ch.userData || !ch.userData.jointName) continue;
+      acc.add(new THREE.Vector3().setFromMatrixPosition(ch.matrixWorld).applyMatrix4(gInv));
+      n++;
+    }
+    return n ? acc.multiplyScalar(1 / n).sub(here) : null;
+  }
+
+  // Re-skin every bi-articular muscle from its two joints' current transforms.
+  // Called each frame while the muscle layer is visible (skipped otherwise, so
+  // it costs nothing in the skeleton/body views). Uses dual-quaternion skinning
+  // (DQS), not linear blend: the two joint deltas are rigid transforms, so
+  // blending them as dual quaternions rotates each vertex along the shortest
+  // arc and preserves volume. Plain linear blending collapses the belly toward
+  // the joint axis at deep bends ("candy-wrapper"), which made multi-joint
+  // muscles sink through the bone or pop off. Figure-local space; assumes
+  // group.matrixWorld is already current.
+  updateMuscleSkin() {
+    if (!this._skinMuscles.length || !this.layers?.muscle || !this.group.visible) return;
+    const gInv = _gInv.copy(this.group.matrixWorld).invert();
+    for (const sm of this._skinMuscles) {
+      // Rigid delta of each joint since bind, in figure-local space.
+      const dA = _dA.multiplyMatrices(gInv, sm.nodeA.matrixWorld).multiply(sm.invA);
+      const dB = _dB.multiplyMatrices(gInv, sm.nodeB.matrixWorld).multiply(sm.invB);
+      dA.decompose(_tA, _qA, _scl);
+      dB.decompose(_tB, _qB, _scl);
+      // Unit dual quaternion for each delta: real = rotation, dual encodes the
+      // translation as dual = 0.5 * (t as pure quat) * rotation.
+      const arx = _qA.x, ary = _qA.y, arz = _qA.z, arw = _qA.w;
+      let brx = _qB.x, bry = _qB.y, brz = _qB.z, brw = _qB.w;
+      const adx = 0.5 * (_tA.x * arw + _tA.y * arz - _tA.z * ary);
+      const ady = 0.5 * (-_tA.x * arz + _tA.y * arw + _tA.z * arx);
+      const adz = 0.5 * (_tA.x * ary - _tA.y * arx + _tA.z * arw);
+      const adw = 0.5 * (-_tA.x * arx - _tA.y * ary - _tA.z * arz);
+      let bdx = 0.5 * (_tB.x * brw + _tB.y * brz - _tB.z * bry);
+      let bdy = 0.5 * (-_tB.x * brz + _tB.y * brw + _tB.z * brx);
+      let bdz = 0.5 * (_tB.x * bry - _tB.y * brx + _tB.z * brw);
+      let bdw = 0.5 * (-_tB.x * brx - _tB.y * bry - _tB.z * brz);
+      // Blend the two along the shortest arc: flip B into A's hemisphere.
+      if (arx * brx + ary * bry + arz * brz + arw * brw < 0) {
+        brx = -brx; bry = -bry; brz = -brz; brw = -brw;
+        bdx = -bdx; bdy = -bdy; bdz = -bdz; bdw = -bdw;
+      }
+      const geom = sm.mesh.geometry;
+      const parr = geom.attributes.position.array;
+      const narr = geom.attributes.normal.array;
+      const { bindPos, bindNrm, weight } = sm;
+      for (let i = 0, j = 0; i < weight.length; i++, j += 3) {
+        const wb = weight[i];
+        const wa = 1 - wb;
+        // Blend real + dual parts, then renormalize the real part.
+        let rx = arx * wa + brx * wb, ry = ary * wa + bry * wb;
+        let rz = arz * wa + brz * wb, rw = arw * wa + brw * wb;
+        let dx = adx * wa + bdx * wb, dy = ady * wa + bdy * wb;
+        let dz = adz * wa + bdz * wb, dw = adw * wa + bdw * wb;
+        const inv = 1 / (Math.hypot(rx, ry, rz, rw) || 1);
+        rx *= inv; ry *= inv; rz *= inv; rw *= inv;
+        dx *= inv; dy *= inv; dz *= inv; dw *= inv;
+        // Translation = 2 * (dual * conjugate(real)), vector part.
+        const tx = 2 * (rw * dx - rx * dw + ry * dz - rz * dy);
+        const ty = 2 * (rw * dy - ry * dw + rz * dx - rx * dz);
+        const tz = 2 * (rw * dz - rz * dw + rx * dy - ry * dx);
+        // Rotate the bound position by the blended real quaternion, add t.
+        const px = bindPos[j], py = bindPos[j + 1], pz = bindPos[j + 2];
+        let ix = rw * px + ry * pz - rz * py;
+        let iy = rw * py + rz * px - rx * pz;
+        let iz = rw * pz + rx * py - ry * px;
+        let iw = -rx * px - ry * py - rz * pz;
+        parr[j] = ix * rw + iw * -rx + iy * -rz - iz * -ry + tx;
+        parr[j + 1] = iy * rw + iw * -ry + iz * -rx - ix * -rz + ty;
+        parr[j + 2] = iz * rw + iw * -rz + ix * -ry - iy * -rx + tz;
+        // Rotate the bound normal by the same quaternion (no translation).
+        const nx = bindNrm[j], ny = bindNrm[j + 1], nz = bindNrm[j + 2];
+        ix = rw * nx + ry * nz - rz * ny;
+        iy = rw * ny + rz * nx - rx * nz;
+        iz = rw * nz + rx * ny - ry * nx;
+        iw = -rx * nx - ry * ny - rz * nz;
+        narr[j] = ix * rw + iw * -rx + iy * -rz - iz * -ry;
+        narr[j + 1] = iy * rw + iw * -ry + iz * -rx - ix * -rz;
+        narr[j + 2] = iz * rw + iw * -rz + ix * -ry - iy * -rx;
+      }
+      geom.attributes.position.needsUpdate = true;
+      geom.attributes.normal.needsUpdate = true;
+    }
+  }
+
+  // Estimate our limb joints' positions in the *atlas* rest pose from the loaded
+  // skeleton bones, so the clothed body can be retargeted onto the same pose the
+  // skeleton and muscle layers show. Those layers render the atlas rest (arms
+  // slightly abducted, hands/feet splayed out); the rig's own rest is
+  // arms-straight-down, so without this the bones and muscle poke ~10 cm outside
+  // the clothed skin at the hands. Each joint is located where two adjacent bone
+  // clusters meet — the mean of the child cluster's vertices nearest the parent
+  // cluster's centroid — which is robust regardless of how the limb hangs.
+  // Endpoints (hand, toe) have no cluster of their own, so they take the far tip
+  // of the distal cluster. Returns a Map of joint name → figure-local Vector3
+  // (empty if no skeleton is loaded, in which case the body falls back to the
+  // rig rest). Uses the same scale/settle/mirror as #buildMeshSkeleton's bake.
+  #atlasLimbRest() {
+    const out = new Map();
+    if (!this.skeletonMesh) return out;
+    const { bones, atlasMinY, atlasHeight } = this.skeletonMesh;
+    const s = this.height / atlasHeight;
+    const settleY = -atlasMinY * s;
+    const verts = new Map(); // node name → [Vector3, …] in figure-local atlas space
+    const gather = (name, geom, mirror) => {
+      let a = verts.get(name); if (!a) { a = []; verts.set(name, a); }
+      const p = geom.attributes.position;
+      for (let i = 0; i < p.count; i += 3) { // sampled: joint estimates don't need every vert
+        const x = p.getX(i) * s * (mirror ? -1 : 1);
+        a.push(new THREE.Vector3(x, p.getY(i) * s + settleY, p.getZ(i) * s));
+      }
+    };
+    for (const b of bones) {
+      const isLimb = LIMB_BASES.has(b.node);
+      if (b.paired && isLimb) { gather(`${b.node}_R`, b.geometry, false); gather(`${b.node}_L`, b.geometry, true); }
+      else if (b.paired) { gather(b.node, b.geometry, false); gather(b.node, b.geometry, true); }
+      else gather(b.node, b.geometry, false);
+    }
+    const centroid = (a) => a.reduce((c, v) => c.add(v), new THREE.Vector3()).multiplyScalar(1 / a.length);
+    // Mean of the K cluster verts nearest (or farthest) from a reference point.
+    const extremeMean = (a, ref, frac, farthest) => {
+      const scored = a.map((v) => [v.distanceToSquared(ref), v]);
+      scored.sort((x, y) => (farthest ? y[0] - x[0] : x[0] - y[0]));
+      const k = Math.max(1, Math.floor(scored.length * frac));
+      const c = new THREE.Vector3();
+      for (let i = 0; i < k; i++) c.add(scored[i][1]);
+      return c.multiplyScalar(1 / k);
+    };
+    const PARENT = { shoulder: 'chest', elbow: 'shoulder', wrist: 'elbow', hip: 'pelvis', knee: 'hip', ankle: 'knee', toes: 'ankle' };
+    for (const side of ['_L', '_R']) {
+      for (const [base, parBase] of Object.entries(PARENT)) {
+        const a = verts.get(`${base}${side}`);
+        if (!a || !a.length) continue;
+        const par = verts.get(LIMB_BASES.has(parBase) ? `${parBase}${side}` : parBase);
+        out.set(`${base}${side}`, par && par.length ? extremeMean(a, centroid(par), 0.05, false) : centroid(a));
+      }
+      const wrist = verts.get(`wrist${side}`), elbow = verts.get(`elbow${side}`);
+      if (wrist && elbow) out.set(`hand${side}`, extremeMean(wrist, centroid(elbow), 0.03, true));
+      const toes = verts.get(`toes${side}`), ankle = verts.get(`ankle${side}`);
+      if (toes && ankle) out.set(`toe${side}`, extremeMean(toes, centroid(ankle), 0.03, true));
+    }
+    return out;
+  }
+
+  // Attach an imported clothed avatar (Microsoft Rocketbox: one skinned mesh
+  // on a 3ds Max Biped rig, in bind pose) by re-parenting its bones onto our
+  // joint nodes — the same idea as the skeleton/muscle bake, but keeping the
+  // mesh's own skin weights so the surface deforms smoothly at every joint.
+  //
+  // For each bone in BODY_RETARGET we build a constant local matrix under its
+  // target joint node: snap the bone origin to the joint, rotate its bind
+  // orientation by the shortest arc that aligns its bind bone direction with
+  // our rest segment direction (the bind pose is a near-A-pose; our rest is
+  // arms-down, so this also drops the arms), and scale — uniformly by
+  // figure/avatar height, plus axially so long bones reach the child joint,
+  // plus a world-Y "squash" on the feet so shoe soles (heels included) graze
+  // y = 0 at rest instead of sinking through the floor. Unmapped bones
+  // (fingers, face, clavicles, skirt helpers) keep their original local
+  // transform and simply ride their re-parented ancestor. The skinned mesh
+  // itself hangs off `group` in the default 'attached' bind mode, which
+  // cancels the mesh's own transform — every motion comes through the bones,
+  // on the GPU, with no per-frame CPU work.
+  #buildMeshBody() {
+    const H = this.height;
+    const src = this.bodyMesh;
+    const s0 = H / src.height;
+
+    // Our joints' rest positions in figure-local space (rest rotations are
+    // all identity, so rest world = accumulated offsets — no scene reads).
+    const rest = {};
+    for (const def of JOINTS) {
+      const p = def.parent ? rest[def.parent].clone() : new THREE.Vector3();
+      rest[def.name] = p.add(new THREE.Vector3(...def.offset).multiplyScalar(H));
+    }
+    // Retarget onto the *atlas* rest pose where it's known (limb joints), so the
+    // clothed body coincides with the skeleton/muscle layers; the torso and any
+    // joint the atlas can't locate fall back to the rig rest. `target` is the
+    // position each bone is snapped/aligned to; the offset from its rig node is
+    // baked into the bone's local matrix so posing still pivots about the node.
+    const atlas = this.#atlasLimbRest();
+    const target = (name) => atlas.get(name) || rest[name];
+
+    const avatar = cloneSkinned(src.scene);
+    avatar.updateMatrixWorld(true);
+
+    // Bones by normalized name, and each bone's bind world matrix. The scene
+    // is loaded in bind pose, so node matrixWorld *is* the Y-up bind transform.
+    // (Don't invert the inverse-bind matrices instead: those live in the
+    // skinned mesh's Z-up local frame, not scene space.)
+    const boneByName = new Map();
+    avatar.traverse((o) => {
+      if (o.isBone || normBoneName(o.name).startsWith('bip01')) boneByName.set(normBoneName(o.name), o);
+    });
+    const bindWorld = new Map();
+    for (const b of boneByName.values()) bindWorld.set(b, b.matrixWorld.clone());
+    const bindPos = (bone) => new THREE.Vector3().setFromMatrixPosition(bindWorld.get(bone));
+
+    // Biped side letter → our joint suffix, resolved by bind world position so
+    // a mirrored export still lands on the correct side.
+    let sideFor = { l: '_L', r: '_R' };
+    const lThigh = boneByName.get('bip01lthigh');
+    if (lThigh && (bindPos(lThigh).x > 0) !== (rest.hip_L.x > 0)) sideFor = { l: '_R', r: '_L' };
+
+    // Expand the retarget table to both sides and resolve alignment rotations
+    // (inherit entries reuse an earlier bone's rotation, e.g. foot ← calf).
+    const plans = new Map(); // bone object → plan
+    const alignR = new Map(); // bone name (expanded) → THREE.Quaternion
+    for (const s of ['l', 'r']) {
+      for (const tpl of BODY_RETARGET) {
+        const sided = tpl.bone.includes('S'); // side placeholder
+        if (!sided && s === 'r') continue; // central bones: process once
+        const sub = (name) => name && name.replace('S', s);
+        const suffix = sided ? sideFor[s] : '';
+        const boneName = sub(tpl.bone);
+        const jointName = `${tpl.joint}${suffix}`;
+        const bone = boneByName.get(boneName);
+        const node = this.nodes[jointName];
+        if (!bone || !node) continue;
+        const q = bindPos(bone);
+        const rotBind = new THREE.Quaternion();
+        bindWorld.get(bone).decompose(new THREE.Vector3(), rotBind, new THREE.Vector3());
+        let R = new THREE.Quaternion();
+        let axialLen = null; // [ourLen, bindLen] when axially stretched
+        if (tpl.dirBone && boneByName.get(sub(tpl.dirBone))) {
+          const dA = bindPos(boneByName.get(sub(tpl.dirBone))).sub(q);
+          const dirKey = rest[`${tpl.dirJoint}${suffix}`] ? `${tpl.dirJoint}${suffix}` : tpl.dirJoint;
+          const dJ = target(dirKey).clone().sub(target(jointName));
+          if (tpl.axial) axialLen = [dJ.length(), dA.length()];
+          R.setFromUnitVectors(dA.normalize(), dJ.normalize());
+        } else if (tpl.inherit) {
+          R = (alignR.get(sub(tpl.inherit)) || new THREE.Quaternion()).clone();
+        }
+        alignR.set(boneName, R);
+        // Offset from the rig node to the atlas joint the bone snaps to (zero for
+        // joints left on the rig rest, e.g. the torso).
+        const originDelta = target(jointName).clone().sub(rest[jointName]);
+        plans.set(bone, { node, jointName, q, rotBind, R, axialLen, originDelta, jointY: target(jointName).y, squash: !!tpl.squash });
+      }
+    }
+
+    // Apply: constant local matrix under the joint node.
+    const m = new THREE.Matrix4();
+    for (const [bone, p] of plans) {
+      const sx = p.axialLen ? p.axialLen[0] / Math.max(p.axialLen[1], 1e-6) : s0;
+      const local = new THREE.Matrix4()
+        .compose(new THREE.Vector3(), p.R.clone().multiply(p.rotBind), new THREE.Vector3(sx, s0, s0));
+      if (p.squash && p.q.y * s0 > 1e-4) {
+        // Vertical squash so the sole reaches exactly y = 0 at rest: the bind
+        // sole sits q.y below the bone; our joint sits jointY above the floor.
+        const lam = THREE.MathUtils.clamp(p.jointY / (p.q.y * s0), 0.3, 1);
+        local.premultiply(m.makeScale(1, lam, 1));
+      }
+      local.setPosition(p.originDelta); // snap origin to the atlas joint (after squash)
+      p.node.add(bone);
+      bone.matrixAutoUpdate = false;
+      bone.matrix.copy(local);
+    }
+
+    // The skinned meshes themselves: identity bind under `group` ('attached'
+    // mode divides the mesh's own world transform back out, so parenting is
+    // only for visibility/layer bookkeeping).
+    avatar.updateMatrixWorld(true);
+    const skinnedMeshes = [];
+    avatar.traverse((o) => { if (o.isSkinnedMesh) skinnedMeshes.push(o); });
+    for (const o of skinnedMeshes) { // re-parent after the walk, not during
+      o.bind(o.skeleton, new THREE.Matrix4());
+      o.frustumCulled = false; // posed verts leave the bind-pose bounds
+      o.castShadow = !o.material.transparent; // hair cards would cast solid blobs
+      o.userData.noHighlight = true; // one skin, no per-part split (see #applyHighlight)
+      this.group.add(o);
+      this.layerMeshes.body.push(o);
+    }
   }
 
   #buildBody() {
@@ -276,7 +678,7 @@ export class Figure {
         .scale.set(2.2, 0.9, 1.9);
     }
 
-    // Head + hair + nose (nose shows facing in both skeleton and body views).
+    // Head + hair.
     const headBall = new THREE.Mesh(new THREE.SphereGeometry(0.066 * H, 20, 16), this.materials.skin);
     headBall.position.set(0, 0.055 * H, 0.004 * H);
     headBall.castShadow = true;
@@ -287,11 +689,6 @@ export class Figure {
     hair.scale.set(1, 0.92, 0.95);
     this.nodes.head.add(hair);
     this.layerMeshes.body.push(hair);
-
-    const nose = new THREE.Mesh(new THREE.ConeGeometry(0.012 * H, 0.028 * H, 8), this.materials.skin);
-    nose.rotation.x = Math.PI / 2;
-    nose.position.set(0, 0.045 * H, 0.068 * H);
-    this.nodes.head.add(nose); // visible in every view
   }
 
   #alignY(mesh, a, b) {
@@ -368,13 +765,22 @@ export class Figure {
       if (!o.isMesh || o.userData.isPick) return;
       o.userData.baseMaterial ??= o.material;
       const base = o.userData.baseMaterial;
-      if (!parts) {
+      if (!parts || o.userData.noHighlight) {
+        // The imported body avatar is one continuous skin — it can't light up
+        // a single part, so it keeps its normal look during highlights (the
+        // skeleton/muscle layers carry the emphasis).
         o.material = base;
         return;
       }
-      let n = o;
-      while (n && n.userData.jointName === undefined) n = n.parent;
-      const part = n ? PART_OF_NODE[n.userData.jointName] : null;
+      // Skinned muscles hang off the group, not a joint node, so they carry the
+      // joint they belong to explicitly; everything else walks up to its node.
+      let jointName = o.userData.skinNode;
+      if (jointName === undefined) {
+        let n = o;
+        while (n && n.userData.jointName === undefined) n = n.parent;
+        jointName = n ? n.userData.jointName : null;
+      }
+      const part = jointName ? PART_OF_NODE[jointName] : null;
       o.material = this.#highlightVariant(base, parts.has(part) ? 'lit' : 'dim');
     });
   }
@@ -430,6 +836,7 @@ export class Figure {
       this.clampJoint(name);
     }
     this.group.updateMatrixWorld(true);
+    this.updateMuscleSkin(); // keep bi-articular muscles in step (e.g. ghosts, interp)
   }
 
   resetPose() {
@@ -508,6 +915,7 @@ export class Figure {
     this.pickSpheres = [];
     this.layerMeshes = { skeleton: [], body: [], muscle: [] };
     this.jointSphereByName = {};
+    this._skinMuscles = [];
     this.nodes = {};
     this.#build();
     this.setPose(pose);

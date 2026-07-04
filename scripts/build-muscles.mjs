@@ -1,11 +1,14 @@
 // Build public/models/muscles.glb from the AnatomyTOOL "Upper limb" / "Lower
-// limb" BodyParts3D models (CC-BY-SA — see public/models/ATTRIBUTION.md).
+// limb" / "Muscles of thorax, abdomen and back" BodyParts3D models (CC-BY-SA —
+// see public/models/ATTRIBUTION.md).
 //
-// Those source GLBs carry ~450 parts each (bones, arteries, nerves, ligaments,
-// bursae, …). We keep only the curated main-mover muscles (the ones
+// Those source GLBs carry hundreds of parts each (bones, arteries, nerves,
+// ligaments, bursae, …). We keep only the curated main-mover muscles (the ones
 // classifyMuscle in src/skeletonMesh.js routes to a joint), drop everything
 // else, flatten to a single simple material (the app recolors muscles at
-// runtime), merge both limbs into one scene, and Draco-compress the result.
+// runtime), merge all three source models into one scene, and Draco-compress
+// the result. All three share the BodyParts3D atlas frame, so the abdominal
+// wall from the trunk model lands in the same coordinates as the limb muscles.
 //
 // The output shares the atlas coordinate frame with public/models/skeleton.glb,
 // so the app bakes these muscles into its joint rig using the *skeleton's*
@@ -13,7 +16,9 @@
 //
 // Usage:  node scripts/build-muscles.mjs [sourceDir] [outFile]
 //   sourceDir defaults to "Skeleton and Muscle Models" and must contain
-//   lower-limb.glb and upper-limb.glb (extract them from the *-glb.zip files).
+//   lower-limb.glb and upper-limb.glb (extract them from the *-glb.zip files)
+//   plus muscles-thorax-abdomen.glb (the trunk model, downloaded from
+//   caskanatomy.info/open3dviewer/3dmodels/muscles-thorax-abdomen/).
 //
 // Requires (install once, not committed to package.json):
 //   npm install --no-save @gltf-transform/core @gltf-transform/extensions \
@@ -38,14 +43,20 @@ const io = new NodeIO()
     'draco3d.encoder': await draco3d.createEncoderModule(),
   });
 
-// Keep only classified muscle meshes; detach every other mesh so prune() can
-// reclaim it. Returns how many muscle meshes survived.
+// Keep only classified muscle meshes, and only the first time each belly is
+// seen — the source models overlap (the trunk model also carries the pecs,
+// lats, serratus, psoas, … that the limb models already provide), so later
+// sources contribute only their unique muscles (the abdominal wall). Detach
+// every other mesh so prune() can reclaim it. Returns how many survived.
+const seen = new Set();
+const key = (name) => name.toLowerCase().replace(/[^a-z0-9]/g, '');
 function keepMusclesOnly(doc) {
   let kept = 0;
   for (const node of doc.getRoot().listNodes()) {
     const mesh = node.getMesh();
     if (!mesh) continue;
-    if (classifyMuscle(node.getName())) kept++;
+    const k = key(node.getName());
+    if (classifyMuscle(node.getName()) && !seen.has(k)) { seen.add(k); kept++; }
     else node.setMesh(null);
   }
   return kept;
@@ -60,11 +71,13 @@ async function loadTrimmed(file) {
 
 const lower = await loadTrimmed(path.join(srcDir, 'lower-limb.glb'));
 const upper = await loadTrimmed(path.join(srcDir, 'upper-limb.glb'));
+const trunk = await loadTrimmed(path.join(srcDir, 'muscles-thorax-abdomen.glb'));
 
-// Merge upper into lower, then pull every scene's roots under one scene so the
-// runtime's single gltf.scene traversal sees all muscles.
+// Merge the other sources into lower, then pull every scene's roots under one
+// scene so the runtime's single gltf.scene traversal sees all muscles.
 const out = lower.doc;
 mergeDocuments(out, upper.doc);
+mergeDocuments(out, trunk.doc);
 const scenes = out.getRoot().listScenes();
 const mainScene = out.getRoot().getDefaultScene() || scenes[0];
 for (const scene of scenes) {
@@ -95,4 +108,4 @@ for (const acc of out.getRoot().listAccessors()) acc.setBuffer(buffers[0]);
 for (const b of buffers.slice(1)) b.dispose();
 
 await io.write(outFile, out);
-console.log(`\nWrote ${outFile}  (${lower.kept + upper.kept} muscles total)`);
+console.log(`\nWrote ${outFile}  (${lower.kept + upper.kept + trunk.kept} muscles total)`);

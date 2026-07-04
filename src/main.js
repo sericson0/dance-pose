@@ -6,7 +6,7 @@ import { IK_CHAINS, JOINT_BY_NAME, ANCHOR_FOR } from './skeletonDef.js';
 import { solveTwoBone, editWithAnchor, pinAnchor, feetToFloor } from './ik.js';
 import { balanceReport, coupleReport, footContactsBySide } from './analysis.js';
 import { PRESETS } from './presets.js';
-import { loadSkeletonBones, loadMuscleMeshes } from './skeletonMesh.js';
+import { loadSkeletonBones, loadMuscleMeshes, loadBodyMesh } from './skeletonMesh.js';
 import { initUI } from './ui.js';
 
 // ---------------------------------------------------------------- scene
@@ -135,8 +135,20 @@ if (skeletonBones) {
   }
 }
 
-const leader = new Figure({ name: 'Leader', height: 1.78, mass: 75, color: 0x4d8fd1, skeleton: skeletonBones, muscles: muscleMeshes });
-const follower = new Figure({ name: 'Follower', height: 1.65, mass: 60, color: 0xc95f8e, skin: 0xe0b092, skeleton: skeletonBones, muscles: muscleMeshes });
+// Imported clothed body avatars (Microsoft Rocketbox, MIT). Loaded per role;
+// on failure that figure falls back to the procedural mannequin body.
+async function tryLoadBody(file) {
+  try {
+    return await loadBodyMesh(`${import.meta.env.BASE_URL}models/${file}`);
+  } catch (err) {
+    console.warn(`Body avatar ${file} failed to load; using the mannequin body.`, err);
+    return null;
+  }
+}
+const [manBody, womanBody] = await Promise.all([tryLoadBody('man.glb'), tryLoadBody('woman.glb')]);
+
+const leader = new Figure({ name: 'Leader', height: 1.78, mass: 75, color: 0x4d8fd1, skeleton: skeletonBones, muscles: muscleMeshes, body: manBody });
+const follower = new Figure({ name: 'Follower', height: 1.65, mass: 60, color: 0xc95f8e, skin: 0xe0b092, skeleton: skeletonBones, muscles: muscleMeshes, body: womanBody });
 scene.add(leader.group, follower.group);
 
 // -------------------------------------------------------- balance visuals
@@ -778,6 +790,11 @@ function animate() {
   // whatever edit produced the pose (gizmo, slider, IK, preset, import).
   leader.clampToFloor();
   follower.clampToFloor();
+
+  // Deform bi-articular muscles to the current pose (no-op unless the muscle
+  // layer is showing). Runs after clampToFloor so joint matrices are current.
+  leader.updateMuscleSkin();
+  follower.updateMuscleSkin();
 
   const both = leader.group.visible && follower.group.visible;
   const rA = leader.group.visible ? balanceReport(leader) : null;
