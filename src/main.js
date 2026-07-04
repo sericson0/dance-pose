@@ -6,7 +6,7 @@ import { IK_CHAINS, JOINT_BY_NAME, ANCHOR_FOR } from './skeletonDef.js';
 import { solveTwoBone, editWithAnchor, pinAnchor, feetToFloor } from './ik.js';
 import { balanceReport, coupleReport, footContactsBySide } from './analysis.js';
 import { PRESETS } from './presets.js';
-import { loadSkeletonBones } from './skeletonMesh.js';
+import { loadSkeletonBones, loadMuscleMeshes } from './skeletonMesh.js';
 import { initUI } from './ui.js';
 
 // ---------------------------------------------------------------- scene
@@ -124,8 +124,19 @@ try {
   console.warn('Skeleton mesh failed to load; using procedural bones.', err);
 }
 
-const leader = new Figure({ name: 'Leader', height: 1.78, mass: 75, color: 0x4d8fd1, skeleton: skeletonBones });
-const follower = new Figure({ name: 'Follower', height: 1.65, mass: 60, color: 0xc95f8e, skin: 0xe0b092, skeleton: skeletonBones });
+// Imported main-mover muscles (same atlas, so they need the skeleton's scale).
+// Loaded only when the skeleton did; on failure we fall back to procedural bellies.
+let muscleMeshes = null;
+if (skeletonBones) {
+  try {
+    muscleMeshes = await loadMuscleMeshes(`${import.meta.env.BASE_URL}models/muscles.glb`);
+  } catch (err) {
+    console.warn('Muscle mesh failed to load; using procedural muscles.', err);
+  }
+}
+
+const leader = new Figure({ name: 'Leader', height: 1.78, mass: 75, color: 0x4d8fd1, skeleton: skeletonBones, muscles: muscleMeshes });
+const follower = new Figure({ name: 'Follower', height: 1.65, mass: 60, color: 0xc95f8e, skin: 0xe0b092, skeleton: skeletonBones, muscles: muscleMeshes });
 scene.add(leader.group, follower.group);
 
 // -------------------------------------------------------- balance visuals

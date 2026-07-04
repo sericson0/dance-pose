@@ -47,13 +47,14 @@ const SHANK_PROFILE = [
 ];
 
 export class Figure {
-  constructor({ name, height = 1.72, mass = 70, color = 0x4d8fd1, skin = 0xd9a68a, skeleton = null }) {
+  constructor({ name, height = 1.72, mass = 70, color = 0x4d8fd1, skin = 0xd9a68a, skeleton = null, muscles = null }) {
     this.name = name;
     this.height = height;
     this.mass = mass;
     this.color = color;
     this.skin = skin;
     this.skeletonMesh = skeleton; // parsed atlas bones, or null → procedural bones
+    this.muscleMesh = muscles; // parsed atlas muscles (needs skeleton), or null → procedural
 
     this.group = new THREE.Group(); // root: position (x,z) + facing (rotation.y)
     this.group.userData.figure = this;
@@ -122,7 +123,10 @@ export class Figure {
     }
 
     this.#buildBody();
-    buildMuscles(this);
+    // Muscle layer: imported atlas muscles (share the skeleton's frame, so they
+    // need it too), else the procedural bellies in anatomy.js.
+    if (this.muscleMesh && this.skeletonMesh) this.#buildMeshMuscles();
+    else buildMuscles(this);
     this.setLayers({ skeleton: false, body: true, muscle: false });
   }
 
@@ -175,6 +179,40 @@ export class Figure {
       if (!merged) continue;
       this.addMesh(nodeName, new THREE.Mesh(merged, this.materials[material]), 'skeleton', true);
     }
+  }
+
+  // Attach the imported atlas muscles to our joint tree. They live in the same
+  // atlas frame as the bones, so they bake with the *skeleton's* atlas scale
+  // (a limb-only muscle file has no full-body extent of its own). Each right-
+  // side belly is placed on its node and also mirrored to the left; muscles
+  // stay individual (not merged) so each keeps its name for future labelling
+  // and a distinct tint for readability.
+  #buildMeshMuscles() {
+    const { atlasMinY, atlasHeight } = this.skeletonMesh;
+    const s = this.height / atlasHeight;
+    this.group.updateMatrixWorld(true);
+    const settle = new THREE.Matrix4().makeTranslation(0, -atlasMinY * s, 0);
+    const Tpos = settle.clone().multiply(new THREE.Matrix4().makeScale(s, s, s));
+    const Tneg = settle.clone().multiply(new THREE.Matrix4().makeScale(-s, s, s)); // mirror
+
+    this.muscleMesh.muscles.forEach((m, i) => {
+      const material = i % 2 ? this.materials.muscleA : this.materials.muscleB;
+      const isLimb = LIMB_BASES.has(m.node);
+      const targets = isLimb
+        ? [[`${m.node}_R`, Tpos, false], [`${m.node}_L`, Tneg, true]]
+        : [[m.node, Tpos, false], [m.node, Tneg, true]];
+      for (const [nodeName, T, mirror] of targets) {
+        const node = this.nodes[nodeName];
+        if (!node) continue;
+        const g = m.geometry.clone();
+        const X = node.matrixWorld.clone().invert().multiply(this.group.matrixWorld).multiply(T);
+        g.applyMatrix4(X);
+        if (mirror) reverseWinding(g);
+        const mesh = new THREE.Mesh(g, material);
+        mesh.userData.muscleName = m.label;
+        this.addMesh(nodeName, mesh, 'muscle', true);
+      }
+    });
   }
 
   #buildBody() {

@@ -57,6 +57,101 @@ export function classifyBone(rawName) {
   return null;
 }
 
+// ------------------------------------------------------------------- muscles
+// The main-mover muscles come from the same BodyParts3D atlas as the skeleton
+// (AnatomyTOOL "Upper limb" / "Lower limb" models, CC-BY-SA — see
+// public/models/ATTRIBUTION.md), so they share the skeleton's coordinate frame
+// and bake into our joint nodes with the *skeleton's* atlas scale. Only the
+// right side + a curated set of surface movers are shipped (see
+// scripts/build-muscles.mjs); the left side is mirrored at bake time.
+
+// Each entry maps an atlas muscle's exact name (alphanumeric-normalized) to the
+// joint node it should ride. A muscle spans two joints but attaches rigidly to
+// one, matching the fallback muscle table in anatomy.js: thigh muscles ride the
+// hip, shank muscles the knee, upper-arm the shoulder, forearm the elbow, and
+// the shoulder-girdle / rotator-cuff / trunk muscles the chest. Names are the
+// "whole" belly, not the part/head decompositions the atlas also carries.
+const MUSCLE_NODE = new Map(Object.entries({
+  // Thigh + hip → hip.
+  hip: [
+    'Rectus femoris.r', 'Vastus lateralis muscle.r', 'Vastus medialis muscle.r',
+    'Vastus intermedius muscle.r', 'Sartorius muscle.r', 'Gracilis muscle.r',
+    'Adductor longus.r', 'Adductor brevis.r', 'Adductor magnus.r', 'Pectineus muscle.r',
+    'Gluteus maximus muscle.r', 'Gluteus medius muscle.r', 'Gluteus minimus muscle.r',
+    'Iliacus muscle.r', 'Psoas major.r', 'Piriformis muscle.r',
+    'Long head of biceps femoris.r', 'Short head of biceps femoris.r',
+    'Semitendinosus muscle.r', 'Semimembranosus muscle.r',
+  ],
+  // Shank + foot movers → knee (holds the tibia/fibula).
+  knee: [
+    'Lateral head of gastrocnemius.r', 'Medial head of gastrocnemius.r', 'Soleus muscle.r',
+    'Tibialis anterior muscle.r', 'Tibialis posterior muscle.r',
+    'Fibularis longus muscle.r', 'Fibularis brevis muscle.r',
+    'Extensor digitorum longus.r', 'Extensor hallucis longus.r',
+    'Flexor digitorum longus.r', 'Flexor hallucis longus.r',
+  ],
+  // Upper arm → shoulder.
+  shoulder: [
+    'Deltoid muscle.r', 'Long head of biceps brachii.r', 'Short head of biceps brachii.r',
+    'Brachialis muscle.r', 'Coracobrachialis muscle.r',
+    'Long head of triceps brachii.r', 'Lateral head of triceps brachii.r',
+    'Medial head of triceps brachii.r',
+  ],
+  // Forearm → elbow.
+  elbow: [
+    'Brachioradialis muscle.r', 'Anconeus muscle.r', 'Supinator.r', 'Pronator quadratus.r',
+    'Flexor carpi radialis.r', 'Extensor digitorum.r',
+  ],
+  // Shoulder girdle + rotator cuff + trunk → chest.
+  chest: [
+    'Pectoralis major.r', 'Pectoralis minor muscle.r', 'Trapezius muscle.r',
+    'Latissimus dorsi.r', 'Serratus anterior muscle.r',
+    'Rhomboid major muscle.r', 'Rhomboid minor muscle.r',
+    'Supraspinatus muscle.r', 'Infraspinatus muscle.r',
+    'Teres major muscle.r', 'Teres minor muscle.r', 'Subscapularis muscle.r',
+  ],
+}).flatMap(([node, names]) => names.map((name) => [norm(name), node])));
+
+// Map an atlas muscle name → the joint node it should hang from, or null to
+// skip (arteries, nerves, ligaments, intrinsics, and muscles we don't ship).
+export function classifyMuscle(rawName) {
+  const node = MUSCLE_NODE.get(norm(rawName));
+  return node ? { node } : null;
+}
+
+// Human-readable muscle label from an atlas name: drop the ".r"/".l" side tag
+// and a trailing "muscle" word ("Gluteus maximus muscle.r" → "Gluteus maximus").
+export function muscleLabel(rawName) {
+  return rawName.replace(/\s*\.[rl]\s*$/i, '').replace(/\s+muscle$/i, '').trim();
+}
+
+// Load a muscle atlas GLB and return per-muscle atlas-space geometry, ready for
+// the figure to scale (with the skeleton's atlas metrics), mirror, and attach
+// individually. Every shipped muscle is a right-side belly, so all are mirrored
+// to build the left side.
+export async function loadMuscleMeshes(url) {
+  const draco = new DRACOLoader().setDecoderPath(`${import.meta.env.BASE_URL}draco/`);
+  const loader = new GLTFLoader().setDRACOLoader(draco);
+  const gltf = await loader.loadAsync(url);
+  draco.dispose();
+  gltf.scene.updateMatrixWorld(true);
+  const muscles = [];
+  gltf.scene.traverse((o) => {
+    if (!o.isMesh) return;
+    const cls = classifyMuscle(o.name);
+    if (!cls) return;
+    const g = o.geometry.clone();
+    g.applyMatrix4(o.matrixWorld);
+    for (const key of Object.keys(g.attributes)) {
+      if (key !== 'position' && key !== 'normal') g.deleteAttribute(key);
+    }
+    if (!g.attributes.normal) g.computeVertexNormals();
+    muscles.push({ name: o.name, label: muscleLabel(o.name), node: cls.node, geometry: g });
+  });
+  gltf.scene.traverse((o) => { if (o.isMesh) o.geometry.dispose(); });
+  return { muscles };
+}
+
 // Load the GLB and return per-bone atlas-space geometry plus the atlas extents,
 // ready for the figure to scale/mirror/attach. Geometry is stripped to
 // position+normal so the pieces merge cleanly under a single bone material.
