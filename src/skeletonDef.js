@@ -25,13 +25,17 @@ const LEFT_AND_CENTER = [
     labels: { x: 'Tilt back / forward', y: 'Turn right / left', z: 'Tilt right / left' },
   },
   {
+    // Lumbar spine: generous flexion/extension and side-bend, but the facet
+    // joints block axial rotation almost entirely (~5° per side).
     name: 'spine', parent: 'pelvis', offset: [0, 0.090, 0],
-    limits: { x: [-15, 40], y: [-20, 20], z: [-20, 20] },
+    limits: { x: [-25, 50], y: [-8, 8], z: [-20, 20] },
     labels: { x: 'Extend / bend forward', y: 'Twist right / left', z: 'Bend right / left' },
   },
   {
+    // Thoracic spine: the ribcage restricts flexion/extension, but this is
+    // where trunk rotation — tango dissociation — actually happens.
     name: 'chest', parent: 'spine', offset: [0, 0.100, 0],
-    limits: { x: [-20, 25], y: [-25, 25], z: [-20, 20] },
+    limits: { x: [-20, 30], y: [-35, 35], z: [-25, 25] },
     labels: { x: 'Extend / bend forward', y: 'Twist right / left', z: 'Bend right / left' },
   },
   {
@@ -78,7 +82,15 @@ const LEFT_AND_CENTER = [
     limits: { x: [-25, 45], y: [0, 0], z: [-20, 20] },
     labels: { x: 'Toes up / point toes', z: 'Roll out / in' },
   },
-  { name: 'toe_L', parent: 'ankle_L', offset: [0, -0.035, 0.125], endpoint: true },
+  {
+    // Metatarsophalangeal (toes) joint at the ball of the foot: pure hinge.
+    // Extension (toes up, x<0) is what keeps the toes flat on the floor in a
+    // demi-pointe; flexion (x>0) curls them under.
+    name: 'toes_L', parent: 'ankle_L', offset: [0, -0.030, 0.090],
+    limits: { x: [-70, 35], y: [0, 0], z: [0, 0] },
+    labels: { x: 'Toes up / curl under' },
+  },
+  { name: 'toe_L', parent: 'toes_L', offset: [0, -0.005, 0.035], endpoint: true },
 ];
 
 function mirrorJoint(j) {
@@ -108,11 +120,11 @@ export const JOINT_BY_NAME = Object.fromEntries(JOINTS.map((j) => [j.name, j]));
 
 // Human-readable joint names for the UI.
 export const JOINT_TITLES = {
-  pelvis: 'Pelvis', spine: 'Lower spine', chest: 'Upper spine', neck: 'Neck', head: 'Head',
+  pelvis: 'Pelvis', spine: 'Lumbar spine', chest: 'Thoracic spine', neck: 'Neck', head: 'Head',
   shoulder_L: 'Left shoulder', elbow_L: 'Left elbow', wrist_L: 'Left wrist',
   shoulder_R: 'Right shoulder', elbow_R: 'Right elbow', wrist_R: 'Right wrist',
-  hip_L: 'Left hip', knee_L: 'Left knee', ankle_L: 'Left ankle',
-  hip_R: 'Right hip', knee_R: 'Right knee', ankle_R: 'Right ankle',
+  hip_L: 'Left hip', knee_L: 'Left knee', ankle_L: 'Left ankle', toes_L: 'Left toes',
+  hip_R: 'Right hip', knee_R: 'Right knee', ankle_R: 'Right ankle', toes_R: 'Right toes',
 };
 
 // Segment mass model (de Leva 1996 adjustments of Zatsiorsky's data, simplified).
@@ -135,15 +147,25 @@ export const MASS_SEGMENTS = [
   { name: 'foot R', from: 'ankle_R', to: 'toe_R', mass: 0.0137, com: 0.50 },
 ];
 
-// Foot sole corner points in the ankle's local frame (fractions of height),
-// used to build the base of support. Order: heel-in, heel-out, toe-out, toe-in.
+// Foot sole corner points (fractions of height), used to build the base of
+// support. The heel/ball corners live in the ankle's local frame; the toe-tip
+// corners live in the toes joint's frame so they follow toe flexion (a curled
+// or lifted toe stops counting as its flat-foot floor point).
+// Order: heel-in, heel-out, ball-out, ball-in.
 export const FOOT_CORNERS_L = [
   [-0.030, -0.039, -0.055],
   [0.030, -0.039, -0.055],
-  [0.038, -0.039, 0.135],
-  [-0.038, -0.039, 0.135],
+  [0.038, -0.039, 0.095],
+  [-0.038, -0.039, 0.095],
 ];
 export const FOOT_CORNERS_R = FOOT_CORNERS_L.map(([x, y, z]) => [-x, y, z]);
+// Toe-tip corners in the toes joint's frame (joint at ankle-local
+// (0, -0.030, 0.090); sole plane is 0.009H below it). Order: toe-out, toe-in.
+export const TOE_CORNERS_L = [
+  [0.038, -0.009, 0.045],
+  [-0.038, -0.009, 0.045],
+];
+export const TOE_CORNERS_R = TOE_CORNERS_L.map(([x, y, z]) => [-x, y, z]);
 
 // IK chains: dragging the effector solves root + mid rotations.
 // hingeSign: direction the mid joint is allowed to bend around its X axis.
@@ -158,6 +180,8 @@ export const IK_CHAINS = {
   ankle_R: { root: 'hip_R', mid: 'knee_R', effector: 'ankle_R', hingeSign: 1 },
   toe_L: { root: 'hip_L', mid: 'knee_L', effector: 'ankle_L', hingeSign: 1 },
   toe_R: { root: 'hip_R', mid: 'knee_R', effector: 'ankle_R', hingeSign: 1 },
+  toes_L: { root: 'hip_L', mid: 'knee_L', effector: 'ankle_L', hingeSign: 1 },
+  toes_R: { root: 'hip_R', mid: 'knee_R', effector: 'ankle_R', hingeSign: 1 },
 };
 
 // Highlightable body parts: every mesh attached under one of `nodes` belongs
@@ -171,8 +195,8 @@ export const BODY_PARTS = [
   { id: 'arm_R', title: 'Right arm', nodes: ['shoulder_R', 'elbow_R', 'wrist_R', 'hand_R'] },
   { id: 'leg_L', title: 'Left leg', nodes: ['hip_L', 'knee_L'] },
   { id: 'leg_R', title: 'Right leg', nodes: ['hip_R', 'knee_R'] },
-  { id: 'foot_L', title: 'Left foot', nodes: ['ankle_L', 'toe_L'] },
-  { id: 'foot_R', title: 'Right foot', nodes: ['ankle_R', 'toe_R'] },
+  { id: 'foot_L', title: 'Left foot', nodes: ['ankle_L', 'toes_L', 'toe_L'] },
+  { id: 'foot_R', title: 'Right foot', nodes: ['ankle_R', 'toes_R', 'toe_R'] },
 ];
 
 export const PART_OF_NODE = {};
@@ -192,6 +216,9 @@ export function clampAngle(value, [min, max]) {
 export const ANCHOR_FOR = {
   hip_L: 'ankle_L', knee_L: 'ankle_L', ankle_L: 'ankle_L',
   hip_R: 'ankle_R', knee_R: 'ankle_R', ankle_R: 'ankle_R',
+  // The toes joint anchors itself: with the toes pinned flat on the floor,
+  // extending them rotates the body up over the ball of the foot (a relevé).
+  toes_L: 'toes_L', toes_R: 'toes_R',
   shoulder_L: 'wrist_L', elbow_L: 'wrist_L', wrist_L: 'wrist_L',
   shoulder_R: 'wrist_R', elbow_R: 'wrist_R', wrist_R: 'wrist_R',
   pelvis: 'support-foot', // resolved to the lower ankle at runtime

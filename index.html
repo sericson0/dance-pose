@@ -18,6 +18,7 @@
         <button data-mode="ik" title="Click a hand or foot, then drag the target to pose the whole limb">Drag hand/foot</button>
         <button data-mode="move" title="Click a figure, then drag to move it on the floor">Move figure</button>
         <button data-mode="turn" title="Click a figure, then drag the ring to turn it">Turn figure</button>
+        <button data-mode="pivot" title="Click a figure, then drag the ring to pivot it on the ball of its support foot (ochos, giros, calesita)">Pivot on foot</button>
       </div>
       <div id="chain-buttons" class="btn-group" title="Open: rotating a joint moves the limb below it. Closed: the foot/hand stays planted and the body above moves.">
         <button data-chain="open" class="active">Open chain</button>
@@ -85,6 +86,19 @@
           <button id="snap-b">Set B</button>
           <button id="recall-a" disabled>Show A</button>
           <button id="recall-b" disabled>Show B</button>
+        </div>
+        <div class="check-row">
+          <label title="Show a translucent copy of snapshot A"><input type="checkbox" id="ghost-a" /> Ghost A</label>
+          <label title="Show a translucent copy of snapshot B"><input type="checkbox" id="ghost-b" /> Ghost B</label>
+          <label title="Trace the centers of gravity along the A→B movement on the floor (red where balance is lost)"><input type="checkbox" id="show-path" checked /> COG path</label>
+        </div>
+        <div class="slider-row" id="interp-row" hidden>
+          <div class="lbl"><span>Movement A → B</span><span class="val" id="interp-val">0%</span></div>
+          <input type="range" id="interp-slider" min="0" max="1000" step="1" value="0" />
+          <div class="range-hint"><span>A</span><span>B</span></div>
+        </div>
+        <div class="btn-row">
+          <button id="interp-play" disabled title="Animate the couple from pose A to pose B">▶ Play A→B</button>
         </div>
         <div id="compare-panel" class="muted">Snapshot two poses to see joint-angle and COG changes.</div>
       </section>

@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import {
   JOINTS, JOINT_BY_NAME, DEG, clampAngle, FOOT_CORNERS_L, FOOT_CORNERS_R,
-  PART_OF_NODE,
+  TOE_CORNERS_L, TOE_CORNERS_R, PART_OF_NODE,
 } from './skeletonDef.js';
 import { buildSkeleton, buildMuscles } from './anatomy.js';
 
@@ -19,16 +19,30 @@ const FLOOR_CLEARANCE = {
   hand_L: 0.012, hand_R: 0.012,
   hip_L: 0.055, hip_R: 0.055,
   knee_L: 0.042, knee_R: 0.042,
+  toes_L: 0.008, toes_R: 0.008, // ball of the foot: sole is 0.009H below the joint
   toe_L: 0.004, toe_R: 0.004,
 };
 
 // Body-view capsule radii per segment (fractions of height).
 const BODY_RADII = {
-  hip_L: 0.052, hip_R: 0.052,     // thighs
-  knee_L: 0.040, knee_R: 0.040,   // shanks
   shoulder_L: 0.036, shoulder_R: 0.036, // upper arms
   elbow_L: 0.029, elbow_R: 0.029, // forearms
 };
+
+// Lathe profiles for the legs: [t, r] pairs, t running 0 (proximal joint) to
+// 1 (distal joint), radii as fractions of height. Profiles overshoot [0, 1]
+// slightly so their open rims hide inside the pelvis / knee ball / ankle.
+const THIGH_PROFILE = [
+  [-0.06, 0.010], [-0.04, 0.030], [0.02, 0.048], [0.08, 0.054], [0.18, 0.057],
+  [0.35, 0.052], [0.55, 0.046], [0.75, 0.041], [0.9, 0.038], [1.0, 0.0345],
+  [1.04, 0.024], [1.09, 0.008],
+];
+// Calf bulge in the upper third, tapering to a narrow ankle.
+const SHANK_PROFILE = [
+  [-0.05, 0.008], [-0.03, 0.024], [0, 0.0355], [0.06, 0.038], [0.16, 0.042],
+  [0.28, 0.041], [0.45, 0.034], [0.65, 0.026], [0.85, 0.020], [1.0, 0.0165],
+  [1.03, 0.010], [1.05, 0.004],
+];
 
 export class Figure {
   constructor({ name, height = 1.72, mass = 70, color = 0x4d8fd1, skin = 0xd9a68a }) {
@@ -130,9 +144,19 @@ export class Figure {
     limbFor('neck', 'head', 0.024, this.materials.skin);
 
     // Limbs.
+    const legEnd = (childName) => {
+      const child = JOINT_BY_NAME[childName];
+      return new THREE.Vector3(child.offset[0] * H, child.offset[1] * H, child.offset[2] * H);
+    };
     for (const side of ['L', 'R']) {
-      limbFor(`hip_${side}`, `knee_${side}`, BODY_RADII[`hip_${side}`], this.materials.clothDark);
-      limbFor(`knee_${side}`, `ankle_${side}`, BODY_RADII[`knee_${side}`], this.materials.clothDark);
+      // Legs: tapered profiles instead of uniform capsules.
+      this.#bodyLimbProfile(`hip_${side}`, new THREE.Vector3(), legEnd(`knee_${side}`),
+        THIGH_PROFILE, this.materials.clothDark);
+      this.#bodyLimbProfile(`knee_${side}`, new THREE.Vector3(), legEnd(`ankle_${side}`),
+        SHANK_PROFILE, this.materials.clothDark);
+      // Knee ball fills the gap when the knee bends; at rest it hides just
+      // inside the thigh/shank profiles so no intersection ring shows.
+      this.#bodyBall(`knee_${side}`, 0, 0, 0, 0.033 * H, this.materials.clothDark);
       limbFor(`shoulder_${side}`, `elbow_${side}`, BODY_RADII[`shoulder_${side}`], this.materials.cloth);
       limbFor(`elbow_${side}`, `wrist_${side}`, BODY_RADII[`elbow_${side}`], this.materials.skin);
       // Hand: small flattened ellipsoid.
@@ -142,12 +166,20 @@ export class Figure {
       hand.castShadow = true;
       this.nodes[`wrist_${side}`].add(hand);
       this.layerMeshes.body.push(hand);
-      // Shoe.
-      const shoe = new THREE.Mesh(new THREE.BoxGeometry(0.062 * H, 0.046 * H, 0.19 * H), this.materials.shoe);
-      shoe.position.set(0, -0.019 * H, 0.048 * H);
-      shoe.castShadow = true;
-      this.nodes[`ankle_${side}`].add(shoe);
-      this.layerMeshes.body.push(shoe);
+      // Foot: bare ankle, then a shaped shoe — rounded heel, arched instep,
+      // toe box. Sole grazes y = -0.039H to match FOOT_CORNERS.
+      this.#bodyBall(`ankle_${side}`, 0, -0.006 * H, 0, 0.016 * H, this.materials.skin);
+      this.#bodyBall(`ankle_${side}`, 0, -0.020 * H, -0.028 * H, 0.019 * H, this.materials.shoe)
+        .scale.set(1.2, 0.95, 1.5);
+      this.#bodyBall(`ankle_${side}`, 0, -0.016 * H, 0.024 * H, 0.019 * H, this.materials.shoe)
+        .scale.set(1.4, 1.15, 2.5);
+      this.#bodyBall(`ankle_${side}`, 0, -0.022 * H, 0.064 * H, 0.015 * H, this.materials.shoe)
+        .scale.set(1.9, 1.1, 2.1);
+      // Toe cap rides the toes joint so demi-pointe and toe curls read in
+      // body view; its underside grazes the toes-local sole plane (y=-0.009H)
+      // and its tail tucks under the toe box above.
+      this.#bodyBall(`toes_${side}`, 0, 0.0027 * H, 0.021 * H, 0.013 * H, this.materials.shoe)
+        .scale.set(2.2, 0.9, 1.9);
     }
 
     // Head + hair + nose (nose shows facing in both skeleton and body views).
@@ -172,6 +204,28 @@ export class Figure {
     const dir = b.clone().sub(a);
     mesh.position.copy(a).addScaledVector(dir, 0.5);
     mesh.quaternion.setFromUnitVectors(Y_AXIS, dir.normalize());
+  }
+
+  // Tapered limb from a lathe profile of [t, r] pairs (t: 0 at a → 1 at b).
+  #bodyLimbProfile(nodeName, a, b, profile, material) {
+    const H = this.height;
+    const len = a.distanceTo(b);
+    const pts = profile.map(([t, r]) => new THREE.Vector2(r * H, (t - 0.5) * len));
+    const mesh = new THREE.Mesh(new THREE.LatheGeometry(pts, 16), material);
+    this.#alignY(mesh, a, b);
+    mesh.castShadow = true;
+    this.nodes[nodeName].add(mesh);
+    this.layerMeshes.body.push(mesh);
+    return mesh;
+  }
+
+  #bodyBall(nodeName, x, y, z, radius, material) {
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, 14, 10), material);
+    mesh.position.set(x, y, z);
+    mesh.castShadow = true;
+    this.nodes[nodeName].add(mesh);
+    this.layerMeshes.body.push(mesh);
+    return mesh;
   }
 
   #bodyCapsule(nodeName, a, b, radius, material, sx = 1, sz = 1) {
@@ -317,8 +371,11 @@ export class Figure {
     this.group.updateMatrixWorld(true);
     const H = this.height;
     let minY = Infinity;
-    for (const [ankle, corners] of [['ankle_L', FOOT_CORNERS_L], ['ankle_R', FOOT_CORNERS_R]]) {
-      const node = this.nodes[ankle];
+    for (const [nodeName, corners] of [
+      ['ankle_L', FOOT_CORNERS_L], ['ankle_R', FOOT_CORNERS_R],
+      ['toes_L', TOE_CORNERS_L], ['toes_R', TOE_CORNERS_R],
+    ]) {
+      const node = this.nodes[nodeName];
       for (const [x, y, z] of corners) {
         _floorPt.set(x * H, y * H, z * H);
         node.localToWorld(_floorPt);

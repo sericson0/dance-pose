@@ -1,7 +1,8 @@
 import { feetToFloor } from './ik.js';
 
 // Sign conventions (see skeletonDef.js): hip x<0 leg forward · knee x>0 bend ·
-// ankle x>0 point toes · spine/chest x>0 lean forward · shoulder x<0 arm
+// ankle x>0 point toes · toes x<0 toes up (demi-pointe) / x>0 curl under ·
+// spine (lumbar) / chest (thoracic) x>0 lean forward · shoulder x<0 arm
 // forward/up · left-side z>0 = out to the side (right side mirrored) ·
 // elbow x<0 bend.
 
@@ -55,16 +56,16 @@ export const PRESETS = [
       embraceArms(leader, follower);
       leader.setJointDegrees({
         hip_L: { x: -28 }, knee_L: { x: 8 }, ankle_L: { x: -12 },
-        hip_R: { x: 15 }, knee_R: { x: 6 }, ankle_R: { x: 38 },
+        hip_R: { x: 15 }, knee_R: { x: 36 }, ankle_R: { x: 33 },
         pelvis: { x: 3 },
       });
-      leader.nodes.pelvis.position.y = 0.518 * leader.height;
+      leader.nodes.pelvis.position.y = 0.515 * leader.height;
       follower.setJointDegrees({
-        hip_R: { x: 15 }, knee_R: { x: 4 }, ankle_R: { x: 45 },
-        hip_L: { x: -8 }, knee_L: { x: 12 }, ankle_L: { x: -4 },
+        hip_R: { x: 15 }, knee_R: { x: 36 }, ankle_R: { x: 33 },
+        hip_L: { x: -8 }, knee_L: { x: 12 }, ankle_L: { x: -7 },
         pelvis: { x: 3 },
       });
-      follower.nodes.pelvis.position.y = 0.514 * follower.height;
+      follower.nodes.pelvis.position.y = 0.527 * follower.height;
       leader.group.updateMatrixWorld(true);
       follower.group.updateMatrixWorld(true);
     },
@@ -120,21 +121,160 @@ export const PRESETS = [
       place(follower, -0.08, 0.24, 180);
       embraceArms(leader, follower);
       // Leader marks the ocho: weight over the flat left foot, chest rotated,
-      // free right foot trailing on a pointed toe.
+      // free right foot collected behind on a grazing toe.
       leader.setJointDegrees({
         chest: { y: 10 }, spine: { y: 6 },
         hip_L: { x: -3 }, knee_L: { x: 6 }, ankle_L: { x: -3 },
-        hip_R: { x: 14 }, knee_R: { x: 18 }, ankle_R: { x: -6 },
+        hip_R: { x: 14 }, knee_R: { x: 42 }, ankle_R: { x: 30 },
       });
       // Follower mid forward-ocho: hips turned, upper body dissociated back
-      // toward the leader, right leg reaching through, trailing toe pointed.
+      // toward the leader, right leg reaching through, trailing toe grazing.
       follower.setJointDegrees({
         pelvis: { y: -28 },
-        spine: { y: 16 }, chest: { y: 22 }, neck: { y: -18 },
-        hip_R: { x: -32 }, knee_R: { x: 10 }, ankle_R: { x: 15 },
-        hip_L: { x: 15 }, knee_L: { x: 15 }, ankle_L: { x: -3 },
+        spine: { y: 8 }, chest: { y: 30 }, neck: { y: -18 },
+        hip_R: { x: -28 }, knee_R: { x: 8 }, ankle_R: { x: 30 },
+        hip_L: { x: 15 }, knee_L: { x: 40 }, ankle_L: { x: 33 },
       });
       follower.nodes.pelvis.position.y = 0.515 * follower.height;
+      leader.group.updateMatrixWorld(true);
+      follower.group.updateMatrixWorld(true);
+    },
+  },
+  {
+    name: 'Back ocho (follower mid-step)',
+    apply(leader, follower) {
+      leader.resetPose();
+      follower.resetPose();
+      place(leader, 0, -0.17, 0);
+      place(follower, -0.05, 0.28, 180);
+      embraceArms(leader, follower);
+      // Leader marks the back ocho: weight over the right foot, chest rotated
+      // the other way, free left foot collected on a grazing toe.
+      leader.setJointDegrees({
+        chest: { y: -10 }, spine: { y: -6 },
+        hip_R: { x: -3 }, knee_R: { x: 6 }, ankle_R: { x: -3 },
+        hip_L: { x: 14 }, knee_L: { x: 42 }, ankle_L: { x: 30 },
+      });
+      // Follower mid back-ocho: hips turned, chest dissociated back toward the
+      // leader, left leg reaching behind on a pointed grazing toe.
+      follower.setJointDegrees({
+        pelvis: { y: 26 },
+        spine: { y: -8 }, chest: { y: -26 }, neck: { y: 16 },
+        hip_L: { x: 15 }, knee_L: { x: 36 }, ankle_L: { x: 33 },
+        hip_R: { x: -8 }, knee_R: { x: 12 }, ankle_R: { x: -4 },
+      });
+      follower.nodes.pelvis.position.y = 0.527 * follower.height;
+      leader.group.updateMatrixWorld(true);
+      follower.group.updateMatrixWorld(true);
+    },
+  },
+  {
+    name: 'Colgada (counter-lean)',
+    apply(leader, follower) {
+      leader.resetPose();
+      follower.resetPose();
+      place(leader, 0, -0.22, 0);
+      place(follower, -0.04, 0.22, 180);
+      // Arms reaching to a hand-to-hand grip — the pull holds both dancers up.
+      leader.setJointDegrees({
+        shoulder_L: { x: -50, z: 10 }, elbow_L: { x: -40 },
+        shoulder_R: { x: -50, z: -10 }, elbow_R: { x: -40 },
+        neck: { x: -8 },
+      });
+      follower.setJointDegrees({
+        shoulder_R: { x: -50, z: -10 }, elbow_R: { x: -40 },
+        shoulder_L: { x: -50, z: 10 }, elbow_L: { x: -40 },
+        neck: { x: -8 },
+      });
+      // Both hang back away from the shared axis; feet stay in at the middle.
+      leader.setJointDegrees({ pelvis: { x: -18 }, spine: { x: 6 }, chest: { x: 5 } });
+      follower.setJointDegrees({ pelvis: { x: -18 }, spine: { x: 6 }, chest: { x: 5 } });
+      leader.group.updateMatrixWorld(true);
+      follower.group.updateMatrixWorld(true);
+      feetToFloor(leader);
+      feetToFloor(follower);
+      // The hip's backward limit keeps the IK from reaching the floor on a
+      // deep back-lean; settle the remaining gap through the root.
+      leader.group.position.y -= leader.lowestPointY();
+      follower.group.position.y -= follower.lowestPointY();
+    },
+  },
+  {
+    name: 'Volcada (follower leans in)',
+    apply(leader, follower) {
+      leader.resetPose();
+      follower.resetPose();
+      place(leader, 0, -0.19, 0);
+      place(follower, -0.04, 0.13, 180);
+      embraceArms(leader, follower);
+      // Leader: split stance, slight back-lean to receive her weight.
+      leader.setJointDegrees({
+        pelvis: { x: -4 },
+        hip_L: { x: -14 }, knee_L: { x: 8 },
+        hip_R: { x: 12 }, knee_R: { x: 6 },
+      });
+      leader.group.updateMatrixWorld(true);
+      feetToFloor(leader);
+      // Follower: tilted forward past her base onto the leader, support leg
+      // vertical under the pelvis, free leg trailing behind off the floor.
+      follower.setJointDegrees({
+        pelvis: { x: 16 }, spine: { x: 2 }, chest: { x: 2 },
+        hip_R: { x: -16 }, knee_R: { x: 4 }, ankle_R: { x: -4 },
+        hip_L: { x: 15 }, knee_L: { x: 20 }, ankle_L: { x: 45 },
+      });
+      follower.group.updateMatrixWorld(true);
+    },
+  },
+  {
+    name: 'Parada / pasada (step over)',
+    apply(leader, follower) {
+      leader.resetPose();
+      follower.resetPose();
+      place(leader, 0, -0.24, 0);
+      place(follower, -0.05, 0.22, 180);
+      embraceArms(leader, follower);
+      // Leader sinks on the left leg and extends the right foot to stop the
+      // follower's foot; both soles flat (angle triples sum to zero).
+      leader.setJointDegrees({
+        hip_L: { x: -8 }, knee_L: { x: 26 }, ankle_L: { x: -18 },
+        hip_R: { x: -20 }, knee_R: { x: 10 }, ankle_R: { x: 9 },
+      });
+      leader.nodes.pelvis.position.y = 0.5155 * leader.height;
+      // Follower steps over the leader's foot: left leg lifted high mid-pasada.
+      follower.setJointDegrees({
+        spine: { y: 6 }, chest: { y: 8 },
+        hip_R: { x: -2 }, knee_R: { x: 4 }, ankle_R: { x: -2 },
+        hip_L: { x: -48 }, knee_L: { x: 70 }, ankle_L: { x: 30 },
+      });
+      leader.group.updateMatrixWorld(true);
+      follower.group.updateMatrixWorld(true);
+    },
+  },
+  {
+    name: 'Giro (follower side step)',
+    apply(leader, follower) {
+      leader.resetPose();
+      follower.resetPose();
+      place(leader, 0, -0.15, 0);
+      place(follower, -0.10, 0.22, 180);
+      embraceArms(leader, follower);
+      // Leader pivots collected on the left foot, torso leading the turn,
+      // free right foot on the toe beside it.
+      leader.setJointDegrees({
+        spine: { y: 8 }, chest: { y: 16 },
+        hip_L: { x: -3 }, knee_L: { x: 6 }, ankle_L: { x: -3 },
+        hip_R: { x: 2 }, knee_R: { x: 50 }, ankle_R: { x: 42 },
+      });
+      leader.nodes.pelvis.position.y = 0.525 * leader.height;
+      // Follower: wide side step of the molinete — right leg reaching out on a
+      // grazing toe, lowered into the standing left leg, shoulders staying
+      // with the leader.
+      follower.setJointDegrees({
+        spine: { y: -8 }, chest: { y: -24 }, neck: { y: 12 },
+        hip_R: { x: -2, z: -24 }, knee_R: { x: 6 }, ankle_R: { x: 12, z: 18 },
+        hip_L: { x: -4, z: 4 }, knee_L: { x: 18 }, ankle_L: { x: -14 },
+      });
+      follower.nodes.pelvis.position.y = 0.518 * follower.height;
       leader.group.updateMatrixWorld(true);
       follower.group.updateMatrixWorld(true);
     },
@@ -147,9 +287,11 @@ export const PRESETS = [
       place(leader, 0, -0.17, 0);
       place(follower, -0.05, 0.17, 180);
       embraceArms(leader, follower);
-      // Follower's upper body twists against quiet hips — the heart of the ocho.
+      // Follower's upper body twists against quiet hips — the heart of the
+      // ocho. Almost all of it comes from the thoracic spine: the lumbar
+      // facets allow only a few degrees.
       follower.setJointDegrees({
-        spine: { y: 18 }, chest: { y: 25 }, neck: { y: -20 },
+        spine: { y: 8 }, chest: { y: 35 }, neck: { y: -20 },
         hip_R: { y: 5 },
       });
       follower.group.updateMatrixWorld(true);

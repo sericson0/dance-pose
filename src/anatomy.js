@@ -40,6 +40,27 @@ export function spindleGeometry() {
 
 // Long bone: a shaft plus rounded condyles at each end; optionally two parallel
 // shafts (forearm, lower leg).
+// Small primitives shared by the anatomical builders: an ellipsoid knob and a
+// tapered shaft (radii are fractions of height; rB is the radius at end b).
+function ball(fig, nodeName, x, y, z, r, sx = 1, sy = 1, sz = 1, mat = 'bone', cast = true) {
+  const H = fig.height;
+  const m = new THREE.Mesh(new THREE.SphereGeometry(r * H, 12, 10), fig.materials[mat]);
+  m.position.set(x * H, y * H, z * H);
+  m.scale.set(sx, sy, sz);
+  fig.addMesh(nodeName, m, 'skeleton', cast);
+  return m;
+}
+
+function shaft(fig, nodeName, a, b, rA, rB, mat = 'bone') {
+  const m = new THREE.Mesh(
+    new THREE.CylinderGeometry(rB * fig.height, rA * fig.height, a.distanceTo(b), 10),
+    fig.materials[mat],
+  );
+  alignY(m, a, b);
+  fig.addMesh(nodeName, m, 'skeleton');
+  return m;
+}
+
 function longBone(fig, nodeName, a, b, { rMid, rEnd, double = false, sep = 0 }) {
   const H = fig.height;
   const dir = b.clone().sub(a);
@@ -138,35 +159,55 @@ function ribcage(fig) {
   const sternum = new THREE.Mesh(new THREE.BoxGeometry(0.02 * H, 0.11 * H, 0.01 * H), fig.materials.bone);
   sternum.position.set(0, -0.02 * H, 0.072 * H);
   fig.addMesh('chest', sternum, 'skeleton');
-  // Clavicle + scapula per side.
+  // Shoulder girdle per side (shoulder joint at chest-local ±0.115, 0.110, 0).
+  const v = (x, y, z) => new THREE.Vector3(x * H, y * H, z * H);
   for (const sx of [-1, 1]) {
-    const scap = new THREE.Mesh(new THREE.SphereGeometry(0.03 * H, 12, 8), fig.materials.bone);
-    scap.position.set(sx * 0.075 * H, 0.075 * H, -0.045 * H);
-    scap.scale.set(0.7, 1.1, 0.35);
-    fig.addMesh('chest', scap, 'skeleton', false);
+    // Clavicle: S-curved strut from the sternal notch out to the acromion,
+    // bowing forward over the first rib then sweeping back.
+    shaft(fig, 'chest', v(sx * 0.014, 0.078, 0.062), v(sx * 0.062, 0.095, 0.040), 0.0055, 0.005);
+    shaft(fig, 'chest', v(sx * 0.062, 0.095, 0.040), v(sx * 0.104, 0.118, 0.002), 0.005, 0.005);
+    ball(fig, 'chest', sx * 0.062, 0.095, 0.040, 0.006, 1, 1, 1, 'bone', false);
+    // Scapula: flat blade riding the back of the ribcage, lateral edge
+    // swinging forward toward the glenoid.
+    const blade = ball(fig, 'chest', sx * 0.078, 0.058, -0.050, 0.040, 0.75, 1.05, 0.18);
+    blade.rotation.set(0, sx * 0.30, sx * 0.12);
+    // Scapular spine ridge rising to the acromion above the humeral head.
+    shaft(fig, 'chest', v(sx * 0.052, 0.088, -0.058), v(sx * 0.102, 0.115, -0.012), 0.005, 0.005);
+    ball(fig, 'chest', sx * 0.106, 0.120, -0.004, 0.0075, 1.1, 0.7, 1.2);
+    // Glenoid fossa: shallow socket facing the humeral head.
+    ball(fig, 'chest', sx * 0.106, 0.104, -0.004, 0.011, 0.5, 1.1, 0.9, 'cartilage', false);
   }
 }
 
+// Pelvic ring: sacrum + coccyx at the back, flaring iliac wings with ASIS
+// points, acetabular sockets cupping the femoral heads (hips at ±0.052H),
+// and the pubic/ischial ring closing at the symphysis in front.
 function pelvisBone(fig) {
   const H = fig.height;
-  // Sacrum.
-  const sacrum = new THREE.Mesh(new THREE.SphereGeometry(0.028 * H, 12, 10), fig.materials.bone);
-  sacrum.position.set(0, 0.02 * H, -0.028 * H);
-  sacrum.scale.set(0.9, 1.1, 0.7);
-  fig.addMesh('pelvis', sacrum, 'skeleton');
-  // Iliac wings.
+  const v = (x, y, z) => new THREE.Vector3(x * H, y * H, z * H);
+
+  // Sacrum: wedge between the wings, tipped forward at the top (nutation),
+  // tapering to the coccyx.
+  const sacrum = ball(fig, 'pelvis', 0, 0.028, -0.030, 0.026, 1.0, 1.25, 0.6);
+  sacrum.rotation.x = 0.35;
+  ball(fig, 'pelvis', 0, -0.004, -0.038, 0.008, 0.8, 1.1, 0.8, 'bone', false); // coccyx
+
   for (const sx of [-1, 1]) {
-    const ilium = new THREE.Mesh(new THREE.SphereGeometry(0.05 * H, 16, 12), fig.materials.bone);
-    ilium.position.set(sx * 0.045 * H, 0.02 * H, 0.004 * H);
-    ilium.scale.set(0.5, 0.95, 0.85);
-    ilium.rotation.z = sx * 0.35;
-    fig.addMesh('pelvis', ilium, 'skeleton');
-    // Ischium / pubis (sit bone) lower and forward.
-    const ischium = new THREE.Mesh(new THREE.SphereGeometry(0.024 * H, 10, 8), fig.materials.bone);
-    ischium.position.set(sx * 0.03 * H, -0.04 * H, 0.006 * H);
-    ischium.scale.set(0.8, 0.8, 0.9);
-    fig.addMesh('pelvis', ischium, 'skeleton', false);
+    // Iliac wing: broad blade flaring out at the crest, fossa opening forward.
+    const ilium = ball(fig, 'pelvis', sx * 0.040, 0.035, -0.010, 0.042, 0.38, 1.0, 0.85);
+    ilium.rotation.set(0, sx * 0.35, -sx * 0.40);
+    // ASIS: the bony point at the front of the crest.
+    ball(fig, 'pelvis', sx * 0.052, 0.028, 0.024, 0.008, 1, 1, 1, 'bone', false);
+    // Acetabulum: socket cupping the femoral head from above/medial.
+    ball(fig, 'pelvis', sx * 0.046, 0.006, -0.002, 0.023, 0.6, 1.0, 1.0, 'cartilage');
+    // Pubic rami: superior to the symphysis, inferior down to the ischium.
+    shaft(fig, 'pelvis', v(sx * 0.042, -0.006, 0.010), v(sx * 0.006, -0.020, 0.030), 0.007, 0.007);
+    shaft(fig, 'pelvis', v(sx * 0.008, -0.026, 0.028), v(sx * 0.028, -0.042, 0.000), 0.006, 0.006);
+    // Ischial tuberosity (sit bone).
+    ball(fig, 'pelvis', sx * 0.030, -0.044, -0.004, 0.012, 0.85, 1.1, 1.0);
   }
+  // Pubic symphysis joining the rami in front.
+  ball(fig, 'pelvis', 0, -0.022, 0.030, 0.009, 0.9, 1.2, 0.7, 'cartilage', false);
 }
 
 function digits(fig, nodeName, base, count, length, spread, forward) {
@@ -199,25 +240,85 @@ function hand(fig, side) {
   fig.addMesh(node, thumb, 'skeleton', false);
 }
 
+// One leg's bones. Lateral is +X on the left (s = 1), -X on the right; medial
+// is the opposite. Femur lives on the hip node, tibia + fibula on the knee
+// node, so the malleoli stay with the shank when the ankle flexes.
+function legBones(fig, side) {
+  const H = fig.height;
+  const s = side === 'L' ? 1 : -1;
+  const hip = `hip_${side}`;
+  const knee = `knee_${side}`;
+  const kY = fig.nodes[knee].position.y / H;                  // knee offset in hip frame
+  const aY = fig.nodes[`ankle_${side}`].position.y / H;        // ankle offset in knee frame
+  const v = (x, y, z) => new THREE.Vector3(x * H, y * H, z * H);
+
+  // Femur: head at the joint, neck out to the greater trochanter, then a
+  // shaft that angles back toward the midline (valgus) with a slight bow.
+  ball(fig, hip, 0, 0, 0, 0.021, 1, 1, 1, 'cartilage');
+  shaft(fig, hip, v(0, 0, 0), v(s * 0.028, -0.014, -0.003), 0.011, 0.012);
+  ball(fig, hip, s * 0.028, -0.014, -0.003, 0.016, 0.9, 1.25, 0.9);
+  shaft(fig, hip, v(s * 0.026, -0.030, -0.002), v(0, kY + 0.024, 0), 0.015, 0.017);
+  // Medial + lateral condyles sweep backward; patella rides in front.
+  for (const m of [-1, 1]) {
+    ball(fig, hip, m * 0.0135, kY + 0.006, -0.004, 0.0165, 0.95, 0.9, 1.3, 'cartilage');
+  }
+  ball(fig, hip, 0, kY + 0.012, 0.024, 0.013, 1, 1.15, 0.6);
+
+  // Tibia: plateau under the condyles, tuberosity on the front, strong shaft
+  // running slightly medial and ending at the medial malleolus.
+  ball(fig, knee, 0, -0.006, -0.002, 0.019, 1.15, 0.55, 1);
+  ball(fig, knee, 0, -0.034, 0.016, 0.008, 1, 1.2, 0.8);
+  shaft(fig, knee, v(-s * 0.004, -0.014, 0.002), v(-s * 0.008, aY + 0.02, 0.003), 0.0135, 0.010);
+  ball(fig, knee, -s * 0.011, aY + 0.004, 0.002, 0.0095, 0.85, 1.15, 0.9, 'cartilage');
+  // Fibula: thin lateral splint from below the plateau down to the lateral
+  // malleolus, which rides lower than the medial one.
+  ball(fig, knee, s * 0.020, -0.028, -0.008, 0.0085, 0.9, 1.1, 0.9);
+  shaft(fig, knee, v(s * 0.020, -0.034, -0.008), v(s * 0.016, aY - 0.004, -0.002), 0.005, 0.0045);
+  ball(fig, knee, s * 0.016, aY - 0.008, -0.002, 0.008, 0.8, 1.2, 0.9, 'cartilage');
+}
+
+// Foot: talus, calcaneus, midfoot tarsals, five arched metatarsal rays and
+// toes. Medial (big-toe) side faces the midline: -X on the left foot, +X on
+// the right. The sole plane sits at y = -0.039H (FOOT_CORNERS in
+// skeletonDef.js); nothing here may dip below it or the floor clamp lifts
+// the whole dancer. The phalanges attach to the toes (MTP) joint — at
+// ankle-local (0, -0.030, 0.090) — so they hinge at the ball of the foot.
 function foot(fig, side) {
   const H = fig.height;
+  const s = side === 'L' ? 1 : -1;
   const node = `ankle_${side}`;
-  // Tarsals / heel block.
-  const heel = new THREE.Mesh(new THREE.BoxGeometry(0.05 * H, 0.03 * H, 0.06 * H), fig.materials.bone);
-  heel.position.set(0, -0.028 * H, -0.01 * H);
-  fig.addMesh(node, heel, 'skeleton');
-  // Metatarsals + toes reaching forward.
-  digits(fig, node, new THREE.Vector3(0, -0.035 * H, 0.02 * H), 5, -0.005, 0.05, 0.11);
+  const toes = `toes_${side}`;
+  const v = (x, y, z) => new THREE.Vector3(x * H, y * H, z * H);
+  // Same authoring coordinates as `v` (ankle-local), re-expressed in the
+  // toes joint's frame.
+  const tv = (x, y, z) => new THREE.Vector3(x * H, (y + 0.030) * H, (z - 0.090) * H);
+
+  ball(fig, node, 0, -0.008, 0.002, 0.014, 1, 0.8, 1.1, 'cartilage'); // talus dome
+  ball(fig, node, 0, -0.024, -0.030, 0.015, 1, 0.95, 1.75);           // calcaneus (heel)
+  ball(fig, node, -s * 0.003, -0.018, 0.020, 0.012, 1.35, 0.8, 1.1);  // navicular + cuboid
+
+  for (let i = 0; i < 5; i++) {
+    const medial = -s; // ray 0 = big toe on the medial edge
+    const bx = medial * (0.014 - i * 0.007);
+    const hx = medial * (0.022 - i * 0.011);
+    const baseY = -0.015 - i * 0.002;  // longitudinal arch: higher medially
+    const headZ = 0.097 - i * 0.0065;  // oblique line of the ball of the foot
+    const rMeta = i === 0 ? 0.006 : 0.0044;
+    shaft(fig, node, v(bx, baseY, 0.030), v(hx, -0.029, headZ), rMeta, rMeta * 0.9);
+    ball(fig, node, hx, -0.030, headZ, i === 0 ? 0.0068 : 0.005, 1, 0.9, 1, 'cartilage', false);
+    // Toe descends from the ball to graze the sole plane.
+    const tipZ = headZ + (i === 0 ? 0.030 : 0.024 - i * 0.003);
+    const rToe = i === 0 ? 0.0052 : 0.0036;
+    shaft(fig, toes, tv(hx, -0.029, headZ + 0.004), tv(hx * 1.05, -0.0345, tipZ), rToe, rToe * 0.8);
+  }
 }
 
 export function buildSkeleton(fig) {
   const H = fig.height;
   const off = (name) => fig.nodes[name].position.clone();
 
+  // Arm long bones stay table-driven; legs get the anatomical builder below.
   const LONG = {
-    knee_L: { rMid: 0.017, rEnd: 0.030 }, knee_R: { rMid: 0.017, rEnd: 0.030 },
-    ankle_L: { rMid: 0.011, rEnd: 0.024, double: true, sep: 0.011 },
-    ankle_R: { rMid: 0.011, rEnd: 0.024, double: true, sep: 0.011 },
     elbow_L: { rMid: 0.013, rEnd: 0.021 }, elbow_R: { rMid: 0.013, rEnd: 0.021 },
     wrist_L: { rMid: 0.009, rEnd: 0.015, double: true, sep: 0.009 },
     wrist_R: { rMid: 0.009, rEnd: 0.015, double: true, sep: 0.009 },
@@ -232,7 +333,7 @@ export function buildSkeleton(fig) {
   spineColumn(fig);
   ribcage(fig);
   pelvisBone(fig);
-  for (const side of ['L', 'R']) { hand(fig, side); foot(fig, side); }
+  for (const side of ['L', 'R']) { legBones(fig, side); hand(fig, side); foot(fig, side); }
 }
 
 // -------------------------------------------------------------------- muscles
@@ -259,6 +360,8 @@ const MUSCLES_LEFT = [
   { node: 'knee_L', pa: [0.0, -0.06, -0.025], pb: [0.0, -0.195, -0.02], r: 0.02, name: 'Soleus' },
   // Tib ant: lateral upper tibia, crossing to insert at the medial ankle.
   { node: 'knee_L', pa: [0.012, -0.03, 0.022], pb: [-0.004, -0.19, 0.016], r: 0.014, name: 'Tibialis anterior' },
+  // Peroneals: down the lateral face of the fibula toward the lateral malleolus.
+  { node: 'knee_L', pa: [0.018, -0.035, -0.006], pb: [0.014, -0.20, -0.002], r: 0.010, name: 'Peroneals' },
   // Upper arm.
   { node: 'shoulder_L', pa: [0.016, 0.014, 0], pb: [0.006, -0.06, 0], r: 0.032, name: 'Deltoid' },
   { node: 'shoulder_L', pa: [0.004, -0.05, 0.02], pb: [0.002, -0.16, 0.014], r: 0.022, name: 'Biceps' },

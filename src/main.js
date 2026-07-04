@@ -4,7 +4,7 @@ import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { Figure } from './figure.js';
 import { IK_CHAINS, JOINT_BY_NAME, ANCHOR_FOR } from './skeletonDef.js';
 import { solveTwoBone, editWithAnchor, pinAnchor, feetToFloor } from './ik.js';
-import { balanceReport, coupleReport } from './analysis.js';
+import { balanceReport, coupleReport, footContactsBySide } from './analysis.js';
 import { PRESETS } from './presets.js';
 import { initUI } from './ui.js';
 
@@ -180,6 +180,105 @@ const vizFollower = new BalanceViz(0xe89ab8);
 const vizCouple = new BalanceViz(0xffe08a);
 scene.add(vizLeader.group, vizFollower.group, vizCouple.group);
 
+// ------------------------------------------------- pose interpolation (A→B)
+// Component-wise joint lerp is safe: both endpoints respect the joint limits,
+// and each limit interval is convex.
+function lerpPose(a, b, t) {
+  const joints = {};
+  for (const [name, va] of Object.entries(a.joints)) {
+    const vb = b.joints[name];
+    if (!vb) continue;
+    joints[name] = va.map((v, i) => v + (vb[i] - v) * t);
+  }
+  const qa = new THREE.Quaternion().fromArray(a.quaternion);
+  const qb = new THREE.Quaternion().fromArray(b.quaternion);
+  return {
+    position: a.position.map((v, i) => v + (b.position[i] - v) * t),
+    quaternion: qa.slerp(qb, t).toArray(),
+    pelvisY: a.pelvisY + (b.pelvisY - a.pelvisY) * t,
+    joints,
+  };
+}
+
+// Floor trace of the three COGs along the A→B movement, vertex-colored by
+// balance: the entity's own color while balanced, red where it loses the base.
+const trailGroup = new THREE.Group();
+scene.add(trailGroup);
+
+function trailLine(pts, baseHex) {
+  const pos = new Float32Array(pts.length * 3);
+  const col = new Float32Array(pts.length * 3);
+  const base = new THREE.Color(baseHex);
+  const bad = new THREE.Color(0xe0645f);
+  pts.forEach((p, i) => {
+    pos.set([p.x, 0.006, p.z], i * 3);
+    const c = p.ok ? base : bad;
+    col.set([c.r, c.g, c.b], i * 3);
+  });
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  return new THREE.Line(geo, new THREE.LineBasicMaterial({
+    vertexColors: true, transparent: true, opacity: 0.9,
+  }));
+}
+
+function updateCogTrail() {
+  for (const line of [...trailGroup.children]) {
+    line.geometry.dispose();
+    line.material.dispose();
+    trailGroup.remove(line);
+  }
+  if (!app.interpStates) return;
+  const { A, B } = app.interpStates;
+  const saved = app.getCoupleState('__trail');
+  const series = { a: [], b: [], couple: [] };
+  const N = 48;
+  for (let i = 0; i < N; i++) {
+    const t = i / (N - 1);
+    app.figures.forEach((f, j) => f.setPose(lerpPose(A.figures[j], B.figures[j], t)));
+    leader.clampToFloor();
+    follower.clampToFloor();
+    const rep = coupleReport(leader, follower);
+    series.a.push({ x: rep.a.cog.x, z: rep.a.cog.z, ok: rep.a.margin !== null && rep.a.margin > 0 });
+    series.b.push({ x: rep.b.cog.x, z: rep.b.cog.z, ok: rep.b.margin !== null && rep.b.margin > 0 });
+    series.couple.push({ x: rep.cog.x, z: rep.cog.z, ok: rep.margin !== null && rep.margin > 0 });
+  }
+  app.applyCoupleState(saved);
+  trailGroup.add(
+    trailLine(series.a, 0x7fb3e8),
+    trailLine(series.b, 0xe89ab8),
+    trailLine(series.couple, 0xffe08a),
+  );
+}
+
+// ------------------------------------------------------------------ ghosts
+// Translucent copies of the A/B snapshots, for visual pose comparison.
+const ghostMats = {
+  A: new THREE.MeshStandardMaterial({ color: 0x8fb8e8, transparent: true, opacity: 0.22, roughness: 0.9, depthWrite: false }),
+  B: new THREE.MeshStandardMaterial({ color: 0xe8c98f, transparent: true, opacity: 0.22, roughness: 0.9, depthWrite: false }),
+};
+
+function makeGhostCouple(state, which, figures) {
+  return state.figures.map((pose, i) => {
+    const fig = new Figure({
+      name: `Ghost ${which} ${i}`,
+      height: state.meta?.heights?.[i] ?? figures[i].height,
+      mass: 1,
+      color: 0x888888,
+    });
+    fig.setLayers({ skeleton: false, body: true, muscle: false });
+    fig.group.traverse((o) => {
+      if (!o.isMesh) return;
+      if (o.userData.isPick) { o.visible = false; return; }
+      o.material = ghostMats[which];
+      o.castShadow = false;
+    });
+    fig.setPose(pose);
+    return fig;
+  });
+}
+
 // ------------------------------------------------------------ gizmos & picking
 const tcontrols = new TransformControls(camera, renderer.domElement);
 tcontrols.setSpace('local');
@@ -210,6 +309,12 @@ const app = {
   linkCouple: false, // move/turn drags both dancers as one unit
   coupleDrag: null, // start transforms captured while dragging a linked couple
   figDragY: null, // root height captured when a figure drag starts
+  pivot: null, // { figure, ankle, point } captured while dragging in pivot mode
+  interpStates: null, // { A, B } couple states driving the A→B scrubber
+  interpPlaying: false,
+  interpT: 0,
+  interpTick: null, // UI callback fed the current t while playing
+  ghosts: { A: null, B: null }, // translucent snapshot figures
   history: [], // undo stack of serialized couple states
   ui: null,
 
@@ -243,6 +348,42 @@ const app = {
     this.deselect();
   },
 
+  // Raise/lower the pelvis (hip-height slider). A rigid root compensation
+  // cancels a pure translation exactly — closed chain would be a no-op — so
+  // in closed-chain mode the legs re-solve instead: each planted foot keeps
+  // its world position and sole orientation while the body sinks or rises
+  // over it (knees bend/straighten as far as the joint limits allow).
+  setPelvisHeight(figure, y) {
+    if (this.chainMode !== 'closed') {
+      figure.nodes.pelvis.position.y = y;
+      figure.group.updateMatrixWorld(true);
+      return;
+    }
+    figure.group.updateMatrixWorld(true);
+    const contacts = footContactsBySide(figure);
+    const planted = ['L', 'R'].filter((side) => contacts[side].length > 0).map((side) => {
+      const ankle = figure.nodes[`ankle_${side}`];
+      return {
+        side,
+        pos: ankle.getWorldPosition(new THREE.Vector3()),
+        quat: ankle.getWorldQuaternion(new THREE.Quaternion()),
+      };
+    });
+    figure.nodes.pelvis.position.y = y;
+    figure.group.updateMatrixWorld(true);
+    for (const { side, pos, quat } of planted) {
+      solveTwoBone(figure, {
+        root: `hip_${side}`, mid: `knee_${side}`, effector: `ankle_${side}`, hingeSign: 1,
+      }, pos);
+      // Restore the sole's world orientation through the ankle joint.
+      const ankle = figure.nodes[`ankle_${side}`];
+      const parentQ = ankle.parent.getWorldQuaternion(new THREE.Quaternion());
+      ankle.quaternion.copy(parentQ.invert().multiply(quat));
+      figure.clampJoint(`ankle_${side}`);
+    }
+    figure.group.updateMatrixWorld(true);
+  },
+
   setChainMode(mode) {
     this.chainMode = mode;
   },
@@ -253,18 +394,40 @@ const app = {
     for (const f of this.figures) f.setHighlight(parts);
   },
 
+  // The lower of the two ankles — the foot the dancer is standing on.
+  supportAnkle(figure) {
+    figure.group.updateMatrixWorld(true);
+    const lY = figure.worldPos('ankle_L').y;
+    const rY = figure.worldPos('ankle_R').y;
+    return lY <= rY ? 'ankle_L' : 'ankle_R';
+  },
+
   // The distal node kept fixed when `jointName` is edited in closed-chain mode,
   // or null if this joint has no grounded anchor.
   anchorNode(figure, jointName) {
     const key = ANCHOR_FOR[jointName];
     if (!key) return null;
-    if (key === 'support-foot') {
-      figure.group.updateMatrixWorld(true);
-      const lY = figure.worldPos('ankle_L').y;
-      const rY = figure.worldPos('ankle_R').y;
-      return figure.nodes[lY <= rY ? 'ankle_L' : 'ankle_R'];
-    }
+    if (key === 'support-foot') return figure.nodes[this.supportAnkle(figure)];
     return figure.nodes[key];
+  },
+
+  // World position of the ball of the foot (the pivot point in tango).
+  ballOfFoot(figure, ankleName, target = new THREE.Vector3()) {
+    const H = figure.height;
+    figure.group.updateMatrixWorld(true);
+    target.set(0, -0.039 * H, 0.095 * H);
+    return figure.nodes[ankleName].localToWorld(target);
+  },
+
+  // Rotate a figure about the ball of its support foot (ocho/calesita pivot).
+  pivotFigure(figure, deltaYawRad) {
+    const ankle = this.supportAnkle(figure);
+    const before = this.ballOfFoot(figure, ankle);
+    figure.group.rotation.y += deltaYawRad;
+    const after = this.ballOfFoot(figure, ankle);
+    figure.group.position.x += before.x - after.x;
+    figure.group.position.z += before.z - after.z;
+    figure.group.updateMatrixWorld(true);
   },
 
   // Edit a joint honouring the current chain mode. `mutate` changes rotations.
@@ -401,16 +564,63 @@ const app = {
     state.figures.forEach((pose, i) => this.figures[i].setPose(pose));
     if (this.ui) this.ui.onPoseChanged();
   },
+
+  // -------------------------------------------------- A→B interpolation
+  setInterpStates(A, B) {
+    this.interpStates = A && B ? { A, B } : null;
+    this.interpPlaying = false;
+    updateCogTrail();
+  },
+
+  // Apply the pose interpolated between snapshots A and B at t ∈ [0, 1].
+  applyInterp(t) {
+    if (!this.interpStates) return;
+    if (this.selected || this.ikState) this.deselect();
+    const { A, B } = this.interpStates;
+    this.figures.forEach((f, i) => f.setPose(lerpPose(A.figures[i], B.figures[i], t)));
+  },
+
+  playInterp(onTick) {
+    if (!this.interpStates) return;
+    this.interpT = 0;
+    this.interpPlaying = true;
+    this.interpTick = onTick || null;
+  },
+
+  setPathVisible(visible) {
+    trailGroup.visible = visible;
+  },
+
+  // Show/replace/remove the translucent ghost couple for snapshot A or B.
+  setGhost(which, state) {
+    const old = this.ghosts[which];
+    if (old) {
+      for (const f of old) {
+        scene.remove(f.group);
+        f.dispose();
+      }
+      this.ghosts[which] = null;
+    }
+    if (!state) return;
+    const figs = makeGhostCouple(state, which, this.figures);
+    for (const f of figs) scene.add(f.group);
+    this.ghosts[which] = figs;
+  },
 };
 
 // When a drag begins: snapshot for undo, remember the closed-chain anchor so
 // we can pin it back each frame, and capture start transforms for a linked
 // couple drag.
 tcontrols.addEventListener('dragging-changed', (e) => {
-  if (!e.value) { app.ckc = null; app.coupleDrag = null; app.figDragY = null; return; }
+  if (!e.value) { app.ckc = null; app.coupleDrag = null; app.figDragY = null; app.pivot = null; return; }
   app.pushHistory();
   if (!app.selected && tcontrols.object?.userData.figure) {
     app.figDragY = tcontrols.object.position.y;
+  }
+  if (app.mode === 'pivot' && !app.selected && tcontrols.object?.userData.figure) {
+    const figure = tcontrols.object.userData.figure;
+    const ankle = app.supportAnkle(figure);
+    app.pivot = { figure, ankle, point: app.ballOfFoot(figure, ankle) };
   }
   if (app.selected && !app.ikState && app.chainMode === 'closed') {
     const node = app.anchorNode(app.selected.figure, app.selected.jointName);
@@ -448,6 +658,13 @@ tcontrols.addEventListener('objectChange', () => {
   } else if (tcontrols.object) {
     // Figures stay at their drag-start height (usually the floor).
     if (app.figDragY !== null) tcontrols.object.position.y = app.figDragY;
+    if (app.pivot) {
+      // Re-pin the ball of the support foot: the gizmo rotated the figure
+      // about its root; shift it back so the turn happens on the foot.
+      const now = app.ballOfFoot(app.pivot.figure, app.pivot.ankle);
+      app.pivot.figure.group.position.x += app.pivot.point.x - now.x;
+      app.pivot.figure.group.position.z += app.pivot.point.z - now.z;
+    }
     if (app.coupleDrag) {
       // Mirror the drag onto the partner: same translation, and rotation
       // about the dragged dancer so the embrace turns as one unit.
@@ -481,7 +698,7 @@ function handleClick(e) {
   raycaster.setFromCamera(pointer, camera);
 
   const visible = app.visibleFigures();
-  if (app.mode === 'move' || app.mode === 'turn') {
+  if (app.mode === 'move' || app.mode === 'turn' || app.mode === 'pivot') {
     const hits = raycaster.intersectObjects(visible.map((f) => f.group), true);
     const hit = hits.find((h) => h.object.visible);
     if (hit) {
@@ -528,6 +745,13 @@ function animate() {
   requestAnimationFrame(animate);
   const dt = clock.getDelta();
   orbit.update();
+
+  if (app.interpPlaying) {
+    app.interpT = Math.min(1, app.interpT + dt / 2.4);
+    app.applyInterp(app.interpT);
+    if (app.interpTick) app.interpTick(app.interpT);
+    if (app.interpT >= 1) app.interpPlaying = false;
+  }
 
   // Floor collision: no body part may end up below the dance floor,
   // whatever edit produced the pose (gizmo, slider, IK, preset, import).

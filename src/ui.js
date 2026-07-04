@@ -1,5 +1,5 @@
 import { JOINT_BY_NAME, JOINT_TITLES, BODY_PARTS } from './skeletonDef.js';
-import { keyAngles } from './analysis.js';
+import { keyAngles, tangoStats } from './analysis.js';
 
 const R2D = 180 / Math.PI;
 const D2R = Math.PI / 180;
@@ -149,7 +149,7 @@ export function initUI(app) {
       input.addEventListener('pointerdown', () => app.pushHistory());
       input.addEventListener('focus', () => app.pushHistory());
       input.addEventListener('input', () => {
-        app.editJoint(figure, jointName, () => { node.position.y = Number(input.value) / 100; });
+        app.setPelvisHeight(figure, Number(input.value) / 100);
         valEl.textContent = `${Number(input.value).toFixed(0)} cm`;
       });
       jointPanel.appendChild(row);
@@ -188,13 +188,24 @@ export function initUI(app) {
       : `<span class="off-balance">Off balance</span> · ${cm} cm outside`;
   }
 
+  function weightLines(w) {
+    if (!w) return '';
+    const pct = (v) => `${Math.round(v * 100)}%`;
+    const support = [`${w.support} foot`];
+    if (w.footPart) support.push(w.footPart);
+    if (w.onAxis) support.push('<span class="balanced">on axis</span>');
+    return `<div class="stat-line"><span>Weight L / R</span><span class="v">${pct(w.shareL)} / ${pct(w.shareR)}</span></div>
+      <div class="stat-line"><span>Support</span><span class="v">${support.join(' · ')}</span></div>`;
+  }
+
   function figureBlock(figure, rep, dotColor) {
-    const angles = keyAngles(figure)
+    const angles = [...keyAngles(figure), ...tangoStats(figure)]
       .map(([k, v]) => `<div class="stat-line"><span>${k}</span><span class="v">${v}</span></div>`)
       .join('');
     return `<div class="stat-block">
       <h3><span class="dot" style="background:${dotColor}"></span>${figure.name}</h3>
       <div class="stat-line"><span>Balance</span><span class="v">${balanceLine(rep.margin)}</span></div>
+      ${weightLines(rep.weight)}
       <div class="stat-line"><span>COG height</span><span class="v">${(rep.cog.y * 100).toFixed(1)} cm</span></div>
       ${angles}
     </div>`;
@@ -206,10 +217,12 @@ export function initUI(app) {
     if (b) html += figureBlock(app.follower, b, '#e89ab8');
     if (couple) {
       const sep = Math.hypot(couple.a.cog.x - couple.b.cog.x, couple.a.cog.z - couple.b.cog.z);
+      const chestSep = app.leader.worldPos('chest').distanceTo(app.follower.worldPos('chest'));
       html += `<div class="stat-block">
           <h3><span class="dot" style="background:#ffe08a"></span>Couple</h3>
           <div class="stat-line"><span>Combined balance</span><span class="v">${balanceLine(couple.margin)}</span></div>
           <div class="stat-line"><span>COG separation</span><span class="v">${(sep * 100).toFixed(1)} cm</span></div>
+          <div class="stat-line"><span>Chest distance</span><span class="v">${(chestSep * 100).toFixed(1)} cm</span></div>
         </div>`;
     }
     statsPanel.innerHTML = html;
@@ -218,11 +231,55 @@ export function initUI(app) {
   // ---------------------------------------------------------------- compare
   const snaps = { A: null, B: null };
   const comparePanel = $('compare-panel');
+  const interpRow = $('interp-row');
+  const interpSlider = $('interp-slider');
+  const interpVal = $('interp-val');
+  const interpPlay = $('interp-play');
+  const showPath = $('show-path');
+  const ghostA = $('ghost-a');
+  const ghostB = $('ghost-b');
+
+  const syncGhosts = () => {
+    app.setGhost('A', ghostA.checked ? snaps.A : null);
+    app.setGhost('B', ghostB.checked ? snaps.B : null);
+  };
+  ghostA.addEventListener('change', syncGhosts);
+  ghostB.addEventListener('change', syncGhosts);
+
+  // The scrubber, play button, and COG path all need both snapshots.
+  function syncInterp() {
+    const ready = !!(snaps.A && snaps.B);
+    app.setInterpStates(snaps.A, snaps.B);
+    interpRow.hidden = !ready;
+    interpPlay.disabled = !ready;
+    app.setPathVisible(ready && showPath.checked);
+  }
+  showPath.addEventListener('change', () => {
+    app.setPathVisible(!!(snaps.A && snaps.B) && showPath.checked);
+  });
+
+  const setInterpLabel = (t) => {
+    interpSlider.value = Math.round(t * 1000);
+    interpVal.textContent = `${Math.round(t * 100)}%`;
+  };
+  interpSlider.addEventListener('pointerdown', () => app.pushHistory());
+  interpSlider.addEventListener('focus', () => app.pushHistory());
+  interpSlider.addEventListener('input', () => {
+    const t = Number(interpSlider.value) / 1000;
+    app.applyInterp(t);
+    interpVal.textContent = `${Math.round(t * 100)}%`;
+  });
+  interpPlay.addEventListener('click', () => {
+    app.pushHistory();
+    app.playInterp(setInterpLabel);
+  });
 
   function takeSnapshot(which) {
     snaps[which] = app.getCoupleState(`Snapshot ${which}`);
     $(`recall-${which.toLowerCase()}`).disabled = false;
     renderCompare();
+    syncInterp();
+    syncGhosts();
   }
 
   function renderCompare() {

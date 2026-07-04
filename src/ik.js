@@ -95,6 +95,8 @@ export function editWithAnchor(figure, anchorNode, mutate) {
 export function flattenFoot(figure, side) {
   const ankleNode = figure.nodes[`ankle_${side}`];
   const toeNode = figure.nodes[`toe_${side}`];
+  // A flat sole includes flat toes; the toe-tip height math below assumes it.
+  figure.nodes[`toes_${side}`].rotation.set(0, 0, 0);
   figure.group.updateMatrixWorld(true);
   const A = ankleNode.getWorldPosition(new THREE.Vector3());
   const T = toeNode.getWorldPosition(new THREE.Vector3());
