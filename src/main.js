@@ -6,6 +6,7 @@ import { IK_CHAINS, JOINT_BY_NAME, ANCHOR_FOR } from './skeletonDef.js';
 import { solveTwoBone, editWithAnchor, pinAnchor, feetToFloor } from './ik.js';
 import { balanceReport, coupleReport, footContactsBySide } from './analysis.js';
 import { PRESETS } from './presets.js';
+import { loadSkeletonBones } from './skeletonMesh.js';
 import { initUI } from './ui.js';
 
 // ---------------------------------------------------------------- scene
@@ -114,8 +115,17 @@ floor.receiveShadow = true;
 scene.add(floor);
 
 // ---------------------------------------------------------------- figures
-const leader = new Figure({ name: 'Leader', height: 1.78, mass: 75, color: 0x4d8fd1 });
-const follower = new Figure({ name: 'Follower', height: 1.65, mass: 60, color: 0xc95f8e, skin: 0xe0b092 });
+// Imported anatomical skeleton (CC-BY-SA, see public/models/ATTRIBUTION.md).
+// Loaded once and shared; on failure we fall back to the procedural bones.
+let skeletonBones = null;
+try {
+  skeletonBones = await loadSkeletonBones(`${import.meta.env.BASE_URL}models/skeleton.glb`);
+} catch (err) {
+  console.warn('Skeleton mesh failed to load; using procedural bones.', err);
+}
+
+const leader = new Figure({ name: 'Leader', height: 1.78, mass: 75, color: 0x4d8fd1, skeleton: skeletonBones });
+const follower = new Figure({ name: 'Follower', height: 1.65, mass: 60, color: 0xc95f8e, skin: 0xe0b092, skeleton: skeletonBones });
 scene.add(leader.group, follower.group);
 
 // -------------------------------------------------------- balance visuals

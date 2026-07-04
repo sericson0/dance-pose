@@ -4,6 +4,8 @@ import {
   TOE_CORNERS_L, TOE_CORNERS_R, PART_OF_NODE,
 } from './skeletonDef.js';
 import { buildSkeleton, buildMuscles } from './anatomy.js';
+import { LIMB_BASES, reverseWinding } from './skeletonMesh.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 const Y_AXIS = new THREE.Vector3(0, 1, 0);
 const _floorPt = new THREE.Vector3();
@@ -45,12 +47,13 @@ const SHANK_PROFILE = [
 ];
 
 export class Figure {
-  constructor({ name, height = 1.72, mass = 70, color = 0x4d8fd1, skin = 0xd9a68a }) {
+  constructor({ name, height = 1.72, mass = 70, color = 0x4d8fd1, skin = 0xd9a68a, skeleton = null }) {
     this.name = name;
     this.height = height;
     this.mass = mass;
     this.color = color;
     this.skin = skin;
+    this.skeletonMesh = skeleton; // parsed atlas bones, or null → procedural bones
 
     this.group = new THREE.Group(); // root: position (x,z) + facing (rotation.y)
     this.group.userData.figure = this;
@@ -103,8 +106,10 @@ export class Figure {
       else this.group.add(node);
     }
 
-    // --- Skeleton layer (procedural bones live in anatomy.js) ---
-    buildSkeleton(this);
+    // --- Skeleton layer: imported anatomical mesh if available, else the
+    // procedural bones in anatomy.js ---
+    if (this.skeletonMesh) this.#buildMeshSkeleton();
+    else buildSkeleton(this);
 
     // Joint pick/display spheres (always raycastable; opacity follows skeleton layer).
     for (const def of JOINTS) {
@@ -119,6 +124,57 @@ export class Figure {
     this.#buildBody();
     buildMuscles(this);
     this.setLayers({ skeleton: false, body: true, muscle: false });
+  }
+
+  // Attach the imported atlas bones to our joint tree. Each bone is baked from
+  // the shared atlas frame into a target joint node's local space (so it poses
+  // with that joint), right-side bones are also mirrored across the sagittal
+  // plane to build the left side, and everything landing on the same node +
+  // material is merged into one mesh to keep the draw-call count low.
+  #buildMeshSkeleton() {
+    const { bones, atlasMinY, atlasHeight } = this.skeletonMesh;
+    const s = this.height / atlasHeight;
+    this.group.updateMatrixWorld(true);
+    const settle = new THREE.Matrix4().makeTranslation(0, -atlasMinY * s, 0);
+    const Tpos = settle.clone().multiply(new THREE.Matrix4().makeScale(s, s, s));
+    const Tneg = settle.clone().multiply(new THREE.Matrix4().makeScale(-s, s, s)); // mirror
+
+    const groups = new Map(); // `${node}|${material}` → [geometry, …]
+    const stash = (nodeName, material, geom) => {
+      const key = `${nodeName}|${material}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(geom);
+    };
+
+    for (const b of bones) {
+      const isLimb = LIMB_BASES.has(b.node);
+      const targets = [];
+      if (b.paired && isLimb) {
+        targets.push([`${b.node}_R`, Tpos, false], [`${b.node}_L`, Tneg, true]);
+      } else if (b.paired) {
+        targets.push([b.node, Tpos, false], [b.node, Tneg, true]);
+      } else {
+        targets.push([b.node, Tpos, false]);
+      }
+      for (const [nodeName, T, mirror] of targets) {
+        const node = this.nodes[nodeName];
+        if (!node) continue;
+        const g = b.geometry.clone();
+        // local = node⁻¹ · group · T  (bring the atlas-frame bone into the node)
+        const X = node.matrixWorld.clone().invert().multiply(this.group.matrixWorld).multiply(T);
+        g.applyMatrix4(X);
+        if (mirror) reverseWinding(g);
+        stash(nodeName, b.material, g);
+      }
+    }
+
+    for (const [key, geoms] of groups) {
+      const [nodeName, material] = key.split('|');
+      const merged = mergeGeometries(geoms, false);
+      geoms.forEach((g) => g.dispose());
+      if (!merged) continue;
+      this.addMesh(nodeName, new THREE.Mesh(merged, this.materials[material]), 'skeleton', true);
+    }
   }
 
   #buildBody() {
@@ -290,10 +346,12 @@ export class Figure {
     for (const m of this.layerMeshes.skeleton) m.visible = skeleton;
     for (const m of this.layerMeshes.body) m.visible = body;
     for (const m of this.layerMeshes.muscle) m.visible = muscle;
-    // Joint spheres: solid only in skeleton view; invisible-but-clickable otherwise.
+    // Joint spheres are click targets, not anatomy: keep them faint in skeleton
+    // view (the bones already show the joints) and invisible-but-clickable
+    // otherwise. Raycasting ignores opacity, so picking is unaffected.
     for (const s of this.pickSpheres) {
-      s.material.opacity = skeleton ? 0.85 : 0;
-      s.material.depthWrite = skeleton;
+      s.material.opacity = skeleton ? 0.22 : 0;
+      s.material.depthWrite = false;
     }
   }
 

@@ -68,8 +68,11 @@ const LEFT_AND_CENTER = [
   { name: 'hand_L', parent: 'wrist_L', offset: [0, -0.100, 0], endpoint: true },
 
   {
+    // x<0 flexion (leg forward), x>0 extension (leg back). Hip extension
+    // reaches ~30-40° in a trained dancer's arabesque/back-reach past the
+    // neutral ~10-20°, so the leg can trail well behind the torso.
     name: 'hip_L', parent: 'pelvis', offset: [0.052, 0, 0],
-    limits: { x: [-120, 15], y: [-40, 40], z: [-25, 45] },
+    limits: { x: [-120, 35], y: [-40, 40], z: [-25, 45] },
     labels: { x: 'Leg forward / back', y: 'Rotate in / out', z: 'Toward midline / out to side' },
   },
   {

@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 TAngle (*Tango + Angle*) — an interactive 3D tool for teaching Argentine tango: pose two dancers (leader/follower) with anatomically constrained joints, view skeleton/body/muscle layers, and read off biomechanics (center of gravity, base of support, balance margin, joint angles, A/B pose comparison). Stack: Vite + Three.js, vanilla JS ES modules, no framework, no tests, no vite config file.
 
+The skeleton *view* is an imported anatomical GLB whose bones are re-parented onto our own joint rig (`src/skeletonMesh.js`); `main.js` loads it with top-level `await` before building the figures and falls back to procedural bones on failure. The GLB is CC-BY-SA, so distributing this project with it requires attribution + a compatible license (`public/models/ATTRIBUTION.md`).
+
 ## Commands
 
 ```bash
@@ -33,8 +35,9 @@ Both scripts print `No console errors.` on success. They use `window.__app` (exp
 Everything is **data-driven**: each body part, muscle, bone, joint limit, and movement is a row in a table, editable without touching the rest.
 
 - `src/skeletonDef.js` — single source of anatomical truth: joint hierarchy (positions as height fractions, Drillis–Contini), per-axis joint limits in degrees, de Leva mass table (`MASS_SEGMENTS`) used for COG, IK chains, closed-chain anchor map (`ANCHOR_FOR`), and `BODY_PARTS`/`PART_OF_NODE` highlight groups. **Only the left side is defined; the right side is auto-mirrored.**
-- `src/anatomy.js` — procedural bone/muscle geometry from data tables: `LONG` (per-bone thickness/style) plus small builders (skull, ribcage, pelvis, spine, hand, foot); muscles are `MUSCLES_LEFT` / `MUSCLES_CENTER` rows of `{ node, pa, pb, r, name }`.
-- `src/figure.js` — assembles a dancer as an Object3D joint tree (not a skinned mesh) with three toggleable mesh layers (skeleton / body / muscles); `addMesh(node, mesh, layer)` is the attach point for any geometry. Also owns `clampToFloor()` (runs every frame) and `setHighlight()`.
+- `src/skeletonMesh.js` — loads the imported anatomical skeleton GLB (`public/models/skeleton.glb`, CC-BY-SA — see `public/models/ATTRIBUTION.md`) and classifies each of its ~144 named bones onto one of our joint nodes (`classifyBone`). The GLB is Draco-compressed (decoder self-hosted in `public/draco/`) and holds only right-side + axial bones; the left side is mirrored at bake time. Matching is alphanumeric-normalized (GLTFLoader sanitizes names) and side is read from the bone's GLTF group, not the name suffix.
+- `src/anatomy.js` — **fallback** procedural bone/muscle geometry from data tables, used only if the GLB fails to load: `LONG` plus small builders (skull, ribcage, pelvis, spine, hand, foot). Muscles (`MUSCLES_LEFT` / `MUSCLES_CENTER`) are always procedural.
+- `src/figure.js` — assembles a dancer as an Object3D joint tree (not a skinned mesh) with three toggleable mesh layers (skeleton / body / muscles); `addMesh(node, mesh, layer)` is the attach point for any geometry. `#buildMeshSkeleton()` scales the atlas bones to the figure's height, bakes each into its joint node's local frame (mirroring right→left, reversing winding), and merges per node+material into one mesh to keep draw calls low. Also owns `clampToFloor()` (runs every frame) and `setHighlight()`.
 - `src/ik.js` — analytic two-bone IK for open-chain limb dragging, and the closed-chain math (`editWithAnchor`, `pinAnchor`: pin a distal foot/hand, move the body above via rigid root compensation); feet-to-floor helper.
 - `src/analysis.js` — COG from segment masses, foot contacts, convex hull, balance margin, key angles; weight distribution between feet (`weightDistribution`: L/R split, support foot, heel/mid/ball, on-axis) and tango metrics (`tangoStats`: dissociation, step length, turnout). Couple stats combine both dancers.
 - `src/presets.js` — starting poses. **Joint sign conventions are documented at the top of this file** — read them before authoring poses.
@@ -46,7 +49,8 @@ Everything is **data-driven**: each body part, muscle, bone, joint limit, and mo
 | To change… | Edit |
 | --- | --- |
 | a joint's range of motion | its `limits` in `skeletonDef.js` |
-| a bone's shape/thickness | the `LONG` table or a builder in `anatomy.js` |
+| which bone mesh maps to which joint | `classifyBone` in `skeletonMesh.js` |
+| a fallback bone's shape/thickness | the `LONG` table or a builder in `anatomy.js` (only shown if the GLB fails to load) |
 | a muscle | its row in `MUSCLES_LEFT` / `MUSCLES_CENTER` in `anatomy.js` |
 | body proportions / masses | `JOINTS` / `MASS_SEGMENTS` in `skeletonDef.js` |
 | a preset pose or add one | `PRESETS` in `presets.js` |

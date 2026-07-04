@@ -44,7 +44,7 @@ export function spindleGeometry() {
 // tapered shaft (radii are fractions of height; rB is the radius at end b).
 function ball(fig, nodeName, x, y, z, r, sx = 1, sy = 1, sz = 1, mat = 'bone', cast = true) {
   const H = fig.height;
-  const m = new THREE.Mesh(new THREE.SphereGeometry(r * H, 12, 10), fig.materials[mat]);
+  const m = new THREE.Mesh(new THREE.SphereGeometry(r * H, 20, 14), fig.materials[mat]);
   m.position.set(x * H, y * H, z * H);
   m.scale.set(sx, sy, sz);
   fig.addMesh(nodeName, m, 'skeleton', cast);
@@ -53,7 +53,7 @@ function ball(fig, nodeName, x, y, z, r, sx = 1, sy = 1, sz = 1, mat = 'bone', c
 
 function shaft(fig, nodeName, a, b, rA, rB, mat = 'bone') {
   const m = new THREE.Mesh(
-    new THREE.CylinderGeometry(rB * fig.height, rA * fig.height, a.distanceTo(b), 10),
+    new THREE.CylinderGeometry(rB * fig.height, rA * fig.height, a.distanceTo(b), 16),
     fig.materials[mat],
   );
   alignY(m, a, b);
