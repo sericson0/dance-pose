@@ -7,6 +7,8 @@ import { solveTwoBone, editWithAnchor, pinAnchor, feetToFloor } from './ik.js';
 import { balanceReport, coupleReport, footContactsBySide } from './analysis.js';
 import { PRESETS } from './presets.js';
 import { loadSkeletonBones, loadMuscleMeshes, loadBodyMesh } from './skeletonMesh.js';
+import { Embrace } from './embrace.js';
+import { resolveBodyCollision, bodyClearance } from './collision.js';
 import { initUI } from './ui.js';
 
 // ---------------------------------------------------------------- scene
@@ -150,6 +152,10 @@ const [manBody, womanBody] = await Promise.all([tryLoadBody('man.glb'), tryLoadB
 const leader = new Figure({ name: 'Leader', height: 1.78, mass: 75, color: 0x4d8fd1, skeleton: skeletonBones, muscles: muscleMeshes, body: manBody });
 const follower = new Figure({ name: 'Follower', height: 1.65, mass: 60, color: 0xc95f8e, skin: 0xe0b092, skeleton: skeletonBones, muscles: muscleMeshes, body: womanBody });
 scene.add(leader.group, follower.group);
+
+// Embrace constraints (open-side hand clasp, close-embrace torso contact),
+// re-applied every frame in the loop below.
+const embrace = new Embrace(leader, follower);
 
 // -------------------------------------------------------- balance visuals
 class BalanceViz {
@@ -332,6 +338,10 @@ const pointer = new THREE.Vector2();
 const app = {
   scene, camera, renderer, orbit,
   leader, follower,
+  embrace,
+  // Smallest surface clearance between the two dancers' body colliders
+  // (negative = penetration) — for the dev verification scripts.
+  bodyClearance: () => bodyClearance(leader, follower),
   figures: [leader, follower],
   presets: PRESETS,
   mode: 'rotate',
@@ -419,6 +429,18 @@ const app = {
 
   setChainMode(mode) {
     this.chainMode = mode;
+  },
+
+  // Toggle the embrace constraints; pass either or both flags.
+  setEmbrace({ hands, close } = {}) {
+    if (hands !== undefined && hands !== this.embrace.hands) {
+      if (hands) this.pushHistory();
+      this.embrace.setHands(hands);
+    }
+    if (close !== undefined && close !== this.embrace.close) {
+      if (close) this.pushHistory();
+      this.embrace.setClose(close);
+    }
   },
 
   // Highlight body parts (Set of BODY_PARTS ids, empty/null clears).
@@ -763,6 +785,18 @@ app.applyPreset(1); // start in the close embrace
 app.history.length = 0; // the pre-preset construction state is not a useful undo target
 app.ui.onHistoryChanged();
 
+// What the user is editing right now, so the embrace constraints leave it
+// alone and move the partner instead: an IK drag, a selected joint, or a
+// whole-figure gizmo drag.
+function embraceEditing() {
+  if (app.ikState) return { figure: app.ikState.figure, jointName: app.ikState.chain.effector };
+  if (app.selected) return app.selected;
+  if (tcontrols.dragging && tcontrols.object?.userData.figure) {
+    return { figure: tcontrols.object.userData.figure, jointName: null };
+  }
+  return null;
+}
+
 const clock = new THREE.Clock();
 let statsTimer = 0;
 let vizFlags = { cog: true, support: true, couple: true };
@@ -786,10 +820,23 @@ function animate() {
     if (app.interpT >= 1) app.interpPlaying = false;
   }
 
+  // Keep the embrace through whatever moved this frame: torso contact first
+  // (it translates a dancer), the floor clamp, then re-join the hands (arm
+  // rotations only, so they cannot disturb the floor contact).
+  const editing = embraceEditing();
+  embrace.maintainTorso(editing?.figure ?? null);
+
+  // Body collision: the dancers may touch but never enter each other's
+  // space — resolve any capsule penetration by sliding the partner of
+  // whoever is being edited (see collision.js).
+  resolveBodyCollision(leader, follower, editing?.figure ?? null);
+
   // Floor collision: no body part may end up below the dance floor,
   // whatever edit produced the pose (gizmo, slider, IK, preset, import).
   leader.clampToFloor();
   follower.clampToFloor();
+
+  embrace.maintainHands(editing);
 
   // Deform bi-articular muscles to the current pose (no-op unless the muscle
   // layer is showing). Runs after clampToFloor so joint matrices are current.

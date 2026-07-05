@@ -27,6 +27,24 @@ export function initUI(app) {
     });
   }
 
+  // ---------------------------------------------------------------- embrace
+  // Close embrace implies the hand hold: enabling close switches hands on,
+  // releasing the hands releases the close embrace too.
+  const embraceHands = $('embrace-hands');
+  const embraceClose = $('embrace-close');
+  const syncEmbrace = () => app.setEmbrace({
+    hands: embraceHands.checked,
+    close: embraceClose.checked,
+  });
+  embraceHands.addEventListener('change', () => {
+    if (!embraceHands.checked) embraceClose.checked = false;
+    syncEmbrace();
+  });
+  embraceClose.addEventListener('change', () => {
+    if (embraceClose.checked) embraceHands.checked = true;
+    syncEmbrace();
+  });
+
   const showButtons = [...document.querySelectorAll('#show-buttons button')];
   for (const btn of showButtons) {
     btn.addEventListener('click', () => {
@@ -218,11 +236,17 @@ export function initUI(app) {
     if (couple) {
       const sep = Math.hypot(couple.a.cog.x - couple.b.cog.x, couple.a.cog.z - couple.b.cog.z);
       const chestSep = app.leader.worldPos('chest').distanceTo(app.follower.worldPos('chest'));
+      const handGap = app.embrace.handGap();
+      // Joined palms sit a hand's thickness apart (the clasp stacks them).
+      const handLine = app.embrace.hands && handGap < app.embrace.palmGap() + 0.01
+        ? '<span class="balanced">joined</span>'
+        : `${(handGap * 100).toFixed(1)} cm`;
       html += `<div class="stat-block">
           <h3><span class="dot" style="background:#ffe08a"></span>Couple</h3>
           <div class="stat-line"><span>Combined balance</span><span class="v">${balanceLine(couple.margin)}</span></div>
           <div class="stat-line"><span>COG separation</span><span class="v">${(sep * 100).toFixed(1)} cm</span></div>
           <div class="stat-line"><span>Chest distance</span><span class="v">${(chestSep * 100).toFixed(1)} cm</span></div>
+          <div class="stat-line"><span>Open-side hands</span><span class="v">${handLine}</span></div>
         </div>`;
     }
     statsPanel.innerHTML = html;

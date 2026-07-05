@@ -6,14 +6,22 @@ import { feetToFloor } from './ik.js';
 // forward/up · left-side z>0 = out to the side (right side mirrored) ·
 // elbow x<0 bend.
 
+// The tango embrace frame. Open side (his left / her right): the upper arms
+// lift the forearms so the joined hands are held UP by the couple's heads
+// (tango carries the open-side hold at about temple height, elbows bent and
+// hanging), out past the open-side shoulders — the embrace constraints then
+// join the hands there (see embrace.js). Closed side: his right arm wraps
+// around her UNDER her left arm, hers drapes over his to his right shoulder —
+// the swivel authored here is what keeps that layering when the constraints
+// re-solve the arms every frame.
 function embraceArms(leader, follower) {
   leader.setJointDegrees({
-    shoulder_L: { x: -30, z: 55 }, elbow_L: { x: -95, y: -25 }, wrist_L: { x: -10 },
+    shoulder_L: { x: -30, y: 30, z: 15 }, elbow_L: { x: -120, y: -30 }, wrist_L: { x: -15 },
     shoulder_R: { x: -55, z: -18, y: 20 }, elbow_R: { x: -70 },
     spine: { x: 4 }, chest: { x: 4 }, neck: { y: 12 },
   });
   follower.setJointDegrees({
-    shoulder_R: { x: -30, z: -55 }, elbow_R: { x: -95, y: 25 }, wrist_R: { x: -10 },
+    shoulder_R: { x: -30, y: -30, z: -15 }, elbow_R: { x: -120, y: 30 }, wrist_R: { x: -15 },
     shoulder_L: { x: -65, z: 22 }, elbow_L: { x: -50 },
     spine: { x: 4 }, chest: { x: 4 }, neck: { y: 12 },
   });
@@ -54,16 +62,20 @@ export const PRESETS = [
       place(leader, 0, -0.14, 0);
       place(follower, -0.05, 0.26, 180);
       embraceArms(leader, follower);
+      // Walking adds a whole-body lean (pelvis x) on top of the embrace's
+      // forward lean; keep both heads upright over it (real walkers look
+      // ahead, not down into the partner) so the heads meet the body-contact
+      // colliders (skeletonDef.js) at a graze, not a clash.
       leader.setJointDegrees({
         hip_L: { x: -28 }, knee_L: { x: 8 }, ankle_L: { x: -12 },
         hip_R: { x: 15 }, knee_R: { x: 36 }, ankle_R: { x: 33 },
-        pelvis: { x: 3 },
+        pelvis: { x: 3 }, neck: { x: -4 },
       });
       leader.nodes.pelvis.position.y = 0.515 * leader.height;
       follower.setJointDegrees({
         hip_R: { x: 15 }, knee_R: { x: 36 }, ankle_R: { x: 33 },
         hip_L: { x: -8 }, knee_L: { x: 12 }, ankle_L: { x: -7 },
-        pelvis: { x: 3 },
+        pelvis: { x: 3 }, neck: { x: -10 },
       });
       follower.nodes.pelvis.position.y = 0.527 * follower.height;
       leader.group.updateMatrixWorld(true);

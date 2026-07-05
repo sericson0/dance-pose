@@ -58,6 +58,15 @@ const SHANK_PROFILE = [
   [1.03, 0.010], [1.05, 0.004],
 ];
 
+// Finger curl for a clasped hand (the embrace's open-side hold): per-phalanx
+// bend in radians at full curl, proximal→distal; the thumb only closes
+// lightly around the partner's hand. Applied to the clothed avatar's Biped
+// finger bones, which bend about their local Z axis.
+const FINGER_CURL = [0.75, 0.9, 0.6];
+const THUMB_CURL = [0.15, 0.45, 0.35];
+const FINGER_AXIS = new THREE.Vector3(0, 0, 1);
+const _fingerQ = new THREE.Quaternion();
+
 export class Figure {
   constructor({ name, height = 1.72, mass = 70, color = 0x4d8fd1, skin = 0xd9a68a, skeleton = null, muscles = null, body = null }) {
     this.name = name;
@@ -601,6 +610,21 @@ export class Figure {
       bone.matrix.copy(local);
     }
 
+    // Keep handles to the (unmapped) Biped finger bones riding each hand so
+    // the embrace can close a clasped hand's fingers (setFingerCurl).
+    this.fingerBones = { L: [], R: [] };
+    for (const [bone, p] of plans) {
+      if (!p.jointName.startsWith('wrist_')) continue;
+      const side = p.jointName.slice(-1);
+      bone.traverse((o) => {
+        const m = normBoneName(o.name).match(/finger(\d)(\d*)$/);
+        if (!m) return;
+        this.fingerBones[side].push({
+          bone: o, rest: o.quaternion.clone(), digit: +m[1], seg: m[2] ? +m[2] : 0,
+        });
+      });
+    }
+
     // The skinned meshes themselves: identity bind under `group` ('attached'
     // mode divides the mesh's own world transform back out, so parenting is
     // only for visibility/layer bookkeeping).
@@ -614,6 +638,19 @@ export class Figure {
       o.userData.noHighlight = true; // one skin, no per-part split (see #applyHighlight)
       this.group.add(o);
       this.layerMeshes.body.push(o);
+    }
+  }
+
+  // Curl one hand's fingers (0 = bind pose, 1 = closed around the partner's
+  // hand). Used by the embrace's open-side clasp. Only the clothed avatar has
+  // finger bones; the procedural fallback hand is a single ellipsoid, so this
+  // is a no-op without a body mesh.
+  setFingerCurl(side, curl) {
+    if (!this.fingerBones) return;
+    for (const f of this.fingerBones[side]) {
+      const amt = (f.digit === 0 ? THUMB_CURL : FINGER_CURL)[Math.min(f.seg, 2)];
+      f.bone.quaternion.copy(f.rest);
+      if (curl * amt) f.bone.quaternion.multiply(_fingerQ.setFromAxisAngle(FINGER_AXIS, curl * amt));
     }
   }
 

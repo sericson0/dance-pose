@@ -207,6 +207,33 @@ for (const part of BODY_PARTS) {
   for (const node of part.nodes) PART_OF_NODE[node] = part.id;
 }
 
+// Dancer-vs-dancer body colliders (see collision.js): each row wraps the
+// segment from→to in a capsule of radius r (fraction of the dancer's own
+// height). Arms and hands are deliberately absent — the embrace places them ON
+// the partner (the clasp, his palm on her back, hers on his deltoid), so they
+// must always be free to touch. The trunk radii sit just inside the close-
+// embrace CONTACT_FRACTION (embrace.js), so held torso contact rests the
+// surfaces exactly together without the two constraints fighting; the upper
+// chest, shoulders and head taper thinner because in close embrace both
+// dancers lean in and the follower's head sits level with a taller leader's
+// shoulder line — those radii are calibrated so the shipped contact poses
+// (close embrace, walk) reach the held torso distance with ~0 clearance
+// instead of being held off by the head. Tune against those presets with
+// scripts/dev-verify-collision.mjs + dev-verify-embrace.mjs.
+export const COLLIDERS = [
+  { from: 'head', to: 'headTop', r: 0.029 },
+  { from: 'chest', to: 'neck', r: 0.044 },
+  { from: 'spine', to: 'chest', r: 0.060 },
+  { from: 'pelvis', to: 'spine', r: 0.056 },
+  { from: 'shoulder_L', to: 'shoulder_R', r: 0.024 },
+  { from: 'hip_L', to: 'knee_L', r: 0.044 },
+  { from: 'hip_R', to: 'knee_R', r: 0.044 },
+  { from: 'knee_L', to: 'ankle_L', r: 0.025 },
+  { from: 'knee_R', to: 'ankle_R', r: 0.025 },
+  { from: 'ankle_L', to: 'toe_L', r: 0.016 },
+  { from: 'ankle_R', to: 'toe_R', r: 0.016 },
+];
+
 export function clampAngle(value, [min, max]) {
   return Math.min(max * DEG, Math.max(min * DEG, value));
 }
