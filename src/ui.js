@@ -44,6 +44,12 @@ export function initUI(app) {
     if (embraceClose.checked) embraceHands.checked = true;
     syncEmbrace();
   });
+  const embraceTilt = $('embrace-tilt');
+  const embraceTiltVal = $('embrace-tilt-val');
+  embraceTilt.addEventListener('input', () => {
+    embraceTiltVal.textContent = `${embraceTilt.value}°`;
+    app.setClaspTilt(Number(embraceTilt.value));
+  });
 
   const showButtons = [...document.querySelectorAll('#show-buttons button')];
   for (const btn of showButtons) {

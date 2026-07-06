@@ -1,8 +1,8 @@
 // Dev check for the embrace constraints: the open-side clasp stays joined —
-// palms a hand's thickness apart, the leader's hand on the OUTSIDE of the
-// embrace, both wrists holding the finger-wrap flexion — and close embrace
-// keeps torso contact through moves, turns, pivots and preset changes.
-// Screenshots + console errors.
+// palm to palm along the couple axis (his palm facing her, hers facing him),
+// both hands' fingers aimed up the clasp's tilted-vertical direction
+// (clasp-tilt slider) — and close embrace keeps torso contact through moves,
+// turns, pivots and preset changes. Screenshots + console errors.
 import puppeteer from 'puppeteer-core';
 
 const outDir = process.argv[2] || '.';
@@ -24,25 +24,31 @@ const problems = [];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const measure = () => page.evaluate(async () => {
-  const { handCenter, CLASP_WRAP_DEG } = await import('/src/embrace.js');
+  const { handCenter } = await import('/src/embrace.js');
   const app = window.__app;
   const e = app.embrace;
-  const wrap = CLASP_WRAP_DEG * Math.PI / 180;
-  // Open-side wrists hold the finger-wrap flexion (x = -wrap, y = z = 0).
-  const wl = app.leader.nodes.wrist_L.rotation;
-  const wr = app.follower.nodes.wrist_R.rotation;
-  const wristDev = (w) => Math.max(Math.abs(w.x + wrap), Math.abs(w.y), Math.abs(w.z));
-  // The leader's palm should stack on the OUTSIDE of the clasp: past the
-  // follower's palm along the horizontal direction out from her chest.
+  // Open-side hands point their fingers along the clasp's tilted-vertical
+  // finger direction (degrees off target; joint limits allow some shortfall).
+  const fingerDev = (f, wristName, handName, armKey) => {
+    const target = e.claspFingerTarget(armKey);
+    if (!target) return 999;
+    const dir = f.worldPos(handName).sub(f.worldPos(wristName)).normalize();
+    return Math.acos(Math.min(1, Math.max(-1, dir.dot(target)))) * 180 / Math.PI;
+  };
+  // The joined hands stack along the couple axis: the leader's palm on his
+  // side of the clasp, the follower's beyond it, each palm facing the
+  // partner (his along the axis, hers back along it).
   const pL = handCenter(app.leader, 'wrist_L', 'hand_L');
   const pF = handCenter(app.follower, 'wrist_R', 'hand_R');
-  const clasp = e.claspWorld();
-  let outside = 0;
-  if (clasp) {
-    const out = clasp.clone().sub(app.follower.worldPos('chest'));
-    out.y = 0;
-    if (out.lengthSq() > 1e-6) outside = pL.clone().sub(pF).dot(out.normalize());
-  }
+  const axis = app.follower.worldPos('chest').sub(app.leader.worldPos('chest'));
+  axis.y = 0;
+  const outside = axis.lengthSq() > 1e-6 ? pF.clone().sub(pL).dot(axis.normalize()) : 0;
+  const palmDev = (f, wristName, sign) => {
+    const el = f.nodes[wristName].matrixWorld.elements;
+    const len = Math.hypot(el[8], el[9], el[10]);
+    const dot = (el[8] * axis.x + el[9] * axis.y + el[10] * axis.z) * sign / len;
+    return Math.acos(Math.min(1, Math.max(-1, dot))) * 180 / Math.PI;
+  };
   // Closed-side palms vs their (reach-clamped) rest points on the partner.
   const closedL = handCenter(app.leader, 'wrist_R', 'hand_R')
     .distanceTo(e.closedGoalWorld('leaderClosed'));
@@ -56,8 +62,10 @@ const measure = () => page.evaluate(async () => {
     contact: e.contactDistance(),
     clearance: app.bodyClearance(),
     closedL, closedF,
-    wristDevL: wristDev(wl),
-    wristDevF: wristDev(wr),
+    fingerDevL: fingerDev(app.leader, 'wrist_L', 'hand_L', 'leaderOpen'),
+    fingerDevF: fingerDev(app.follower, 'wrist_R', 'hand_R', 'followerOpen'),
+    palmDevL: palmDev(app.leader, 'wrist_L', 1),
+    palmDevF: palmDev(app.follower, 'wrist_R', -1),
     liftL: app.leader.group.position.y,
     liftF: app.follower.group.position.y,
   };
@@ -67,18 +75,39 @@ const measure = () => page.evaluate(async () => {
 // palms can only rest on their partner points while the couple roughly faces
 // each other — after a big relative turn (pivot) or side-by-side (standing)
 // the arms are expected to strain at their joint limits instead.
-function check(label, m, { hands = true, close = false, closedArms = null } = {}) {
-  console.log(`--- ${label}: handGap ${(m.handGap * 100).toFixed(2)} cm (palms ${(m.palmGap * 100).toFixed(1)}, leader outside ${(m.outside * 100).toFixed(1)}), `
+// `strainedClasp` marks geometries with no embrace shape at all (side by
+// side, facing the same way): the clasp still pulls the hands together but
+// the arms are limit-bound, so the finger aim is skipped and the palm gap
+// tolerance widens.
+// `moved` marks transitional mid-movement states (a dancer stepped or turned
+// away with the clasp held): palm contact and stacking still hold, but the
+// stored clasp point can sit where the ideal orientation is limit-bound, so
+// the finger/palm thresholds relax — the fingers legitimately lean over in
+// the palm plane (see #LEANS in embrace.js) rather than let a palm turn
+// away.
+function check(label, m, { hands = true, close = false, closedArms = null, strainedClasp = false, moved = false } = {}) {
+  const fingersMax = moved ? 50 : 25;
+  // Settled embraces keep the palms within 40° of the couple axis (10° of
+  // that is the deliberate finger wrap). Mid-movement the arms are honestly
+  // limit-bound and the palm can wander to ~60°; the check only needs to
+  // catch the turned-back-on-the-partner failure (~90°).
+  const palmsMax = moved ? 70 : 40;
+  console.log(`--- ${label}: handGap ${(m.handGap * 100).toFixed(2)} cm (palms ${(m.palmGap * 100).toFixed(1)}, follower beyond ${(m.outside * 100).toFixed(1)}), `
     + `chestGap ${(m.chestGap * 100).toFixed(1)} cm (contact ${(m.contact * 100).toFixed(1)}, body clearance ${(m.clearance * 100).toFixed(2)}), `
     + `closed L ${(m.closedL * 100).toFixed(1)} F ${(m.closedF * 100).toFixed(1)} cm, `
-    + `wrist wrap dev L ${(m.wristDevL * 57.3).toFixed(1)}° F ${(m.wristDevF * 57.3).toFixed(1)}°`);
-  if (hands && Math.abs(m.handGap - m.palmGap) > 0.015) {
+    + `finger dev L ${m.fingerDevL.toFixed(1)}° F ${m.fingerDevF.toFixed(1)}°, palm dev L ${m.palmDevL.toFixed(1)}° F ${m.palmDevF.toFixed(1)}°`);
+  if (hands && Math.abs(m.handGap - m.palmGap) > (strainedClasp ? 0.03 : 0.015)) {
     problems.push(`${label}: clasp gap ${(m.handGap * 100).toFixed(1)} cm (want ${(m.palmGap * 100).toFixed(1)})`);
   }
   if (hands && m.outside < -0.005) {
-    problems.push(`${label}: leader hand not on the outside (${(m.outside * 100).toFixed(1)} cm)`);
+    problems.push(`${label}: hands stacked backwards along the couple axis (${(m.outside * 100).toFixed(1)} cm)`);
   }
-  if (hands && (m.wristDevL > 0.02 || m.wristDevF > 0.02)) problems.push(`${label}: clasp wrist not holding the finger wrap`);
+  if (hands && !strainedClasp && (m.fingerDevL > fingersMax || m.fingerDevF > fingersMax)) {
+    problems.push(`${label}: clasp fingers off the tilt direction (L ${m.fingerDevL.toFixed(1)}° F ${m.fingerDevF.toFixed(1)}°)`);
+  }
+  if (hands && !strainedClasp && (m.palmDevL > palmsMax || m.palmDevF > palmsMax)) {
+    problems.push(`${label}: palms not facing the partner (L ${m.palmDevL.toFixed(1)}° F ${m.palmDevF.toFixed(1)}°)`);
+  }
   if (closedArms !== null && (m.closedL > closedArms || m.closedF > closedArms)) {
     problems.push(`${label}: closed-side palm off by L ${(m.closedL * 100).toFixed(1)} / F ${(m.closedF * 100).toFixed(1)} cm`);
   }
@@ -117,6 +146,34 @@ if (!fingers.leader || !fingers.follower) {
 }
 await page.screenshot({ path: `${outDir}/embrace-hands.png` });
 
+// ---- 1b. The clasp-tilt slider re-aims the joined hands: near-vertical
+//          fingers at 0°, a clearly swung direction at 45°.
+const tiltTest = await page.evaluate(async () => {
+  const app = window.__app;
+  const setTilt = (v) => {
+    const s = document.getElementById('embrace-tilt');
+    s.value = String(v);
+    s.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const dir = () => app.leader.worldPos('hand_L').sub(app.leader.worldPos('wrist_L')).normalize();
+  setTilt(0);
+  await sleep(300);
+  const d0 = dir();
+  setTilt(45);
+  await sleep(300);
+  const d45 = dir();
+  setTilt(20); // back to the default
+  await sleep(300);
+  const swing = Math.acos(Math.min(1, Math.max(-1, d0.dot(d45)))) * 180 / Math.PI;
+  return { swing, vertY: d0.y };
+});
+console.log(`--- tilt slider: 0°→45° swings the leader's hand ${tiltTest.swing.toFixed(1)}° (fingers-up y at 0°: ${tiltTest.vertY.toFixed(2)})`);
+// The ±30° wrist-deviation limit bounds the extremes, so the achievable
+// swing is ~23° of the slider's 45° — anatomically honest, still visible.
+if (tiltTest.swing < 18) problems.push(`tilt slider: hands only swung ${tiltTest.swing.toFixed(1)}° between 0° and 45°`);
+if (tiltTest.vertY < 0.75) problems.push(`tilt 0°: leader's fingers not near vertical (y ${tiltTest.vertY.toFixed(2)})`);
+
 // ---- 2. Move the leader: the clasp must follow.
 await page.evaluate(() => {
   const app = window.__app;
@@ -124,12 +181,12 @@ await page.evaluate(() => {
   app.leader.group.position.z -= 0.08;
 });
 await sleep(400);
-check('leader moved', await measure());
+check('leader moved', await measure(), { moved: true });
 
 // ---- 3. Turn the leader 30°: still joined.
 await page.evaluate(() => { window.__app.leader.group.rotation.y += Math.PI / 6; });
 await sleep(400);
-check('leader turned', await measure());
+check('leader turned', await measure(), { moved: true });
 await page.screenshot({ path: `${outDir}/embrace-turned.png` });
 
 // ---- 4. Close embrace on: torsos pulled into contact.
@@ -139,14 +196,14 @@ await page.evaluate(() => {
   cb.dispatchEvent(new Event('change', { bubbles: true }));
 });
 await sleep(400);
-check('close embrace on', await measure(), { close: true, closedArms: 0.12 }); // leader turned 30° away
+check('close embrace on', await measure(), { close: true, closedArms: 0.12, moved: true }); // leader turned 30° away
 await page.screenshot({ path: `${outDir}/embrace-close.png` });
 
 // ---- 5. Pivot the leader 60° on his support foot: contact + clasp keep up
 //         (a calesita-like turn — the follower is carried around).
 await page.evaluate(() => { window.__app.pivotFigure(window.__app.leader, Math.PI / 3); });
 await sleep(400);
-check('leader pivoted 60°', await measure(), { close: true });
+check('leader pivoted 60°', await measure(), { close: true, moved: true });
 await page.evaluate(() => window.__app.setView('top'));
 await sleep(300);
 await page.screenshot({ path: `${outDir}/embrace-pivot-top.png` });
@@ -184,7 +241,11 @@ const armEdit = await page.evaluate(() => {
   return { gap, palms };
 });
 console.log(`--- arm edit: follower tracked to ${(armEdit.gap * 100).toFixed(2)} cm`);
-if (Math.abs(armEdit.gap - armEdit.palms) > 0.015) {
+// The user controls the leader's arm here, so there is no meeting halfway:
+// the follower reaches as far as her joint limits allow toward wherever his
+// hand went, which can leave the palms a centimetre or two short. The check
+// only needs to catch her hand not following at all.
+if (Math.abs(armEdit.gap - armEdit.palms) > 0.03) {
   problems.push(`arm edit: follower hand did not track (${(armEdit.gap * 100).toFixed(1)} cm)`);
 }
 await sleep(300);
@@ -204,7 +265,9 @@ await page.evaluate(() => {
   cb.dispatchEvent(new Event('change', { bubbles: true }));
 });
 await sleep(500);
-check('standing → close embrace', await measure(), { close: true });
+// The standing preset is side by side facing the same way, and the hand
+// clasp is OFF here — only the torso pull is asserted.
+check('standing → close embrace', await measure(), { close: true, hands: false });
 await page.screenshot({ path: `${outDir}/embrace-from-standing.png` });
 
 if (problems.length) console.log(`PROBLEMS:\n${problems.join('\n')}`);

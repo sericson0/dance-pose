@@ -443,6 +443,12 @@ const app = {
     }
   },
 
+  // Tilt of the joined open-side hands, degrees from vertical (0 = fingers
+  // straight up); the clasp constraint re-aims the hands every frame.
+  setClaspTilt(deg) {
+    this.embrace.setTilt(deg);
+  },
+
   // Highlight body parts (Set of BODY_PARTS ids, empty/null clears).
   setHighlight(parts) {
     this.highlightParts = parts;

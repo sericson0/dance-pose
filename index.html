@@ -64,7 +64,7 @@
       <section>
         <h2>Embrace</h2>
         <div class="check-row">
-          <label title="Keep the arm frame through any movement: the leader's left hand joins the follower's right (open side), his right palm stays on her back and her left palm on his upper arm (closed side). Wrists stay neutral — the shoulders and elbows do the reaching, and the clasped palms turn to face each other.">
+          <label title="Keep the arm frame through any movement: the leader's left hand joins the follower's right palm to palm (open side, his palm facing her and hers facing him, fingers up like a vertical handshake), his right palm stays on her back and her left palm on his upper arm (closed side).">
             <input type="checkbox" id="embrace-hands" /> Hold embrace (arms)
           </label>
         </div>
@@ -72,6 +72,11 @@
           <label title="Keep the torsos in contact. Only the chest-to-chest distance is held, so the point of contact is free to rotate around either torso (giros, apilado shifts). Implies holding hands.">
             <input type="checkbox" id="embrace-close" /> Close embrace (torso contact)
           </label>
+        </div>
+        <div class="slider-row">
+          <div class="lbl"><span title="How far the joined open-side hands lean from vertical (0° = fingers straight up)">Clasp tilt</span><span class="val" id="embrace-tilt-val">20°</span></div>
+          <input type="range" id="embrace-tilt" min="0" max="45" step="1" value="20" />
+          <div class="range-hint"><span>vertical</span><span>45°</span></div>
         </div>
       </section>
 
