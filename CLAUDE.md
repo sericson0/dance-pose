@@ -27,6 +27,7 @@ node scripts/dev-verify-features.mjs <outDir>  # presets stay grounded, weight/t
 node scripts/dev-verify-toes.mjs <outDir>      # toes (MTP) joint, demi-pointe, closed-chain relevé + pelvis height
 node scripts/dev-verify-muscles.mjs <outDir>   # bi-articular muscles skin between their two joints (deform on bend), screenshots
 node scripts/dev-verify-body.mjs <outDir>      # clothed avatars load + retarget, soles graze the floor, knees move feet not heads
+node scripts/dev-verify-alignment.mjs <outDir> # skeleton-vs-body overlay: per-joint centroid drift + hand/foot endpoint gaps, translucent-body overlay screenshots
 node scripts/dev-verify-embrace.mjs <outDir>   # embrace constraints: clasp joined (palm to palm along the couple axis, his palm facing her and hers him, fingers aimed up the tilted clasp direction, tilt slider re-aims) through moves/turns/pivots, torso contact held (or resting body-on-body where collision stops the pull earlier)
 node scripts/dev-verify-collision.mjs <outDir> # body collision: presets settle penetration-free, walking/kicking into the partner displaces them, edited dancer keeps ground, close embrace still reaches exact contact
 node scripts/dev-tune.mjs '<json cases>'       # pose-authoring probe: prints foot-sole heights for candidate joint angles
