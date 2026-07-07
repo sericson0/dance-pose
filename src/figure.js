@@ -204,6 +204,9 @@ export class Figure {
     // De-splay the skeletal hands/feet onto the clothed body's orientation so
     // the three layers coincide at the extremities (see #alignEndpointGeometry).
     if (this.skeletonMesh && this.bodyMesh) this.#alignEndpointGeometry();
+    // A heeled figure: pitch the skeletal foot down onto the floor and relocate
+    // its balance corners to match the raised, pitched heeled foot.
+    if (this._heelLift && this.skeletonMesh) this.#applyHeel();
     this.setLayers({ skeleton: false, body: true, muscle: false });
   }
 
@@ -725,9 +728,8 @@ export class Figure {
     // the rotation pivots about, and the joint base(s) whose geometry defines
     // the endpoint's frame (in both layers). Only the hand uses this whole-frame
     // match: the foot rests on the floor and its flat-bone-vs-heeled-shoe shape
-    // mismatch makes a centroid match over-pitch it through the floor. (Pitching
-    // the heeled skeletal foot to sit inside the shoe is still TODO — see the
-    // heelRise WIP notes.)
+    // mismatch makes a centroid match over-pitch it through the floor, so the
+    // foot is handled separately (#applyHeel pitches a heeled foot about the ball).
     const specs = [
       { rotNodes: ['wrist'], pivot: 'wrist', geomJoints: ['wrist'] },
     ];
@@ -821,6 +823,93 @@ export class Figure {
     const Ms = frameBasis(skelPrimary, skel.normal);
     const Mb = frameBasis(bodyPrimary, bodyF.normal);
     return new THREE.Quaternion().setFromRotationMatrix(Mb.multiply(Ms.transpose()));
+  }
+
+  // Seat a heeled figure's skeletal foot inside its clothed heel. The ankle is
+  // already raised (heelLift) so the shoe sits natively, but the skeletal foot
+  // settles flat on the floor — heel bone down — 22–32 mm below the raised
+  // ankle node, while inside a real heel the foot is pitched (heel bone lifted,
+  // ankle high, ball on the floor). So here the skeletal foot is rotated
+  // heel-up about the ball until its ankle end rises to the ankle node, closing
+  // the gap to the shin and matching the shoe's pitch. Separately, the floor
+  // corners just drop back to the shoe sole (the ankle raise floated them): the
+  // shoe still contacts heel-block + ball, so the balance footprint stays flat,
+  // it only needs un-floating. Geometry only, never the ankle joint (the shoe's
+  // heel is baked into its mesh, so a joint pitch would double it). Stores
+  // this.footCorners / this.toeCorners, which lowestPointY and analysis prefer.
+  #applyHeel() {
+    this.group.updateMatrixWorld(true);
+    const gInv = this.group.matrixWorld.clone().invert();
+    const t = new THREE.Vector3();
+    const P = new THREE.Vector3();
+    const off = new THREE.Vector3();
+    for (const side of ['_L', '_R']) {
+      const A = this.nodes[`ankle${side}`].getWorldPosition(new THREE.Vector3()).applyMatrix4(gInv);
+      // Skeleton foot vertices (ankle + toes meshes), figure-local.
+      const verts = [];
+      for (const mesh of this.layerMeshes.skeleton) {
+        const nn = this.#nodeNameOf(mesh);
+        if (nn !== `ankle${side}` && nn !== `toes${side}`) continue;
+        mesh.updateMatrixWorld(true);
+        const p = mesh.geometry.attributes.position;
+        const step = Math.max(1, Math.floor(p.count / 1500));
+        for (let i = 0; i < p.count; i += step) {
+          verts.push(new THREE.Vector3().fromBufferAttribute(p, i).applyMatrix4(mesh.matrixWorld).applyMatrix4(gInv));
+        }
+      }
+      if (!verts.length) continue;
+      // Ball pivot: the lowest vertex in the forward half of the foot (the ball/
+      // toe contact, ~y = 0). Pitch axis: horizontal, perpendicular to forward.
+      const c = new THREE.Vector3();
+      verts.forEach((v) => c.add(v));
+      c.multiplyScalar(1 / verts.length);
+      const fwd = new THREE.Vector3(c.x - A.x, 0, c.z - A.z).normalize();
+      const axis = new THREE.Vector3(0, 1, 0).cross(fwd).normalize();
+      let ball = verts[0];
+      for (const v of verts) {
+        if (v.clone().sub(c).dot(fwd) > 0 && v.y < ball.y) ball = v;
+      }
+      const B = ball.clone();
+      // Rotate heel-up (back of the foot rises) about the ball until the foot's
+      // highest point reaches the ankle node — seating the ankle end at the
+      // shin and lifting the heel bone off the floor, as a heel does.
+      const q = new THREE.Quaternion();
+      const maxYAt = (phi) => {
+        q.setFromAxisAngle(axis, phi);
+        let m = -Infinity;
+        for (const v of verts) {
+          t.copy(v).sub(B).applyQuaternion(q).add(B);
+          if (t.y > m) m = t.y;
+        }
+        return m;
+      };
+      const dir = maxYAt(0.15) > maxYAt(-0.15) ? 1 : -1; // sign that raises the back
+      let lo = 0;
+      let hi = 1.0;
+      for (let it = 0; it < 40; it++) {
+        const mid = (lo + hi) / 2;
+        if (maxYAt(dir * mid) < A.y) lo = mid; else hi = mid;
+      }
+      const R = new THREE.Quaternion().setFromAxisAngle(axis, dir * (lo + hi) / 2);
+      // Apply to the ankle + toes skeleton meshes (rotate about the ball B; a
+      // mesh parented at node P needs local offset B + R·(P − B) − P).
+      for (const base of ['ankle', 'toes']) {
+        const nodeName = `${base}${side}`;
+        this.nodes[nodeName].getWorldPosition(P).applyMatrix4(gInv);
+        off.copy(P).sub(B).applyQuaternion(R).add(B).sub(P);
+        for (const mesh of this.layerMeshes.skeleton) {
+          if (this.#nodeNameOf(mesh) !== nodeName) continue;
+          mesh.quaternion.copy(R);
+          mesh.position.copy(off);
+        }
+      }
+    }
+    // Floor corners: drop back to the shoe sole. The ankle raise floated them by
+    // heelLift; the shoe still contacts heel-block + ball flat on the floor, so
+    // just lower each corner by heelRise (fraction of height) — no pitch.
+    const drop = (corners) => corners.map(([x, y, z]) => [x, y - this.heelRise, z]);
+    this.footCorners = { _L: drop(FOOT_CORNERS_L), _R: drop(FOOT_CORNERS_R) };
+    this.toeCorners = { _L: drop(TOE_CORNERS_L), _R: drop(TOE_CORNERS_R) };
   }
 
   // Curl one hand's fingers (0 = bind pose, 1 = closed around the partner's
@@ -1094,8 +1183,8 @@ export class Figure {
     const H = this.height;
     let minY = Infinity;
     for (const [nodeName, corners] of [
-      ['ankle_L', FOOT_CORNERS_L], ['ankle_R', FOOT_CORNERS_R],
-      ['toes_L', TOE_CORNERS_L], ['toes_R', TOE_CORNERS_R],
+      ['ankle_L', this.footCorners?._L ?? FOOT_CORNERS_L], ['ankle_R', this.footCorners?._R ?? FOOT_CORNERS_R],
+      ['toes_L', this.toeCorners?._L ?? TOE_CORNERS_L], ['toes_R', this.toeCorners?._R ?? TOE_CORNERS_R],
     ]) {
       const node = this.nodes[nodeName];
       for (const [x, y, z] of corners) {

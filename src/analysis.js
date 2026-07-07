@@ -23,9 +23,11 @@ export function computeCOG(figure, target = new THREE.Vector3()) {
 export function footContactsBySide(figure, threshold = 0.035) {
   const bySide = { L: [], R: [] };
   figure.group.updateMatrixWorld(true);
+  // Prefer a figure's heel-adjusted corners (see Figure.#applyHeel) so a heeled
+  // dancer's support base sits on the floor, not up at the raised ankle.
   const patches = [
-    ['L', 'ankle_L', FOOT_CORNERS_L], ['L', 'toes_L', TOE_CORNERS_L],
-    ['R', 'ankle_R', FOOT_CORNERS_R], ['R', 'toes_R', TOE_CORNERS_R],
+    ['L', 'ankle_L', figure.footCorners?._L ?? FOOT_CORNERS_L], ['L', 'toes_L', figure.toeCorners?._L ?? TOE_CORNERS_L],
+    ['R', 'ankle_R', figure.footCorners?._R ?? FOOT_CORNERS_R], ['R', 'toes_R', figure.toeCorners?._R ?? TOE_CORNERS_R],
   ];
   for (const [side, nodeName, corners] of patches) {
     const node = figure.nodes[nodeName];
