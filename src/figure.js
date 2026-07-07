@@ -105,10 +105,14 @@ const FINGER_AXIS = new THREE.Vector3(0, 0, 1);
 const _fingerQ = new THREE.Quaternion();
 
 export class Figure {
-  constructor({ name, height = 1.72, mass = 70, color = 0x4d8fd1, skin = 0xd9a68a, skeleton = null, muscles = null, body = null }) {
+  constructor({ name, height = 1.72, mass = 70, color = 0x4d8fd1, skin = 0xd9a68a, skeleton = null, muscles = null, body = null, heelRise = 0 }) {
     this.name = name;
     this.height = height;
     this.mass = mass;
+    // Heel height as a fraction of stature: raises the ankle (and everything the
+    // heel lifts) so a heeled avatar's foot sits natively on the floor instead
+    // of being squashed flat, and the skeletal foot pitches to match.
+    this.heelRise = heelRise;
     this.color = color;
     this.skin = skin;
     this.skeletonMesh = skeleton; // parsed atlas bones, or null → procedural bones
@@ -157,11 +161,17 @@ export class Figure {
   #build() {
     const H = this.height;
 
-    // Joint hierarchy.
+    // Joint hierarchy. A heeled figure lifts its ankles (and, riding them, the
+    // toes) so the raised heel — not a squashed-flat sole — is what stands on
+    // the floor; the extra height propagates up the closed leg chain.
+    this._heelLift = this.heelRise * H;
     for (const def of JOINTS) {
       const node = new THREE.Object3D();
       node.name = `${this.name}:${def.name}`;
       node.position.set(def.offset[0] * H, def.offset[1] * H, def.offset[2] * H);
+      if (this._heelLift && (def.name === 'ankle_L' || def.name === 'ankle_R')) {
+        node.position.y += this._heelLift; // toes/toe are children → ride along
+      }
       node.userData = { figure: this, jointName: def.name, def };
       this.nodes[def.name] = node;
       if (def.parent) this.nodes[def.parent].add(node);
@@ -566,13 +576,21 @@ export class Figure {
       const p = def.parent ? rest[def.parent].clone() : new THREE.Vector3();
       rest[def.name] = p.add(new THREE.Vector3(...def.offset).multiplyScalar(H));
     }
+    // The heel lifts the ankle and everything riding it; mirror the node-build
+    // lift here so rest/target/jointY agree with the actual foot node heights.
+    const HEEL_NODES = new Set(['ankle_L', 'ankle_R', 'toes_L', 'toes_R', 'toe_L', 'toe_R']);
+    if (this._heelLift) for (const n of HEEL_NODES) rest[n].y += this._heelLift;
     // Retarget onto the *atlas* rest pose where it's known (limb joints), so the
     // clothed body coincides with the skeleton/muscle layers; the torso and any
     // joint the atlas can't locate fall back to the rig rest. `target` is the
     // position each bone is snapped/aligned to; the offset from its rig node is
     // baked into the bone's local matrix so posing still pivots about the node.
     const atlas = this.#atlasLimbRest();
-    const target = (name) => atlas.get(name) || rest[name];
+    const target = (name) => {
+      const p = atlas.get(name) || rest[name];
+      return this._heelLift && HEEL_NODES.has(name) && atlas.has(name)
+        ? p.clone().setY(p.y + this._heelLift) : p;
+    };
 
     const avatar = cloneSkinned(src.scene);
     avatar.updateMatrixWorld(true);
@@ -643,6 +661,8 @@ export class Figure {
       if (p.squash && p.q.y * s0 > 1e-4) {
         // Vertical squash so the sole reaches exactly y = 0 at rest: the bind
         // sole sits q.y below the bone; our joint sits jointY above the floor.
+        // A heeled figure raises its ankle to the shoe's natural sole depth, so
+        // lam → 1 and the heel is preserved instead of flattened.
         const lam = THREE.MathUtils.clamp(p.jointY / (p.q.y * s0), 0.3, 1);
         local.premultiply(m.makeScale(1, lam, 1));
       }
@@ -703,10 +723,11 @@ export class Figure {
     const gInv = this.group.matrixWorld.clone().invert();
     // Per endpoint: the skeleton node(s) whose merged mesh we rotate, the joint
     // the rotation pivots about, and the joint base(s) whose geometry defines
-    // the endpoint's frame (in both layers). Only the hand is treated this way:
-    // the foot's floor contact plus the flat-foot-vs-heeled-shoe shape mismatch
-    // make a whole-frame match drive the bones through the floor, so feet need a
-    // floor-aware approach handled elsewhere.
+    // the endpoint's frame (in both layers). Only the hand uses this whole-frame
+    // match: the foot rests on the floor and its flat-bone-vs-heeled-shoe shape
+    // mismatch makes a centroid match over-pitch it through the floor. (Pitching
+    // the heeled skeletal foot to sit inside the shoe is still TODO — see the
+    // heelRise WIP notes.)
     const specs = [
       { rotNodes: ['wrist'], pivot: 'wrist', geomJoints: ['wrist'] },
     ];
