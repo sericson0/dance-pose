@@ -10,7 +10,9 @@
 //
 // Keyed by avatar (man/woman have different Biped bind poses). `rest` holds
 // canonical joint centers as fractions of stature (scale-free); `endpointR`
-// holds the skeletal-hand roll quaternions [x, y, z, w] (scale-free).
+// holds the skeletal-hand roll quaternions [x, y, z, w]; `endpointS` holds the
+// uniform hand scale; `endpointT` holds the seat translation [x, y, z] as
+// fractions of stature (all scale-free).
 export const RIG_CALIBRATION = {
   man: {
     rest: {
@@ -34,8 +36,16 @@ export const RIG_CALIBRATION = {
       wrist_R: [-0.152071, 0.498696, 0.008197],
     },
     endpointR: {
-      wrist_L: [0.261957, -0.352076, 0.161908, 0.883859],
-      wrist_R: [0.266243, 0.356436, -0.163937, 0.88045],
+      wrist_L: [0.069496, -0.635647, 0.300984, 0.707483],
+      wrist_R: [0.065536, 0.66001, -0.304483, 0.683653],
+    },
+    endpointS: {
+      wrist_L: 0.825838,
+      wrist_R: 0.821222,
+    },
+    endpointT: {
+      wrist_L: [0.038748, -0.017958, -0.02652],
+      wrist_R: [-0.042206, -0.017946, -0.025898],
     },
   },
   woman: {
@@ -60,8 +70,16 @@ export const RIG_CALIBRATION = {
       wrist_R: [-0.152071, 0.498696, 0.008197],
     },
     endpointR: {
-      wrist_L: [0.27588, -0.362723, 0.150582, 0.877295],
-      wrist_R: [0.284182, 0.37295, -0.157352, 0.869131],
+      wrist_L: [0.087677, -0.59786, 0.297649, 0.739109],
+      wrist_R: [0.088953, 0.628927, -0.302958, 0.71046],
+    },
+    endpointS: {
+      wrist_L: 0.83633,
+      wrist_R: 0.839051,
+    },
+    endpointT: {
+      wrist_L: [0.035295, -0.024344, -0.025225],
+      wrist_R: [-0.038928, -0.023124, -0.025212],
     },
   },
 };

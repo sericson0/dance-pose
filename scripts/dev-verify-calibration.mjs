@@ -65,6 +65,20 @@ for (const key of keys) {
     console.log(`  ${j.padEnd(12)} ${deg.toFixed(3).padStart(7)} °`);
     if (deg > TOL_DEG) problems.push(`${key}: endpointR ${j} ${deg.toFixed(2)}° > ${TOL_DEG}°`);
   }
+  console.log('endpoint seat-translation drift (frozen vs live), mm:');
+  for (const j of Object.keys(frozen.endpointT || {}).sort()) {
+    if (!l.endpointT || !l.endpointT[j]) { problems.push(`${key}: ${j} missing live endpointT`); continue; }
+    const mm = dist3(frozen.endpointT[j], l.endpointT[j]) * H * 1000;
+    console.log(`  ${j.padEnd(12)} ${mm.toFixed(2).padStart(7)} mm`);
+    if (mm > TOL_MM) problems.push(`${key}: endpointT ${j} ${mm.toFixed(2)}mm > ${TOL_MM}mm`);
+  }
+  console.log('endpoint hand-scale drift (frozen vs live):');
+  for (const j of Object.keys(frozen.endpointS || {}).sort()) {
+    if (!l.endpointS || l.endpointS[j] == null) { problems.push(`${key}: ${j} missing live endpointS`); continue; }
+    const d = Math.abs(frozen.endpointS[j] - l.endpointS[j]);
+    console.log(`  ${j.padEnd(12)} ${d.toFixed(4).padStart(7)}`);
+    if (d > 0.01) problems.push(`${key}: endpointS ${j} ${d.toFixed(3)} > 0.01`);
+  }
 }
 
 if (problems.length) console.log('\nPROBLEMS (re-bake with `npm run bake:rig`):\n' + problems.join('\n'));

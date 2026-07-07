@@ -61,16 +61,24 @@ lines.push('// pass/fail gate lives in scripts/dev-verify-calibration.mjs.');
 lines.push('//');
 lines.push('// Keyed by avatar (man/woman have different Biped bind poses). `rest` holds');
 lines.push('// canonical joint centers as fractions of stature (scale-free); `endpointR`');
-lines.push('// holds the skeletal-hand roll quaternions [x, y, z, w] (scale-free).');
+lines.push('// holds the skeletal-hand roll quaternions [x, y, z, w]; `endpointS` holds the');
+lines.push('// uniform hand scale; `endpointT` holds the seat translation [x, y, z] as');
+lines.push('// fractions of stature (all scale-free).');
 lines.push('export const RIG_CALIBRATION = {');
 for (const key of Object.keys(table).sort()) {
-  const { rest, endpointR } = table[key];
+  const { rest, endpointR, endpointS, endpointT } = table[key];
   lines.push(`  ${key}: {`);
   lines.push('    rest: {');
   for (const j of Object.keys(rest).sort()) lines.push(`      ${j}: ${fmtVec(rest[j])},`);
   lines.push('    },');
   lines.push('    endpointR: {');
   for (const j of Object.keys(endpointR).sort()) lines.push(`      ${j}: ${fmtVec(endpointR[j])},`);
+  lines.push('    },');
+  lines.push('    endpointS: {');
+  for (const j of Object.keys(endpointS || {}).sort()) lines.push(`      ${j}: ${r(endpointS[j])},`);
+  lines.push('    },');
+  lines.push('    endpointT: {');
+  for (const j of Object.keys(endpointT || {}).sort()) lines.push(`      ${j}: ${fmtVec(endpointT[j])},`);
   lines.push('    },');
   lines.push('  },');
 }

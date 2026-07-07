@@ -238,9 +238,10 @@ export class Figure {
     // body avatar and the endpoint roll both resolve against, computed once from
     // the skeleton atlas so every layer references one object instead of
     // re-estimating inline. `rest` holds the (fragile, estimated) limb joints;
-    // `endpointR` is filled by #alignEndpointGeometry. A frozen snapshot is the
-    // drift tripwire (see #assertCalibration).
-    this.calibration = { rest: this.skeletonMesh ? this.#atlasLimbRest() : new Map(), endpointR: {} };
+    // `endpointR`/`endpointS`/`endpointT` are filled by #alignEndpointGeometry
+    // (the roll, uniform scale, and seat translation of each skeletal hand). A
+    // frozen snapshot is the drift tripwire (see #assertCalibration).
+    this.calibration = { rest: this.skeletonMesh ? this.#atlasLimbRest() : new Map(), endpointR: {}, endpointS: {}, endpointT: {} };
 
     // --- Body layer: imported clothed avatar if available, else the
     // procedural mannequin volumes ---
@@ -670,7 +671,13 @@ export class Figure {
     for (const [k, q] of Object.entries(this.calibration.endpointR)) {
       endpointR[k] = [q.x, q.y, q.z, q.w];
     }
-    return { rest, endpointR };
+    const endpointS = {};
+    for (const [k, s] of Object.entries(this.calibration.endpointS)) endpointS[k] = s;
+    const endpointT = {};
+    for (const [k, t] of Object.entries(this.calibration.endpointT)) {
+      endpointT[k] = [t.x / H, t.y / H, t.z / H];
+    }
+    return { rest, endpointR, endpointS, endpointT };
   }
 
   // Tripwire: compare the live calibration to the frozen snapshot for this
@@ -697,6 +704,17 @@ export class Figure {
       _q.set(f[0], f[1], f[2], f[3]);
       const deg = 2 * Math.acos(Math.min(1, Math.abs(live.dot(_q)))) / DEG;
       if (deg > TOL_DEG) issues.push(`${k} ${deg.toFixed(2)}°`);
+    }
+    for (const [k, f] of Object.entries(frozen.endpointT || {})) {
+      const live = this.calibration.endpointT[k];
+      if (!live) continue;
+      const mm = live.distanceTo(_v.set(f[0] * H, f[1] * H, f[2] * H)) * 1000;
+      if (mm > TOL_MM) issues.push(`${k}T ${mm.toFixed(1)}mm`);
+    }
+    for (const [k, f] of Object.entries(frozen.endpointS || {})) {
+      const live = this.calibration.endpointS[k];
+      if (live == null) continue;
+      if (Math.abs(live - f) > 0.01) issues.push(`${k}S ${(live - f).toFixed(3)}`);
     }
     if (issues.length) {
       console.error(`[rig] calibration for "${this.bodyKey}" is stale (${issues.join(', ')}) — re-run: npm run bake:rig`);
@@ -890,20 +908,28 @@ export class Figure {
     const A = new THREE.Vector3(); const P = new THREE.Vector3(); const off = new THREE.Vector3();
     for (const side of ['_L', '_R']) {
       for (const spec of specs) {
-        const R = this.#endpointAlignR(side, spec, gInv);
-        if (!R) continue;
+        const fit = this.#endpointAlignR(side, spec, gInv);
+        if (!fit) continue;
+        const { R, S, T } = fit;
         this.calibration.endpointR[`${spec.pivot}${side}`] = R.clone(); // record for the tripwire
+        this.calibration.endpointS[`${spec.pivot}${side}`] = S;
+        this.calibration.endpointT[`${spec.pivot}${side}`] = T.clone();
         this.nodes[`${spec.pivot}${side}`].getWorldPosition(A).applyMatrix4(gInv);
         for (const base of spec.rotNodes) {
           const nodeName = `${base}${side}`;
-          // Rotate this node's geometry about the pivot A. A mesh parented at a
-          // node with origin P and identity rest rotation needs a local offset
-          // A + R·(P − A) − P so the rotation pivots about A, not about P (zero
-          // when the node *is* the pivot, e.g. the wrist/ankle's own mesh).
+          // Scale+rotate this node's geometry about the pivot A, then seat it with
+          // T so the whole hand lands on the glove (roll alone leaves the atlas
+          // hand — longer from the wrist and shaped differently — poking past the
+          // skin). A mesh parented at a node with origin P and identity rest
+          // rotation needs a local offset A + S·R·(P − A) − P so the transform
+          // pivots about A, not P (zero when the node *is* the pivot, e.g. the
+          // wrist's own mesh); T is a figure-local displacement, which equals
+          // node-local at the rest bake.
           this.nodes[nodeName].getWorldPosition(P).applyMatrix4(gInv);
-          off.copy(P).sub(A).applyQuaternion(R).add(A).sub(P);
+          off.copy(P).sub(A).applyQuaternion(R).multiplyScalar(S).add(A).sub(P).add(T);
           for (const mesh of this.layerMeshes.skeleton) {
             if (this.#nodeNameOf(mesh) !== nodeName) continue;
+            mesh.scale.setScalar(S);
             mesh.quaternion.copy(R);
             mesh.position.copy(off);
           }
@@ -919,8 +945,10 @@ export class Figure {
     return n ? n.userData.jointName : null;
   }
 
-  // Rotation (about the wrist) that lays the atlas hand onto the clothed hand's
-  // orientation. Rather than build a palm frame from a few axes — fragile,
+  // Similarity fit ({ R, S, T }) that lays the atlas hand onto the clothed hand:
+  // R rolls it to the glove's orientation, S scales it to the glove's size about
+  // the wrist, and T seats the whole hand on the glove. Rather than build a palm
+  // frame from a few axes — fragile,
   // because the two hands are shaped differently and the opposable thumb sits
   // off the palm plane, so any single normal is tilted differently in each layer
   // — this fits the *optimal* rotation (hornRotation) that overlays six
@@ -932,8 +960,7 @@ export class Figure {
   // coincide, so the palm block — the rigid part that must truly match — is
   // weighted up, and the fingers merely steer the roll. Returns null if the
   // regions can't be gathered (body fell back to the mannequin, or the atlas
-  // isn't the named anatomy skeleton) — the caller then leaves the hand
-  // unrotated.
+  // isn't the named anatomy skeleton) — the caller then leaves the hand as-is.
   #endpointAlignR(side, spec, gInv) {
     const jointName = `${spec.pivot}${side}`;
     const jointPos = this.nodes[jointName].getWorldPosition(new THREE.Vector3()).applyMatrix4(gInv);
@@ -995,8 +1022,7 @@ export class Figure {
       }
     }
 
-    // Corresponding wrist-relative point pairs, palm weighted up, then the
-    // optimal overlay rotation.
+    // Corresponding wrist-relative point pairs, palm weighted up.
     const P = [], Q = [], W = [];
     for (const k of ['thumb', 'index', 'middle', 'ring', 'pinky', 'palm']) {
       const bc = bodyAcc[k];
@@ -1006,7 +1032,29 @@ export class Figure {
       W.push(k === 'palm' ? 2 : 1);
     }
     if (P.length < 3) return null;
-    return hornRotation(P, Q, W);
+
+    // Weighted similarity fit (Umeyama): a roll R, a uniform scale S about the
+    // wrist, and a seat translation T that together overlay the atlas hand onto
+    // the glove. Scale earns its keep because the atlas hand is a bit longer from
+    // the wrist than the glove — a rotation alone leaves the fingertips poking
+    // past the skin, and a translation alone would only trade that overshoot for
+    // a palm offset. Centering by the weighted centroids first frees the roll
+    // from having to pass through the wrist, then S/T seat the whole hand; S is
+    // clamped so a degenerate correspondence can't collapse or inflate it.
+    let wsum = 0; const muP = new THREE.Vector3(); const muQ = new THREE.Vector3();
+    for (let i = 0; i < P.length; i++) { muP.addScaledVector(P[i], W[i]); muQ.addScaledVector(Q[i], W[i]); wsum += W[i]; }
+    muP.multiplyScalar(1 / wsum); muQ.multiplyScalar(1 / wsum);
+    const Pc = P.map((p) => p.clone().sub(muP));
+    const Qc = Q.map((q) => q.clone().sub(muQ));
+    const R = hornRotation(Pc, Qc, W);
+    let num = 0, den = 0; const _rp = new THREE.Vector3();
+    for (let i = 0; i < Pc.length; i++) {
+      num += W[i] * _rp.copy(Pc[i]).applyQuaternion(R).dot(Qc[i]);
+      den += W[i] * Pc[i].lengthSq();
+    }
+    const S = THREE.MathUtils.clamp(den > 1e-9 ? num / den : 1, 0.75, 1.25);
+    const T = muQ.clone().sub(muP.clone().applyQuaternion(R).multiplyScalar(S));
+    return { R, S, T };
   }
 
   // Seat a heeled figure's skeletal foot inside its clothed heel. The ankle is
