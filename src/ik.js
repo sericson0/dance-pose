@@ -50,6 +50,76 @@ export function solveTwoBone(figure, chain, targetWorld) {
   figure.group.updateMatrixWorld(true);
 }
 
+// Swivel a two-bone limb about the line through its root and effector: with
+// the shoulder (root) and wrist (effector) both pinned in world space, the
+// elbow (mid) can only travel on a circle around that axis. This rolls the
+// whole limb about the axis so the elbow swings toward `targetWorld` (a
+// pole-vector handle). The roll is applied at the root joint, and because a
+// rotation about an axis that passes through the root's origin AND the
+// effector (which sits on it) leaves both of those points fixed exactly, the
+// endpoints never move. The one thing that would move them is a joint-limit
+// clamp turning the roll into some other rotation, so instead we clamp the
+// roll *angle*: the largest roll toward the target that still keeps the root
+// within its limits. The mid joint's own flexion is untouched, so the root's
+// rotation range is what bounds the elbow's travel.
+export function swivelLimb(figure, chain, targetWorld) {
+  const root = figure.nodes[chain.root];
+  const mid = figure.nodes[chain.mid];
+  const eff = figure.nodes[chain.effector];
+
+  figure.group.updateMatrixWorld(true);
+  root.getWorldPosition(_R);
+  mid.getWorldPosition(_M);
+  eff.getWorldPosition(_E);
+
+  const axis = _E.clone().sub(_R);
+  if (axis.lengthSq() < 1e-10) return; // limb folded flat: no swivel axis
+  axis.normalize();
+
+  // Elbow's current radial direction from the axis, and the desired one from
+  // the pole handle (both projected into the plane perpendicular to the axis).
+  const center = _R.clone().addScaledVector(axis, _M.clone().sub(_R).dot(axis));
+  const cur = _M.clone().sub(center);
+  if (cur.lengthSq() < 1e-10) return; // elbow on the axis (limb straight)
+  cur.normalize();
+  const rel = targetWorld.clone().sub(center);
+  const des = rel.addScaledVector(axis, -rel.dot(axis));
+  if (des.lengthSq() < 1e-10) return; // handle on the axis: no direction
+  des.normalize();
+  const desired = Math.atan2(axis.dot(new THREE.Vector3().crossVectors(cur, des)), cur.dot(des));
+
+  const parentQ = root.parent.getWorldQuaternion(new THREE.Quaternion());
+  const parentQInv = parentQ.clone().invert();
+  const q0 = root.quaternion.clone(); // the root's local rotation before the roll
+  // The root's local rotation after rolling the whole limb by `theta` about the
+  // world axis: local' = P⁻¹ · Rot(axis, θ) · P · local.
+  const rolled = (theta) => parentQInv.clone()
+    .multiply(new THREE.Quaternion().setFromAxisAngle(axis, theta))
+    .multiply(parentQ).multiply(q0);
+  // A roll is feasible if it lands the root within its joint limits — i.e. the
+  // clamp leaves it unchanged (so the applied rotation stays a pure axis roll
+  // and the endpoints stay pinned).
+  const feasible = (theta) => {
+    root.quaternion.copy(rolled(theta));
+    const before = root.quaternion.clone();
+    figure.clampJoint(chain.root);
+    return root.quaternion.angleTo(before) < 1e-3;
+  };
+  // Largest fraction of the desired roll that stays in range (θ = 0 always is).
+  let frac = 1;
+  if (!feasible(desired)) {
+    let lo = 0, hi = 1;
+    for (let i = 0; i < 16; i++) {
+      const midF = (lo + hi) / 2;
+      if (feasible(desired * midF)) lo = midF; else hi = midF;
+    }
+    frac = lo;
+  }
+  root.quaternion.copy(rolled(desired * frac));
+  figure.clampJoint(chain.root); // a no-op at a feasible angle; keeps endpoints pinned
+  figure.group.updateMatrixWorld(true);
+}
+
 // Drop each foot back to standing ankle height directly below its current
 // position — handy after lowering the pelvis or leaning a figure.
 export function feetToFloor(figure) {

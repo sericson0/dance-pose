@@ -3,7 +3,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { Figure } from './figure.js';
 import { IK_CHAINS, JOINT_BY_NAME, ANCHOR_FOR } from './skeletonDef.js';
-import { solveTwoBone, editWithAnchor, pinAnchor, feetToFloor } from './ik.js';
+import { solveTwoBone, swivelLimb, editWithAnchor, pinAnchor, feetToFloor } from './ik.js';
 import { balanceReport, coupleReport, footContactsBySide } from './analysis.js';
 import { PRESETS } from './presets.js';
 import { loadSkeletonBones, loadMuscleMeshes, loadBodyMesh } from './skeletonMesh.js';
@@ -332,6 +332,23 @@ const ikTarget = new THREE.Mesh(
 ikTarget.visible = false;
 scene.add(ikTarget);
 
+// Pole-vector handle for swiveling an intermediate joint (elbow/knee) while
+// its neighbours stay pinned — see app.startSwivel / swivelLimb.
+const swivelTarget = new THREE.Mesh(
+  new THREE.SphereGeometry(0.025, 14, 10),
+  new THREE.MeshBasicMaterial({ color: 0x8ac6ff, transparent: true, opacity: 0.85 }),
+);
+swivelTarget.visible = false;
+scene.add(swivelTarget);
+
+// The two-bone chain whose middle joint is `jointName` (elbow/knee), or null.
+function swivelChainFor(jointName) {
+  for (const chain of Object.values(IK_CHAINS)) {
+    if (chain.mid === jointName) return chain;
+  }
+  return null;
+}
+
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 
@@ -348,6 +365,7 @@ const app = {
   chainMode: 'open', // 'open' (move distal) | 'closed' (anchor foot, move proximal)
   selected: null, // { figure, jointName }
   ikState: null, // { figure, chain }
+  swivelState: null, // { figure, chain } while dragging an elbow/knee pole handle
   ckc: null, // { node, matrix } captured while dragging in closed-chain mode
   linkCouple: false, // move/turn drags both dancers as one unit
   coupleDrag: null, // start transforms captured while dragging a linked couple
@@ -537,7 +555,9 @@ const app = {
     }
     this.selected = null;
     this.ikState = null;
+    this.swivelState = null;
     ikTarget.visible = false;
+    swivelTarget.visible = false;
     tcontrols.detach();
     if (this.ui) this.ui.onSelectionChanged();
   },
@@ -574,6 +594,33 @@ const app = {
     tcontrols.showX = tcontrols.showY = tcontrols.showZ = true;
     tcontrols.attach(ikTarget);
     if (this.ui) this.ui.onSelectionChanged();
+  },
+
+  // Drag an intermediate joint (elbow/knee) while its neighbours stay put: a
+  // pole handle appears at the joint, and dragging it swivels the limb about
+  // the root→effector axis (see swivelLimb) within the joint's freedom of
+  // motion. `jointName` is the mid joint of a two-bone chain.
+  startSwivel(figure, jointName) {
+    const chain = swivelChainFor(jointName);
+    if (!chain) return;
+    this.deselect();
+    this.selected = { figure, jointName: chain.mid };
+    const sphere = figure.jointSphereByName[chain.mid];
+    if (sphere) sphere.material.emissive.set(0x3b6ea5);
+    this.swivelState = { figure, chain };
+    figure.nodes[chain.mid].getWorldPosition(swivelTarget.position);
+    swivelTarget.visible = true;
+    tcontrols.setMode('translate');
+    tcontrols.showX = tcontrols.showY = tcontrols.showZ = true;
+    tcontrols.attach(swivelTarget);
+    if (this.ui) this.ui.onSelectionChanged();
+  },
+
+  // Scriptable swivel (headless verification): roll the limb whose mid joint is
+  // `jointName` so the elbow/knee reaches toward `target` ({x,y,z} or Vector3).
+  swivelJoint(figure, jointName, target) {
+    const chain = swivelChainFor(jointName);
+    if (chain) swivelLimb(figure, chain, new THREE.Vector3(target.x, target.y, target.z));
   },
 
   selectFigure(figure) {
@@ -712,6 +759,10 @@ tcontrols.addEventListener('objectChange', () => {
     const minY = app.ikState.chain.effector.startsWith('ankle') ? 0.039 * H : 0.115 * H;
     if (ikTarget.position.y < minY) ikTarget.position.y = minY;
     solveTwoBone(app.ikState.figure, app.ikState.chain, ikTarget.position);
+  } else if (app.swivelState) {
+    // The pole handle stays where dragged; the elbow swivels to aim at it.
+    swivelLimb(app.swivelState.figure, app.swivelState.chain, swivelTarget.position);
+    if (app.ui) app.ui.refreshJointValues();
   } else if (app.selected) {
     app.selected.figure.clampJoint(app.selected.jointName);
     if (app.ckc) pinAnchor(app.ckc.figure, app.ckc.node, app.ckc.matrix);
@@ -779,7 +830,8 @@ function handleClick(e) {
   const { figure, jointName } = hits[0].object.userData;
   if (app.mode === 'ik') {
     if (IK_CHAINS[jointName]) app.startIK(figure, jointName);
-    // clicks on non-effector joints in IK mode are ignored
+    else if (swivelChainFor(jointName)) app.startSwivel(figure, jointName);
+    // clicks on other joints in drag mode are ignored
   } else {
     app.selectJoint(figure, jointName);
   }

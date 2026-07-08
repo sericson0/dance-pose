@@ -51,13 +51,26 @@ const LEFT_AND_CENTER = [
   { name: 'headTop', parent: 'head', offset: [0, 0.110, 0], endpoint: true },
 
   {
-    name: 'shoulder_L', parent: 'chest', offset: [0.115, 0.110, 0],
+    // Shoulder girdle (scapula + clavicle) pivoting about the sternoclavicular
+    // joint near the top of the sternum. The whole arm hangs off it, so moving
+    // the scapula carries the shoulder: protraction/retraction slides the point
+    // of the shoulder forward/back (rounding vs. opening the chest — the core of
+    // tango posture), elevation/depression is the shrug, and a small tilt tips
+    // the blade. At the rest (identity) pose the shoulder sits exactly where it
+    // did before this joint existed, so nothing downstream shifts until the
+    // scapula is actually moved. Left side only; the right is auto-mirrored.
+    name: 'scapula_L', parent: 'chest', offset: [0.020, 0.090, 0.030],
+    limits: { x: [-15, 15], y: [-25, 25], z: [-12, 25] },
+    labels: { x: 'Tip back / forward', y: 'Protract / retract', z: 'Depress / elevate' },
+  },
+  {
+    name: 'shoulder_L', parent: 'scapula_L', offset: [0.095, 0.020, -0.030],
     limits: { x: [-170, 45], y: [-80, 80], z: [-30, 170] },
     labels: { x: 'Raise forward / lower back', y: 'Rotate in / out', z: 'Across body / out to side' },
   },
   {
     name: 'elbow_L', parent: 'shoulder_L', offset: [0, -0.186, 0],
-    limits: { x: [-150, 0], y: [-85, 85], z: [0, 0] },
+    limits: { x: [-150, 0], y: [-120, 120], z: [0, 0] },
     labels: { x: 'Bend / straighten', y: 'Palm turn (pronation)' },
   },
   {
@@ -124,8 +137,8 @@ export const JOINT_BY_NAME = Object.fromEntries(JOINTS.map((j) => [j.name, j]));
 // Human-readable joint names for the UI.
 export const JOINT_TITLES = {
   pelvis: 'Pelvis', spine: 'Lumbar spine', chest: 'Thoracic spine', neck: 'Neck', head: 'Head',
-  shoulder_L: 'Left shoulder', elbow_L: 'Left elbow', wrist_L: 'Left wrist',
-  shoulder_R: 'Right shoulder', elbow_R: 'Right elbow', wrist_R: 'Right wrist',
+  scapula_L: 'Left shoulder blade', shoulder_L: 'Left shoulder', elbow_L: 'Left elbow', wrist_L: 'Left wrist',
+  scapula_R: 'Right shoulder blade', shoulder_R: 'Right shoulder', elbow_R: 'Right elbow', wrist_R: 'Right wrist',
   hip_L: 'Left hip', knee_L: 'Left knee', ankle_L: 'Left ankle', toes_L: 'Left toes',
   hip_R: 'Right hip', knee_R: 'Right knee', ankle_R: 'Right ankle', toes_R: 'Right toes',
 };
@@ -194,8 +207,8 @@ export const BODY_PARTS = [
   { id: 'head', title: 'Head & neck', nodes: ['neck', 'head', 'headTop'] },
   { id: 'torso', title: 'Torso', nodes: ['spine', 'chest'] },
   { id: 'pelvis', title: 'Pelvis', nodes: ['pelvis'] },
-  { id: 'arm_L', title: 'Left arm', nodes: ['shoulder_L', 'elbow_L', 'wrist_L', 'hand_L'] },
-  { id: 'arm_R', title: 'Right arm', nodes: ['shoulder_R', 'elbow_R', 'wrist_R', 'hand_R'] },
+  { id: 'arm_L', title: 'Left arm', nodes: ['scapula_L', 'shoulder_L', 'elbow_L', 'wrist_L', 'hand_L'] },
+  { id: 'arm_R', title: 'Right arm', nodes: ['scapula_R', 'shoulder_R', 'elbow_R', 'wrist_R', 'hand_R'] },
   { id: 'leg_L', title: 'Left leg', nodes: ['hip_L', 'knee_L'] },
   { id: 'leg_R', title: 'Right leg', nodes: ['hip_R', 'knee_R'] },
   { id: 'foot_L', title: 'Left foot', nodes: ['ankle_L', 'toes_L', 'toe_L'] },
@@ -249,8 +262,8 @@ export const ANCHOR_FOR = {
   // The toes joint anchors itself: with the toes pinned flat on the floor,
   // extending them rotates the body up over the ball of the foot (a relevé).
   toes_L: 'toes_L', toes_R: 'toes_R',
-  shoulder_L: 'wrist_L', elbow_L: 'wrist_L', wrist_L: 'wrist_L',
-  shoulder_R: 'wrist_R', elbow_R: 'wrist_R', wrist_R: 'wrist_R',
+  scapula_L: 'wrist_L', shoulder_L: 'wrist_L', elbow_L: 'wrist_L', wrist_L: 'wrist_L',
+  scapula_R: 'wrist_R', shoulder_R: 'wrist_R', elbow_R: 'wrist_R', wrist_R: 'wrist_R',
   pelvis: 'support-foot', // resolved to the lower ankle at runtime
   spine: null, chest: null, neck: null, head: null,
 };

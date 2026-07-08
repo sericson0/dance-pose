@@ -9,7 +9,7 @@ import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 // to one of our own joint nodes so it poses with the existing skeleton.
 
 // Joint bases that exist per-side as `${base}_L` / `${base}_R`.
-export const LIMB_BASES = new Set(['hip', 'knee', 'ankle', 'toes', 'shoulder', 'elbow', 'wrist']);
+export const LIMB_BASES = new Set(['hip', 'knee', 'ankle', 'toes', 'scapula', 'shoulder', 'elbow', 'wrist']);
 
 // Alphanumeric-only lowercasing so matching survives GLTFLoader's node-name
 // sanitization ("1st metacarpal bone.r" → "1st_metacarpal_boner").
@@ -31,7 +31,11 @@ export function classifyBone(rawName) {
 
   if (has('cervicalvertebrae', 'atlasc1', 'axisc2')) return { node: 'neck', material };
   if (has('lumbarvertebrae')) return { node: 'spine', material };
-  if (has('thoracicvertebrae', 'rib', 'sternum', 'scapula', 'clavicle', 'costalcart')) {
+  // Shoulder-girdle bones ride the scapula node (a limb base, resolved per-side)
+  // so they move when the scapula is articulated; the rest of the thorax rides
+  // the chest. Check girdle before the thoracic group.
+  if (has('scapula', 'clavicle')) return { node: 'scapula', material };
+  if (has('thoracicvertebrae', 'rib', 'sternum', 'costalcart')) {
     return { node: 'chest', material };
   }
   if (has('sacrum', 'coccyx', 'hipbone')) return { node: 'pelvis', material };

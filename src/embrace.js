@@ -85,6 +85,19 @@ const CLOSED_CURL = 0.45;
 // around its joint limits instead of settling.
 const MIN_REACH = 0.12;
 
+// Working pronation span the embrace arm solves within, in degrees. The elbow
+// joint itself allows a wider palm turn (±120°) for free posing, but the clasp
+// branch-ranking (#demandBranches / #poseError) and the closed-side #pronate
+// were tuned to the forearm's natural ±85° range: letting the solve reach past
+// it lets it pick a strained pronation branch that leaves the joined hands
+// gapping after a pivot. So the embrace caps pronation to this range while the
+// joint limit still governs the UI slider and gizmo.
+const CLASP_PRONATION_DEG = 85;
+const claspPronationRange = (arm) => {
+  const [lo, hi] = JOINT_BY_NAME[arm.elbow].limits.y;
+  return [Math.max(lo, -CLASP_PRONATION_DEG), Math.min(hi, CLASP_PRONATION_DEG)];
+};
+
 // Center of the palm: halfway from the wrist to the hand endpoint.
 export function handCenter(figure, wristName, handName, target = new THREE.Vector3()) {
   figure.group.updateMatrixWorld(true);
@@ -413,7 +426,7 @@ export class Embrace {
       .multiply(new THREE.Matrix4().makeRotationFromQuaternion(targetQ));
     const e = new THREE.Euler().setFromRotationMatrix(m, 'YXZ');
     const wrap = (a) => THREE.MathUtils.euclideanModulo(a + Math.PI, 2 * Math.PI) - Math.PI;
-    const ly = JOINT_BY_NAME[arm.elbow].limits.y;
+    const ly = claspPronationRange(arm);
     const lw = JOINT_BY_NAME[arm.wrist].limits;
     return [
       [e.y, e.x, e.z],
@@ -640,6 +653,6 @@ export class Embrace {
     ));
     if (Math.hypot(local.x, local.z) < 1e-4) return; // clasp along the forearm axis
     const theta = Math.atan2(local.x, local.z);
-    elbow.rotation.y = clampAngle(theta, JOINT_BY_NAME[arm.elbow].limits.y);
+    elbow.rotation.y = clampAngle(theta, claspPronationRange(arm));
   }
 }
