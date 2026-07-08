@@ -119,6 +119,14 @@ export class Embrace {
     this.hands = false; // keep the arm frame (clasp + closed-side palms)
     this.close = false; // keep chest-to-chest torso contact
     this.tiltDeg = 20; // joined hands' finger tilt from vertical (UI slider)
+    // Height of the seeded clasp above the open-side shoulders, as a fraction
+    // of mean stature (UI "Clasp height" slider). 0 = shoulder level, the
+    // natural close-embrace frame — the hands join at collarbone height and
+    // the elbows hang. Raising it lifts the hands (and the elbows with them)
+    // toward a raised salon frame; the elbow height follows the clasp, not
+    // the finger tilt (the hand is above the shoulder, so the elbow must rise
+    // to reach it).
+    this.claspHeight = 0;
     // The clasp point stored in each dancer's chest frame; the live target is
     // the midpoint of the two, so it follows both torsos as they move.
     this.claspLocal = { leader: null, follower: null };
@@ -152,27 +160,52 @@ export class Embrace {
     this.tiltDeg = deg;
   }
 
+  // Height of the joined open-side hands, as a fraction of mean stature above
+  // the open-side shoulders (0 = shoulder level). Re-seats the live clasp at
+  // the new height, keeping its horizontal position, so the elbows rise or
+  // fall to follow it (see #swivelForPalm — the elbow tracks the clasp, the
+  // hand being above the shoulder is what forces it up).
+  setClaspHeight(frac) {
+    this.claspHeight = frac;
+    const clasp = this.claspWorld();
+    if (!clasp) return; // not engaged yet; defaultClasp() will use it
+    clasp.y = this.#claspShoulderY() + frac * this.#meanHeight();
+    this.captureClasp(clasp);
+  }
+
+  #meanHeight() {
+    return (this.leader.height + this.follower.height) / 2;
+  }
+
+  // Mean height of the two open-side shoulders (the clasp's height reference).
+  #claspShoulderY() {
+    return (this.leader.worldPos('shoulder_L').y
+      + this.follower.worldPos('shoulder_R').y) / 2;
+  }
+
   // Where the hands join when the clasp engages: the canonical tango hold —
   // out to the open side past the couple's open-side shoulders, midway
-  // between the two chests, raised to about the follower's face. The point
-  // is chosen so that both arms can really deliver the clasp orientation
-  // (palms facing each other along the couple axis, fingers up): seeding
-  // the clasp from wherever the hands happen to hang can land it where
-  // that orientation is anatomically unreachable — too close over the
-  // shoulders, the demanded pronation sits in the dead zone at every
-  // swivel and a hand turns its back on the partner. Dragging an open-side
-  // hand afterwards re-captures the clasp wherever the user puts it.
+  // between the two chests, at the clasp height (`claspHeight`, default
+  // shoulder level — the natural close-embrace frame, elbows hanging; the
+  // "Clasp height" slider raises it toward a salon frame). The horizontal
+  // placement is chosen so that both arms can really deliver the clasp
+  // orientation (palms facing each other along the couple axis): seeding the
+  // clasp from wherever the hands happen to hang can land it where that
+  // orientation is anatomically unreachable — too close over the shoulders,
+  // the demanded pronation sits in the dead zone at every swivel and a hand
+  // turns its back on the partner. Dragging an open-side hand afterwards
+  // re-captures the clasp wherever the user puts it.
   defaultClasp() {
     const base = this.leader.worldPos('shoulder_L')
       .add(this.follower.worldPos('shoulder_R'))
       .multiplyScalar(0.5);
-    const meanH = (this.leader.height + this.follower.height) / 2;
+    const meanH = this.#meanHeight();
     const mid = this.leader.worldPos('chest')
       .add(this.follower.worldPos('chest')).multiplyScalar(0.5);
     const out = base.clone().sub(mid);
     out.y = 0;
     if (out.lengthSq() > 1e-6) base.addScaledVector(out.normalize(), 0.10 * meanH);
-    base.y += 0.05 * meanH;
+    base.y += this.claspHeight * meanH; // shoulder level by default
     return base;
   }
 

@@ -50,6 +50,14 @@ export function initUI(app) {
     embraceTiltVal.textContent = `${embraceTilt.value}°`;
     app.setClaspTilt(Number(embraceTilt.value));
   });
+  // Clasp height: the slider value is a percent of mean stature above the
+  // shoulders (0 = shoulder level).
+  const embraceHeight = $('embrace-height');
+  const embraceHeightVal = $('embrace-height-val');
+  embraceHeight.addEventListener('input', () => {
+    embraceHeightVal.textContent = embraceHeight.value;
+    app.setClaspHeight(Number(embraceHeight.value) / 100);
+  });
 
   const showButtons = [...document.querySelectorAll('#show-buttons button')];
   for (const btn of showButtons) {
