@@ -163,6 +163,13 @@ export class Figure {
     this.group = new THREE.Group(); // root: position (x,z) + facing (rotation.y)
     this.group.userData.figure = this;
     this.nodes = {};
+    // Display-only "atlas" joint nodes: a parallel sub-tree carrying the skeletal
+    // limb bones, positioned at the imported skeleton's OWN joint centers (which
+    // sit a few cm off the rig's anthropometric nodes) and slaved to the rig
+    // joints' rotations each frame. Bones hung here pivot about the anatomical
+    // joint, so they stay welded to their neighbours in any pose instead of
+    // swinging apart as a bend opens (see #buildAtlasNodes / syncAtlasNodes).
+    this.atlasNodes = {};
     this.pickSpheres = [];
     this.layerMeshes = { skeleton: [], body: [], muscle: [] };
     this.jointSphereByName = {};
@@ -192,9 +199,9 @@ export class Figure {
 
   // Attach a mesh into a joint node and register it in a visual layer.
   // Public so anatomy.js (and future part modules) can add geometry.
-  addMesh(nodeName, mesh, layer, cast = true) {
+  addMesh(nodeName, mesh, layer, cast = true, parent = null) {
     mesh.castShadow = cast;
-    this.nodes[nodeName].add(mesh);
+    (parent || this.nodes[nodeName]).add(mesh);
     if (layer) this.layerMeshes[layer].push(mesh);
     return mesh;
   }
@@ -219,10 +226,19 @@ export class Figure {
       else this.group.add(node);
     }
 
+    // The single neutral rest: the imported skeleton's own joint centers
+    // (figure-local), estimated where its bone clusters meet. The body avatar
+    // retarget and the endpoint roll both resolve against this, and the atlas
+    // limb sub-tree is positioned by it. Computed before the skeleton bake so
+    // the bones can be hung on the atlas nodes.
+    const atlasRest = this.skeletonMesh ? this.#atlasLimbRest() : new Map();
+
     // --- Skeleton layer: imported anatomical mesh if available, else the
     // procedural bones in anatomy.js ---
-    if (this.skeletonMesh) this.#buildMeshSkeleton();
-    else buildSkeleton(this);
+    if (this.skeletonMesh) {
+      this.#buildAtlasNodes(atlasRest);
+      this.#buildMeshSkeleton();
+    } else buildSkeleton(this);
 
     // Joint pick/display spheres (always raycastable; opacity follows skeleton layer).
     for (const def of JOINTS) {
@@ -235,13 +251,13 @@ export class Figure {
     }
 
     // The single neutral rest: the canonical figure-local joint centers the
-    // body avatar and the endpoint roll both resolve against, computed once from
-    // the skeleton atlas so every layer references one object instead of
-    // re-estimating inline. `rest` holds the (fragile, estimated) limb joints;
+    // body avatar and the endpoint roll both resolve against (computed above as
+    // `atlasRest`) so every layer references one object instead of re-estimating
+    // inline. `rest` holds the (fragile, estimated) limb joints;
     // `endpointR`/`endpointS`/`endpointT` are filled by #alignEndpointGeometry
     // (the roll, uniform scale, and seat translation of each skeletal hand). A
     // frozen snapshot is the drift tripwire (see #assertCalibration).
-    this.calibration = { rest: this.skeletonMesh ? this.#atlasLimbRest() : new Map(), endpointR: {}, endpointS: {}, endpointT: {} };
+    this.calibration = { rest: atlasRest, endpointR: {}, endpointS: {}, endpointT: {} };
 
     // --- Body layer: imported clothed avatar if available, else the
     // procedural mannequin volumes ---
@@ -351,7 +367,9 @@ export class Figure {
         targets.push([b.node, Tpos, false]);
       }
       for (const [nodeName, T, mirror] of targets) {
-        const node = this.nodes[nodeName];
+        // Limb bones ride the atlas sub-tree (pivot about the anatomical joint);
+        // everything else rides its rig node directly.
+        const node = this.atlasNodes[nodeName] || this.nodes[nodeName];
         if (!node) continue;
         const g = b.geometry.clone();
         if (Rf) g.applyMatrix4(Rf); // adduct the finger in the atlas frame first
@@ -368,7 +386,56 @@ export class Figure {
       const merged = mergeGeometries(geoms, false);
       geoms.forEach((g) => g.dispose());
       if (!merged) continue;
-      this.addMesh(nodeName, new THREE.Mesh(merged, this.materials[material]), 'skeleton', true);
+      this.addMesh(nodeName, new THREE.Mesh(merged, this.materials[material]), 'skeleton', true,
+        this.atlasNodes[nodeName] || null);
+    }
+  }
+
+  // Build the display-only atlas limb sub-tree (see this.atlasNodes). Each
+  // seated joint gets an Object3D placed at the imported skeleton's own joint
+  // center (`atlasRest`) and slaved to the rig joint's rotation every frame, so
+  // the bones hung on it pivot about the anatomical joint and stay welded to
+  // their neighbours through any bend. A whole limb chain must be seated
+  // together (a bone welds to its neighbour only if both ride matching trees),
+  // so this covers the complete arm chain scapula → shoulder → elbow → wrist;
+  // the scapula stays a rig node (it anchors the chain and barely articulates).
+  #buildAtlasNodes(atlasRest) {
+    this.group.updateMatrixWorld(true);
+    const gInv = this.group.matrixWorld.clone().invert();
+    const rigLocal = (name) => this.nodes[name].getWorldPosition(new THREE.Vector3()).applyMatrix4(gInv);
+    // [seated base, parent base, parent is a rig node?]. Rest rotations are all
+    // identity, so a parent's local axes equal the figure axes and the child's
+    // local offset is a plain figure-local subtraction.
+    const chain = [
+      ['shoulder', 'scapula', true],
+      ['elbow', 'shoulder', false],
+      ['wrist', 'elbow', false],
+    ];
+    for (const side of ['_L', '_R']) {
+      for (const [base, par, parIsRig] of chain) {
+        const name = `${base}${side}`, parName = `${par}${side}`;
+        const center = atlasRest.get(name);
+        const parent = parIsRig ? this.nodes[parName] : this.atlasNodes[parName];
+        const parCenter = parIsRig ? rigLocal(parName) : atlasRest.get(parName);
+        if (!center || !parent || !parCenter) continue;
+        const node = new THREE.Object3D();
+        node.position.copy(center).sub(parCenter);
+        node.userData = { figure: this, jointName: name, isAtlas: true };
+        parent.add(node);
+        this.atlasNodes[name] = node;
+      }
+    }
+    this.group.updateMatrixWorld(true);
+  }
+
+  // Slave each atlas limb node to its rig joint's local rotation. The atlas tree
+  // mirrors the rig chain order with identity rest rotations, so copying local
+  // quaternions reproduces the rig's articulation about the anatomical pivots.
+  // Called every frame (constraints/IK move rig joints directly) and from
+  // setPose so headless/ghost paths stay in step without waiting for a frame.
+  syncAtlasNodes() {
+    for (const name in this.atlasNodes) {
+      this.atlasNodes[name].quaternion.copy(this.nodes[name].quaternion);
     }
   }
 
@@ -396,9 +463,12 @@ export class Figure {
       // left (Tneg). The node side follows the copy's side.
       for (const [side, T, mirror] of [['R', Tpos, false], ['L', Tneg, true]]) {
         const nodeName = resolve(m.node, side);
-        const node = this.nodes[nodeName];
+        // Ride the same atlas limb sub-tree as the bones (see #seatNode) so a
+        // belly stays welded to the bone it lies on when the joint bends,
+        // instead of pivoting about the offset rig node while the bone doesn't.
+        const node = this.#seatNode(nodeName);
         if (!node) continue;
-        const insNode = m.insert ? this.nodes[resolve(m.insert, side)] : null;
+        const insNode = m.insert ? this.#seatNode(resolve(m.insert, side)) : null;
         if (insNode) {
           // Skinned: bake into figure-local space and let updateMuscleSkin blend
           // each vertex between the two joints every frame.
@@ -414,7 +484,7 @@ export class Figure {
           if (mirror) reverseWinding(g);
           const mesh = new THREE.Mesh(g, material);
           mesh.userData.muscleName = m.label;
-          this.addMesh(nodeName, mesh, 'muscle', true);
+          this.addMesh(nodeName, mesh, 'muscle', true, this.atlasNodes[nodeName] || null);
         }
       }
     });
@@ -914,7 +984,7 @@ export class Figure {
         this.calibration.endpointR[`${spec.pivot}${side}`] = R.clone(); // record for the tripwire
         this.calibration.endpointS[`${spec.pivot}${side}`] = S;
         this.calibration.endpointT[`${spec.pivot}${side}`] = T.clone();
-        this.nodes[`${spec.pivot}${side}`].getWorldPosition(A).applyMatrix4(gInv);
+        this.#seatNode(`${spec.pivot}${side}`).getWorldPosition(A).applyMatrix4(gInv);
         for (const base of spec.rotNodes) {
           const nodeName = `${base}${side}`;
           // Scale+rotate this node's geometry about the pivot A, then seat it with
@@ -923,9 +993,9 @@ export class Figure {
           // skin). A mesh parented at a node with origin P and identity rest
           // rotation needs a local offset A + S·R·(P − A) − P so the transform
           // pivots about A, not P (zero when the node *is* the pivot, e.g. the
-          // wrist's own mesh); T is a figure-local displacement, which equals
-          // node-local at the rest bake.
-          this.nodes[nodeName].getWorldPosition(P).applyMatrix4(gInv);
+          // wrist's own mesh — the hand rides the atlas wrist node, whose origin
+          // is that pivot); T is a figure-local displacement = node-local at rest.
+          this.#seatNode(nodeName).getWorldPosition(P).applyMatrix4(gInv);
           off.copy(P).sub(A).applyQuaternion(R).multiplyScalar(S).add(A).sub(P).add(T);
           for (const mesh of this.layerMeshes.skeleton) {
             if (this.#nodeNameOf(mesh) !== nodeName) continue;
@@ -936,6 +1006,12 @@ export class Figure {
         }
       }
     }
+  }
+
+  // The Object3D a limb bone actually pivots about: its atlas node if seated,
+  // else the rig node of the same name.
+  #seatNode(name) {
+    return this.atlasNodes[name] || this.nodes[name];
   }
 
   // Walk up to the joint node a mesh belongs to (its jointName), or null.
@@ -963,7 +1039,7 @@ export class Figure {
   // isn't the named anatomy skeleton) — the caller then leaves the hand as-is.
   #endpointAlignR(side, spec, gInv) {
     const jointName = `${spec.pivot}${side}`;
-    const jointPos = this.nodes[jointName].getWorldPosition(new THREE.Vector3()).applyMatrix4(gInv);
+    const jointPos = this.#seatNode(jointName).getWorldPosition(new THREE.Vector3()).applyMatrix4(gInv);
 
     // Skeleton region centroids from the atlas bones (figure-local, same bake).
     // Fingers are the phalanges of each ray; the palm is the metacarpal + carpal
@@ -1375,6 +1451,7 @@ export class Figure {
       node.rotation.set(x, y, z);
       this.clampJoint(name);
     }
+    this.syncAtlasNodes(); // pivot the skeletal limb bones about the anatomical joints
     this.group.updateMatrixWorld(true);
     this.updateMuscleSkin(); // keep bi-articular muscles in step (e.g. ghosts, interp)
   }
@@ -1388,6 +1465,7 @@ export class Figure {
     const yaw = this.group.rotation.y;
     this.group.position.y = 0;
     this.group.rotation.set(0, yaw, 0);
+    this.syncAtlasNodes();
     this.group.updateMatrixWorld(true);
   }
 
@@ -1401,6 +1479,7 @@ export class Figure {
       if (axes.z !== undefined) node.rotation.z = axes.z * DEG;
       this.clampJoint(name);
     }
+    this.syncAtlasNodes();
     this.group.updateMatrixWorld(true);
   }
 

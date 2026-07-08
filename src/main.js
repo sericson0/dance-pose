@@ -467,6 +467,12 @@ const app = {
     this.embrace.setTilt(deg);
   },
 
+  // Height of the joined open-side hands, fraction of mean stature above the
+  // shoulders (0 = shoulder level); the elbows follow the clasp height.
+  setClaspHeight(frac) {
+    this.embrace.setClaspHeight(frac);
+  },
+
   // Highlight body parts (Set of BODY_PARTS ids, empty/null clears).
   setHighlight(parts) {
     this.highlightParts = parts;
@@ -517,8 +523,11 @@ const app = {
     } else {
       mutate();
       figure.clampJoint(jointName);
-      figure.group.updateMatrixWorld(true);
     }
+    // Re-slave the skeletal limb bones (and their muscles) to the edited joints
+    // so they pivot about the anatomical joints, then refresh world matrices.
+    figure.syncAtlasNodes();
+    figure.group.updateMatrixWorld(true);
   },
 
   // Standard teaching camera angles.
@@ -895,6 +904,12 @@ function animate() {
   follower.clampToFloor();
 
   embrace.maintainHands(editing);
+
+  // Pivot the skeletal limb bones about their anatomical joints (the embrace,
+  // collision and IK above all move rig joints directly, so re-slave the atlas
+  // sub-tree before this frame renders).
+  leader.syncAtlasNodes();
+  follower.syncAtlasNodes();
 
   // Deform bi-articular muscles to the current pose (no-op unless the muscle
   // layer is showing). Runs after clampToFloor so joint matrices are current.
