@@ -3,7 +3,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { Figure } from './figure.js';
 import { IK_CHAINS, JOINT_BY_NAME, ANCHOR_FOR } from './skeletonDef.js';
-import { solveTwoBone, swivelLimb, editWithAnchor, pinAnchor, feetToFloor } from './ik.js';
+import { solveTwoBone, swivelLimb, editWithAnchor, pinAnchor, feetToFloor, flattenFoot } from './ik.js';
 import { balanceReport, coupleReport, footContactsBySide } from './analysis.js';
 import { PRESETS } from './presets.js';
 import { loadSkeletonBones, loadMuscleMeshes, loadBodyMesh } from './skeletonMesh.js';
@@ -352,6 +352,96 @@ function swivelChainFor(jointName) {
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 
+// ---------------------------------------------------------- whole-figure helpers
+const _UP = new THREE.Vector3(0, 1, 0);
+
+// Open vs. closed chain is only meaningful for the legs/pelvis (they have a
+// grounded foot to anchor); arms and the spine are always open chain.
+const CHAIN_JOINTS = new Set([
+  'pelvis', 'hip_L', 'knee_L', 'ankle_L', 'toes_L', 'hip_R', 'knee_R', 'ankle_R', 'toes_R',
+]);
+
+// Walking: the free foot lands STEP_STRIDE·H ahead of the planted foot, the body
+// rolls STEP_ADVANCE of that stride forward per step, and the pelvis sits at
+// WALK_PELVIS·H — a slight walking crouch, since a fully straight leg (the rest
+// pose) can only reach straight down, so the hip must drop for the foot to reach
+// forward and still touch the floor.
+const STEP_STRIDE = 0.20;
+const STEP_ADVANCE = 0.5;
+const WALK_PELVIS = 0.51;
+
+// The dancer's forward on the floor (local +Z projected onto the ground plane).
+function figureForward(figure, out = new THREE.Vector3()) {
+  out.set(0, 0, 1).applyQuaternion(figure.group.quaternion);
+  out.y = 0;
+  if (out.lengthSq() < 1e-8) return out.set(0, 0, 1);
+  return out.normalize();
+}
+
+// Orbit a figure around a world point by a yaw delta (couple pivot / calesita).
+function rotateAbout(figure, point, dYaw) {
+  const p = figure.group.position;
+  const rel = new THREE.Vector3(p.x - point.x, 0, p.z - point.z).applyAxisAngle(_UP, dYaw);
+  p.x = point.x + rel.x;
+  p.z = point.z + rel.z;
+  figure.group.rotation.y += dYaw;
+  figure.group.updateMatrixWorld(true);
+}
+
+// One footfall for `figure` (dir +1 forward, -1 back): the support foot holds its
+// spot on the floor while the body rolls forward over it and the free foot swings
+// a stride ahead, both landing flat. Which foot swings alternates (the trailing
+// foot leads), so repeated calls walk. Uses the two-bone leg IK to plant the feet
+// and a walking crouch so the legs can reach.
+function takeStep(figure, dir) {
+  const H = figure.height;
+  const g = figure.group;
+  g.updateMatrixWorld(true);
+  const fwd = figureForward(figure);
+  const lat = new THREE.Vector3().crossVectors(fwd, _UP).normalize();
+  const travel = fwd.clone().multiplyScalar(dir);
+  const ankleRestY = 0.039 * H;
+  const stride = STEP_STRIDE * H;
+
+  const aL = figure.worldPos('ankle_L', new THREE.Vector3());
+  const aR = figure.worldPos('ankle_R', new THREE.Vector3());
+  const pL = aL.dot(travel);
+  const pR = aR.dot(travel);
+  let swing;
+  if (Math.abs(pL - pR) > 0.02 * H) swing = pL < pR ? 'L' : 'R'; // trailing foot swings through
+  else swing = figure.__swing === 'L' ? 'R' : 'L';               // collected stance: alternate
+  const support = swing === 'L' ? 'R' : 'L';
+
+  // Support foot: hold its floor spot (its current XZ, dropped to rest height).
+  const supPos = (support === 'L' ? aL : aR).clone();
+  supPos.y = ankleRestY;
+  // Swing foot: land it a stride ahead of the support foot along travel, keeping
+  // its lateral offset so the feet stay on their own rails.
+  const swCur = swing === 'L' ? aL : aR;
+  const latOff = swCur.clone().sub(supPos).dot(lat);
+  const swPos = supPos.clone().addScaledVector(travel, stride).addScaledVector(lat, latOff);
+  swPos.y = ankleRestY;
+
+  // Drop into a walking crouch (a straight leg can only reach straight down) and
+  // roll the body forward over the support foot.
+  figure.nodes.pelvis.position.y = Math.min(figure.nodes.pelvis.position.y, WALK_PELVIS * H);
+  g.position.addScaledVector(travel, stride * STEP_ADVANCE);
+  g.updateMatrixWorld(true);
+
+  // Plant both feet flat on the floor at their targets (the knees bend to reach).
+  for (const [side, pos] of [[support, supPos], [swing, swPos]]) {
+    solveTwoBone(figure, { root: `hip_${side}`, mid: `knee_${side}`, effector: `ankle_${side}`, hingeSign: 1 }, pos);
+    flattenFoot(figure, side);
+  }
+
+  // Settle the lowest point onto the floor, then let the loop's clamp hold it.
+  g.updateMatrixWorld(true);
+  g.position.y -= figure.lowestPointY();
+  g.updateMatrixWorld(true);
+  figure.syncAtlasNodes();
+  figure.__swing = swing;
+}
+
 const app = {
   scene, camera, renderer, orbit,
   leader, follower,
@@ -364,13 +454,13 @@ const app = {
   mode: 'rotate',
   chainMode: 'open', // 'open' (move distal) | 'closed' (anchor foot, move proximal)
   selected: null, // { figure, jointName }
+  activeFigure: null, // the figure driven by Move/Step (keyboard nudges act on it)
   ikState: null, // { figure, chain }
   swivelState: null, // { figure, chain } while dragging an elbow/knee pole handle
   ckc: null, // { node, matrix } captured while dragging in closed-chain mode
-  linkCouple: false, // move/turn drags both dancers as one unit
+  linkCouple: false, // move/turn/step act on both dancers as one unit
   coupleDrag: null, // start transforms captured while dragging a linked couple
   figDragY: null, // root height captured when a figure drag starts
-  pivot: null, // { figure, ankle, point } captured while dragging in pivot mode
   interpStates: null, // { A, B } couple states driving the A→B scrubber
   interpPlaying: false,
   interpT: 0,
@@ -473,6 +563,12 @@ const app = {
     this.embrace.setClaspHeight(frac);
   },
 
+  // Swing a dancer's open-side elbow (role 'leader'/'follower') around its
+  // shoulder→wrist axis without moving the joined hands (0 = elbow down).
+  setOpenElbow(role, deg) {
+    this.embrace.setOpenElbow(role, deg);
+  },
+
   // Highlight body parts (Set of BODY_PARTS ids, empty/null clears).
   setHighlight(parts) {
     this.highlightParts = parts;
@@ -515,9 +611,64 @@ const app = {
     figure.group.updateMatrixWorld(true);
   },
 
+  // ------------------------------------------------------------------ walking
+  // Take one walking step (dir +1 forward, -1 back). Repeated calls alternate
+  // feet, so the dancer walks. With "Move as couple" on the partner steps too
+  // (facing the other way, they step back to travel the same direction), so the
+  // whole embrace walks together.
+  stepFigure(figure, dir = 1) {
+    this.pushHistory();
+    this.activeFigure = figure;
+    takeStep(figure, dir);
+    if (this.linkCouple) {
+      const partner = this.figures.find((f) => f !== figure);
+      if (partner && partner.group.visible) {
+        const sameWay = figureForward(figure).dot(figureForward(partner)) >= 0;
+        takeStep(partner, sameWay ? dir : -dir);
+      }
+    }
+    if (this.ui) this.ui.onPoseChanged();
+  },
+
+  // Slide a figure across the floor along its facing (Move-mode keyboard nudge);
+  // the partner comes along when linked.
+  slideFigure(figure, dist) {
+    const d = figureForward(figure).multiplyScalar(dist);
+    const move = (f) => { f.group.position.x += d.x; f.group.position.z += d.z; f.group.updateMatrixWorld(true); };
+    move(figure);
+    if (this.linkCouple) {
+      const partner = this.figures.find((f) => f !== figure);
+      if (partner) move(partner);
+    }
+  },
+
+  // Turn a figure by a yaw delta, pivoting on the ball of its support foot; when
+  // linked the partner orbits the same point, so the couple turns as one.
+  turnFigure(figure, dYaw) {
+    const pivotPt = this.ballOfFoot(figure, this.supportAnkle(figure));
+    this.pivotFigure(figure, dYaw);
+    if (this.linkCouple) {
+      const partner = this.figures.find((f) => f !== figure);
+      if (partner) rotateAbout(partner, pivotPt, dYaw);
+    }
+  },
+
+  // Default chain mode for a leg/pelvis joint: closed when its foot is planted
+  // (bend the knee and the body sinks over the standing foot), else open.
+  autoChain(figure, jointName) {
+    figure.group.updateMatrixWorld(true);
+    const contacts = footContactsBySide(figure);
+    const planted = (side) => contacts[side] && contacts[side].length > 0;
+    if (jointName === 'pelvis') return planted('L') || planted('R') ? 'closed' : 'open';
+    const side = jointName.endsWith('_L') ? 'L' : 'R';
+    return planted(side) ? 'closed' : 'open';
+  },
+
   // Edit a joint honouring the current chain mode. `mutate` changes rotations.
+  // Closed chain only applies to the legs/pelvis (arms/spine are always open).
   editJoint(figure, jointName, mutate) {
-    const anchor = this.chainMode === 'closed' ? this.anchorNode(figure, jointName) : null;
+    const useClosed = this.chainMode === 'closed' && CHAIN_JOINTS.has(jointName);
+    const anchor = useClosed ? this.anchorNode(figure, jointName) : null;
     if (anchor) {
       editWithAnchor(figure, anchor, () => { mutate(); figure.clampJoint(jointName); });
     } else {
@@ -563,6 +714,7 @@ const app = {
       if (s) s.material.emissive.set(0x000000);
     }
     this.selected = null;
+    this.activeFigure = null;
     this.ikState = null;
     this.swivelState = null;
     ikTarget.visible = false;
@@ -576,6 +728,8 @@ const app = {
     const def = JOINT_BY_NAME[jointName];
     if (def.endpoint) jointName = def.parent;
     this.selected = { figure, jointName };
+    // Chain mode is a legs-only choice; default it from whether the foot is planted.
+    this.chainMode = CHAIN_JOINTS.has(jointName) ? this.autoChain(figure, jointName) : 'open';
     const sphere = figure.jointSphereByName[jointName];
     if (sphere) sphere.material.emissive.set(0x3b6ea5);
 
@@ -634,15 +788,15 @@ const app = {
 
   selectFigure(figure) {
     this.deselect();
-    tcontrols.attach(figure.group);
+    this.activeFigure = figure;
+    // Move mode drags the figure on the floor; turning is the arrow keys (they
+    // pivot on the support foot). Step mode has no drag gizmo — clicking steps,
+    // and the arrows step/turn — so the figure is only recorded as active.
     if (this.mode === 'move') {
+      tcontrols.attach(figure.group);
       tcontrols.setMode('translate');
       tcontrols.showX = tcontrols.showZ = true;
       tcontrols.showY = false;
-    } else {
-      tcontrols.setMode('rotate');
-      tcontrols.showY = true;
-      tcontrols.showX = tcontrols.showZ = false;
     }
   },
 
@@ -729,17 +883,12 @@ const app = {
 // we can pin it back each frame, and capture start transforms for a linked
 // couple drag.
 tcontrols.addEventListener('dragging-changed', (e) => {
-  if (!e.value) { app.ckc = null; app.coupleDrag = null; app.figDragY = null; app.pivot = null; return; }
+  if (!e.value) { app.ckc = null; app.coupleDrag = null; app.figDragY = null; return; }
   app.pushHistory();
   if (!app.selected && tcontrols.object?.userData.figure) {
     app.figDragY = tcontrols.object.position.y;
   }
-  if (app.mode === 'pivot' && !app.selected && tcontrols.object?.userData.figure) {
-    const figure = tcontrols.object.userData.figure;
-    const ankle = app.supportAnkle(figure);
-    app.pivot = { figure, ankle, point: app.ballOfFoot(figure, ankle) };
-  }
-  if (app.selected && !app.ikState && app.chainMode === 'closed') {
+  if (app.selected && !app.ikState && app.chainMode === 'closed' && CHAIN_JOINTS.has(app.selected.jointName)) {
     const node = app.anchorNode(app.selected.figure, app.selected.jointName);
     if (node) {
       app.selected.figure.group.updateMatrixWorld(true);
@@ -779,13 +928,6 @@ tcontrols.addEventListener('objectChange', () => {
   } else if (tcontrols.object) {
     // Figures stay at their drag-start height (usually the floor).
     if (app.figDragY !== null) tcontrols.object.position.y = app.figDragY;
-    if (app.pivot) {
-      // Re-pin the ball of the support foot: the gizmo rotated the figure
-      // about its root; shift it back so the turn happens on the foot.
-      const now = app.ballOfFoot(app.pivot.figure, app.pivot.ankle);
-      app.pivot.figure.group.position.x += app.pivot.point.x - now.x;
-      app.pivot.figure.group.position.z += app.pivot.point.z - now.z;
-    }
     if (app.coupleDrag) {
       // Mirror the drag onto the partner: same translation, and rotation
       // about the dragged dancer so the embrace turns as one unit.
@@ -819,13 +961,18 @@ function handleClick(e) {
   raycaster.setFromCamera(pointer, camera);
 
   const visible = app.visibleFigures();
-  if (app.mode === 'move' || app.mode === 'turn' || app.mode === 'pivot') {
+  if (app.mode === 'move' || app.mode === 'step') {
     const hits = raycaster.intersectObjects(visible.map((f) => f.group), true);
     const hit = hits.find((h) => h.object.visible);
     if (hit) {
       let o = hit.object;
       while (o && !o.userData.figure) o = o.parent;
-      if (o) app.selectFigure(o.userData.figure);
+      if (o) {
+        app.selectFigure(o.userData.figure);
+        // In Step mode a click on a dancer takes one step forward — keep
+        // clicking to walk. The arrow keys step/turn the same dancer.
+        if (app.mode === 'step') app.stepFigure(o.userData.figure, 1);
+      }
     } else app.deselect();
     return;
   }
@@ -864,6 +1011,15 @@ function embraceEditing() {
   return null;
 }
 
+// The one arm the user is posing right now, as { figure, side } for body
+// collision (so it can't be pushed through the partner) — null unless the edit
+// targets an arm joint. See resolveBodyCollision.
+const ARM_JOINT = /^(?:scapula|shoulder|elbow|wrist|hand)_(L|R)$/;
+function editedArm(editing) {
+  const m = editing?.jointName?.match(ARM_JOINT);
+  return m ? { figure: editing.figure, side: m[1] } : null;
+}
+
 const clock = new THREE.Clock();
 let statsTimer = 0;
 let vizFlags = { cog: true, support: true, couple: true };
@@ -895,8 +1051,11 @@ function animate() {
 
   // Body collision: the dancers may touch but never enter each other's
   // space — resolve any capsule penetration by sliding the partner of
-  // whoever is being edited (see collision.js).
-  resolveBodyCollision(leader, follower, editing?.figure ?? null);
+  // whoever is being edited (see collision.js). The arm currently being posed
+  // is also a collider, so it can't be pushed through the partner (it displaces
+  // them instead); the resting/wrapping embrace arms are not (they lie on the
+  // partner by design). `editedArm` names that one arm.
+  resolveBodyCollision(leader, follower, editing?.figure ?? null, editedArm(editing));
 
   // Floor collision: no body part may end up below the dance floor,
   // whatever edit produced the pose (gizmo, slider, IK, preset, import).
@@ -949,6 +1108,39 @@ window.addEventListener('keydown', (e) => {
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA') && t.type !== 'range') return;
     e.preventDefault();
     app.undo();
+  }
+});
+
+// Keyboard nudges for the active figure (Move / Step modes). Move: arrows slide
+// forward/back and turn (pivoting on the support foot). Step: arrows step
+// forward/back and turn. Shift makes a Move nudge coarser. Hold "Move as couple"
+// to drive the pair together.
+const NUDGE_DIST = 0.03;                  // metres per press when sliding
+const NUDGE_TURN = 4 * Math.PI / 180;     // radians per press when turning
+const STEP_TURN = 8 * Math.PI / 180;      // radians per press when turning in Step mode
+let lastNudge = 0;
+window.addEventListener('keydown', (e) => {
+  if (!e.key.startsWith('Arrow')) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA') && t.type !== 'range') return;
+  const fig = app.activeFigure;
+  if (!fig || !fig.group.visible || (app.mode !== 'move' && app.mode !== 'step')) return;
+  e.preventDefault();
+  const now = performance.now();
+  if (now - lastNudge > 500) app.pushHistory(); // one undo entry per burst of nudges
+  lastNudge = now;
+  const k = e.key;
+  if (app.mode === 'step') {
+    if (k === 'ArrowUp') app.stepFigure(fig, 1);
+    else if (k === 'ArrowDown') app.stepFigure(fig, -1);
+    else if (k === 'ArrowLeft') app.turnFigure(fig, STEP_TURN);
+    else if (k === 'ArrowRight') app.turnFigure(fig, -STEP_TURN);
+  } else {
+    const coarse = e.shiftKey ? 3 : 1;
+    if (k === 'ArrowUp') app.slideFigure(fig, NUDGE_DIST * coarse);
+    else if (k === 'ArrowDown') app.slideFigure(fig, -NUDGE_DIST * coarse);
+    else if (k === 'ArrowLeft') app.turnFigure(fig, NUDGE_TURN * coarse);
+    else if (k === 'ArrowRight') app.turnFigure(fig, -NUDGE_TURN * coarse);
   }
 });
 

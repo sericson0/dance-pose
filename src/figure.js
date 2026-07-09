@@ -871,7 +871,11 @@ export class Figure {
         const boneName = sub(tpl.bone);
         const jointName = `${tpl.joint}${suffix}`;
         const bone = boneByName.get(boneName);
-        const node = this.nodes[jointName];
+        // Ride the same atlas limb sub-tree as the skeleton bones and muscles
+        // (#seatNode) where the joint is seated, so the clothed arm pivots about
+        // the anatomical joint centre too and stays welded to the skeleton
+        // through any bend; unseated joints (torso/legs) keep their rig node.
+        const node = this.#seatNode(jointName);
         if (!bone || !node) continue;
         const q = bindPos(bone);
         const rotBind = new THREE.Quaternion();
@@ -888,9 +892,11 @@ export class Figure {
           R = (alignR.get(sub(tpl.inherit)) || new THREE.Quaternion()).clone();
         }
         alignR.set(boneName, R);
-        // Offset from the rig node to the atlas joint the bone snaps to (zero for
-        // joints left on the rig rest, e.g. the torso).
-        const originDelta = target(jointName).clone().sub(rest[jointName]);
+        // Snap the bone origin to the atlas joint, expressed in the PARENT node's
+        // rest frame. An atlas seat node already sits at the atlas joint, so the
+        // offset is zero; a rig node (torso/legs) carries the rig→atlas delta.
+        const seatRest = this.atlasNodes[jointName] ? atlas.get(jointName) : rest[jointName];
+        const originDelta = target(jointName).clone().sub(seatRest);
         plans.set(bone, { node, jointName, q, rotBind, R, axialLen, originDelta, jointY: target(jointName).y, squash: !!tpl.squash });
       }
     }

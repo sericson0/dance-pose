@@ -7,6 +7,12 @@ const STORAGE_KEY = 'tangoPoseStudio.poses.v1';
 
 const AXIS_FALLBACK = { x: 'Forward / back', y: 'Twist', z: 'Side' };
 
+// Open vs. closed chain is only offered for the legs/pelvis (the joints with a
+// foot to plant); arms and the spine are always open chain.
+const CHAIN_JOINTS = new Set([
+  'pelvis', 'hip_L', 'knee_L', 'ankle_L', 'toes_L', 'hip_R', 'knee_R', 'ankle_R', 'toes_R',
+]);
+
 export function initUI(app) {
   const $ = (id) => document.getElementById(id);
 
@@ -19,12 +25,12 @@ export function initUI(app) {
     });
   }
 
-  const chainButtons = [...document.querySelectorAll('#chain-buttons button')];
-  for (const btn of chainButtons) {
-    btn.addEventListener('click', () => {
-      chainButtons.forEach((b) => b.classList.toggle('active', b === btn));
-      app.setChainMode(btn.dataset.chain);
-    });
+  // Collapsible sidebar sections: clicking a heading folds it away.
+  for (const section of document.querySelectorAll('#sidebar section')) {
+    const h2 = section.querySelector('h2');
+    if (!h2) continue;
+    h2.classList.add('collapse-toggle');
+    h2.addEventListener('click', () => section.classList.toggle('collapsed'));
   }
 
   // ---------------------------------------------------------------- embrace
@@ -32,17 +38,22 @@ export function initUI(app) {
   // releasing the hands releases the close embrace too.
   const embraceHands = $('embrace-hands');
   const embraceClose = $('embrace-close');
+  const embraceControls = $('embrace-controls');
   const syncEmbrace = () => app.setEmbrace({
     hands: embraceHands.checked,
     close: embraceClose.checked,
   });
+  // The clasp tilt/height/elbow sliders only matter with the arm frame held.
+  const syncEmbraceControls = () => { embraceControls.hidden = !embraceHands.checked; };
   embraceHands.addEventListener('change', () => {
     if (!embraceHands.checked) embraceClose.checked = false;
     syncEmbrace();
+    syncEmbraceControls();
   });
   embraceClose.addEventListener('change', () => {
     if (embraceClose.checked) embraceHands.checked = true;
     syncEmbrace();
+    syncEmbraceControls();
   });
   const embraceTilt = $('embrace-tilt');
   const embraceTiltVal = $('embrace-tilt-val');
@@ -58,6 +69,16 @@ export function initUI(app) {
     embraceHeightVal.textContent = embraceHeight.value;
     app.setClaspHeight(Number(embraceHeight.value) / 100);
   });
+  // Open-side elbow swivel per dancer (alternative embrace model): swings the
+  // elbow between the joined hands without moving either hand.
+  for (const role of ['leader', 'follower']) {
+    const slider = $(`embrace-elbow-${role}`);
+    const val = $(`embrace-elbow-${role}-val`);
+    slider.addEventListener('input', () => {
+      val.textContent = `${slider.value}°`;
+      app.setOpenElbow(role, Number(slider.value));
+    });
+  }
 
   const showButtons = [...document.querySelectorAll('#show-buttons button')];
   for (const btn of showButtons) {
@@ -142,6 +163,28 @@ export function initUI(app) {
     title.innerHTML = `<span>${JOINT_TITLES[jointName] || jointName}</span>
       <span class="fig-tag" style="background:${tagColor}">${figure.name}</span>`;
     jointPanel.appendChild(title);
+
+    // Legs/pelvis get the open/closed chain choice (defaulted by app.selectJoint
+    // from whether the foot is planted); everything else is always open chain.
+    if (CHAIN_JOINTS.has(jointName)) {
+      const caption = document.createElement('div');
+      caption.className = 'chain-caption';
+      caption.textContent = 'Open moves the leg below this joint. Closed keeps the foot planted and moves the body above.';
+      jointPanel.appendChild(caption);
+      const toggle = document.createElement('div');
+      toggle.className = 'chain-toggle btn-group';
+      toggle.innerHTML = `
+        <button data-chain="open">Open chain</button>
+        <button data-chain="closed">Closed chain</button>`;
+      const syncChain = () => toggle.querySelectorAll('button').forEach((b) =>
+        b.classList.toggle('active', b.dataset.chain === app.chainMode));
+      toggle.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => {
+        app.setChainMode(b.dataset.chain);
+        syncChain();
+      }));
+      syncChain();
+      jointPanel.appendChild(toggle);
+    }
 
     for (const axis of ['x', 'y', 'z']) {
       const [min, max] = def.limits[axis];

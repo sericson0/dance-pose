@@ -222,29 +222,44 @@ for (const part of BODY_PARTS) {
 
 // Dancer-vs-dancer body colliders (see collision.js): each row wraps the
 // segment from→to in a capsule of radius r (fraction of the dancer's own
-// height). Arms and hands are deliberately absent — the embrace places them ON
-// the partner (the clasp, his palm on her back, hers on his deltoid), so they
-// must always be free to touch. The trunk radii sit just inside the close-
-// embrace CONTACT_FRACTION (embrace.js), so held torso contact rests the
-// surfaces exactly together without the two constraints fighting; the upper
-// chest, shoulders and head taper thinner because in close embrace both
-// dancers lean in and the follower's head sits level with a taller leader's
-// shoulder line — those radii are calibrated so the shipped contact poses
-// (close embrace, walk) reach the held torso distance with ~0 clearance
-// instead of being held off by the head. Tune against those presets with
-// scripts/dev-verify-collision.mjs + dev-verify-embrace.mjs.
+// height). Rows are tagged by `group`:
+//   'core' (torso/head/legs/feet) — the body volume proper; these collide with
+//          everything on the partner.
+//   'arm'  (upper arm + forearm) — so an arm the user is posing cannot pass
+//          THROUGH the partner's body, while the embrace can still rest an arm
+//          ON it. These are colliders ONLY for the one arm being actively posed,
+//          and only against the partner's CORE (collision.js does the gating and
+//          skips arm↔arm) — the resting/wrapping embrace arms lie against the
+//          partner by design (the closed-side arm wraps the back, its centerline
+//          coming within ~0.5 cm of the partner's arm), so colliding them all
+//          the time would shove the couple apart. The hand is never a collider —
+//          it is exactly what the embrace rests on the partner (the clasp, his
+//          palm on her back, hers on his deltoid); the forearm capsule ends at
+//          the wrist. The radius is a natural forearm thickness.
+// The core trunk radii sit just inside the close-embrace CONTACT_FRACTION
+// (embrace.js), so held torso contact rests the surfaces exactly together
+// without the two constraints fighting; the upper chest, shoulders and head
+// taper thinner because in close embrace both dancers lean in and the
+// follower's head sits level with a taller leader's shoulder line — those radii
+// are calibrated so the shipped contact poses (close embrace, walk) reach the
+// held torso distance with ~0 clearance instead of being held off by the head.
+// Tune against those presets with dev-verify-collision.mjs + dev-verify-embrace.mjs.
 export const COLLIDERS = [
-  { from: 'head', to: 'headTop', r: 0.029 },
-  { from: 'chest', to: 'neck', r: 0.044 },
-  { from: 'spine', to: 'chest', r: 0.060 },
-  { from: 'pelvis', to: 'spine', r: 0.056 },
-  { from: 'shoulder_L', to: 'shoulder_R', r: 0.024 },
-  { from: 'hip_L', to: 'knee_L', r: 0.044 },
-  { from: 'hip_R', to: 'knee_R', r: 0.044 },
-  { from: 'knee_L', to: 'ankle_L', r: 0.025 },
-  { from: 'knee_R', to: 'ankle_R', r: 0.025 },
-  { from: 'ankle_L', to: 'toe_L', r: 0.016 },
-  { from: 'ankle_R', to: 'toe_R', r: 0.016 },
+  { from: 'head', to: 'headTop', r: 0.029, group: 'core' },
+  { from: 'chest', to: 'neck', r: 0.044, group: 'core' },
+  { from: 'spine', to: 'chest', r: 0.060, group: 'core' },
+  { from: 'pelvis', to: 'spine', r: 0.056, group: 'core' },
+  { from: 'shoulder_L', to: 'shoulder_R', r: 0.024, group: 'core' },
+  { from: 'hip_L', to: 'knee_L', r: 0.044, group: 'core' },
+  { from: 'hip_R', to: 'knee_R', r: 0.044, group: 'core' },
+  { from: 'knee_L', to: 'ankle_L', r: 0.025, group: 'core' },
+  { from: 'knee_R', to: 'ankle_R', r: 0.025, group: 'core' },
+  { from: 'ankle_L', to: 'toe_L', r: 0.016, group: 'core' },
+  { from: 'ankle_R', to: 'toe_R', r: 0.016, group: 'core' },
+  { from: 'shoulder_L', to: 'elbow_L', r: 0.020, group: 'arm' },
+  { from: 'elbow_L', to: 'wrist_L', r: 0.020, group: 'arm' },
+  { from: 'shoulder_R', to: 'elbow_R', r: 0.020, group: 'arm' },
+  { from: 'elbow_R', to: 'wrist_R', r: 0.020, group: 'arm' },
 ];
 
 export function clampAngle(value, [min, max]) {
