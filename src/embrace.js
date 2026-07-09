@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { JOINT_BY_NAME, DEG, clampAngle } from './skeletonDef.js';
-import { solveTwoBone } from './ik.js';
+import { solveTwoBone, swivelLimb } from './ik.js';
 
 // The tango embrace as a set of per-frame constraints (see main.js's loop),
 // modelled on the real embrace:
@@ -130,6 +130,12 @@ export class Embrace {
     // The clasp point stored in each dancer's chest frame; the live target is
     // the midpoint of the two, so it follows both torsos as they move.
     this.claspLocal = { leader: null, follower: null };
+    // ALTERNATIVE OPEN-SIDE MODEL: each dancer's open-side elbow swivel, in
+    // degrees around the shoulder→wrist axis (0 = elbow hanging straight
+    // down). Set by hand from the UI (Embrace panel); the clasp holds the
+    // wrists, this only swings the elbow between them (see #maintainOpenSide
+    // / #setElbowSwivel). Replaces the old auto-searched swivel (#swivelForPalm).
+    this.openElbow = { leader: 0, follower: 0 };
   }
 
   figure(role) {
@@ -158,6 +164,13 @@ export class Embrace {
   // Finger tilt of the joined hands, degrees from vertical (0 = fingers up).
   setTilt(deg) {
     this.tiltDeg = deg;
+  }
+
+  // ALTERNATIVE OPEN-SIDE MODEL: swing one dancer's open-side elbow to `deg`
+  // around its shoulder→wrist axis (0 = elbow hanging down). The joined hands
+  // stay pinned, so moving the elbow never disturbs the partner's hand.
+  setOpenElbow(role, deg) {
+    this.openElbow[role] = deg;
   }
 
   // Height of the joined open-side hands, as a fraction of mean stature above
@@ -302,6 +315,13 @@ export class Embrace {
     const edited = this.#editedArm(editing);
     const t = this.palmGap() / 2;
 
+    // Open side (ALTERNATIVE MODEL): the joined hands are held in palm
+    // contact and turned to face each other, and each dancer's open-side
+    // elbow is swung by hand (UI) rather than auto-solved — see
+    // #maintainOpenSide. The original auto-solved clasp orientation is kept
+    // below, commented out, for a side-by-side comparison.
+    this.#maintainOpenSide(edited, t);
+    /* --- original open-side clasp (superseded by #maintainOpenSide) -------
     // Open side: palms joined around the shared clasp point — the leader's
     // half a gap on his side of it, the follower's half a gap beyond — with
     // both hands' fingers aimed up the clasp's tilted vertical and the palm
@@ -340,6 +360,7 @@ export class Embrace {
         this.#solveArm('followerOpen', mid.clone().addScaledVector(out, t), dirF, palmF);
       }
     }
+    --- end original open-side clasp ------------------------------------- */
 
     // Closed side: each palm to its rest point on the partner, turned to lie
     // against the surface it rests on. Only while the couple roughly face
@@ -359,6 +380,121 @@ export class Embrace {
       const dir = upperArm.sub(handCenter(this.follower, 'wrist_L', 'hand_L'));
       if (dir.lengthSq() > 1e-8) this.#pronate(this.follower, ARMS.followerClosed, dir.normalize());
     }
+  }
+
+  // ALTERNATIVE OPEN-SIDE MODEL ------------------------------------------
+  //
+  // Two rules replace the old auto-solved clasp:
+  //   1. Palm contact + facing. The two open-side hands are held around a
+  //      shared clasp point (the midpoint between them, stored in both chest
+  //      frames so it rides the couple) no farther apart than PALM_GAP, each
+  //      palm turned to face the other along the couple axis.
+  //   2. Manual elbow. Each dancer's open-side elbow swivel is set from the
+  //      UI (openElbow), not searched. Swivelling rotates the arm about the
+  //      shoulder→wrist line, which leaves the pinned wrist — and so the
+  //      partner's clasped hand — exactly where it is.
+  #maintainOpenSide(edited, t) {
+    const out = this.#claspOutward();
+    const fingerDir = this.#simpleFingerDir(out);
+    // The user is posing one open hand: re-anchor the clasp on it and solve
+    // only the partner to meet it (the edited hand is left alone).
+    if (edited === 'leaderOpen' || edited === 'followerOpen') {
+      const arm = ARMS[edited];
+      const palm = handCenter(this.figure(arm.role), arm.wrist, arm.hand);
+      const clasp = palm.clone().addScaledVector(out, edited === 'leaderOpen' ? t : -t);
+      this.captureClasp(clasp);
+      const other = edited === 'leaderOpen' ? 'followerOpen' : 'leaderOpen';
+      const palmDir = out.clone().multiplyScalar(other === 'leaderOpen' ? 1 : -1);
+      const goal = clasp.clone().addScaledVector(out, other === 'leaderOpen' ? -t : t);
+      this.#solveOpenArm(other, goal, fingerDir, palmDir, this.openElbow[ARMS[other].role]);
+      return;
+    }
+    const clasp = this.claspWorld();
+    if (!clasp) return;
+    const palmF = out.clone().negate();
+    this.#solveOpenArm('leaderOpen', clasp.clone().addScaledVector(out, -t), fingerDir, out, this.openElbow.leader);
+    this.#solveOpenArm('followerOpen', clasp.clone().addScaledVector(out, t), fingerDir, palmF, this.openElbow.follower);
+    // Rule 1's distance cap: if joint limits left the palms more than a hair
+    // apart (or stacked in the wrong order along the axis), meet halfway.
+    const a = handCenter(this.leader, 'wrist_L', 'hand_L');
+    const b = handCenter(this.follower, 'wrist_R', 'hand_R');
+    const signed = b.clone().sub(a).dot(out);
+    if (Math.abs(signed - 2 * t) > 0.004 || Math.abs(a.distanceTo(b) - 2 * t) > 0.004) {
+      const mid = a.add(b).multiplyScalar(0.5);
+      this.#solveOpenArm('leaderOpen', mid.clone().addScaledVector(out, -t), fingerDir, out, this.openElbow.leader);
+      this.#solveOpenArm('followerOpen', mid.clone().addScaledVector(out, t), fingerDir, palmF, this.openElbow.follower);
+    }
+  }
+
+  // Finger direction for the joined hands: up (a vertical handshake), leaned
+  // `tiltDeg` from vertical toward the couple's midline. Shared by both hands
+  // so they read as facing each other. (The old per-hand wrap is dropped in
+  // this model — see #claspFingerDir for the original.)
+  #simpleFingerDir(out) {
+    const tangent = out.clone().cross(UP);
+    if (tangent.lengthSq() < 1e-8) return UP.clone();
+    tangent.normalize();
+    const clasp = this.claspWorld();
+    if (clasp) {
+      const toMid = this.leader.worldPos('chest')
+        .add(this.follower.worldPos('chest')).multiplyScalar(0.5).sub(clasp);
+      toMid.y = 0;
+      if (tangent.dot(toMid) < 0) tangent.negate(); // lean in over the couple
+    }
+    const tilt = this.tiltDeg * DEG;
+    return UP.clone().multiplyScalar(Math.cos(tilt)).addScaledVector(tangent, Math.sin(tilt)).normalize();
+  }
+
+  // Reach an open-side palm to `goal` and hold it there, palm facing
+  // `palmDir`, fingers along `fingerDir`, with the elbow parked at the user's
+  // swivel angle `elbowDeg`. Mirrors #solveArm's iterate-and-correct loop but
+  // sets the elbow from the manual control (#setElbowSwivel) instead of
+  // searching it (#swivelForPalm). #orientHand still turns the palm to face
+  // the partner through elbow pronation + wrist flex/deviation.
+  #solveOpenArm(armKey, goal, fingerDir, palmDir, elbowDeg) {
+    const arm = ARMS[armKey];
+    const f = this.figure(arm.role);
+    const chain = { root: arm.shoulder, mid: arm.elbow, effector: arm.wrist, hingeSign: -1 };
+    goal = this.#minReachClamp(f, arm, goal);
+    const target = goal.clone().addScaledVector(fingerDir, -HAND_HALF * f.height);
+    for (let i = 0; i < 6; i++) {
+      solveTwoBone(f, chain, target); // preserves the arm's current swivel
+      this.#setElbowSwivel(f, arm, elbowDeg); // park the elbow, wrist pinned
+      this.#orientHand(f, arm, fingerDir, palmDir);
+      const palm = handCenter(f, arm.wrist, arm.hand);
+      if (palm.distanceTo(goal) < 0.002) break;
+      const handVec = palm.sub(f.nodes[arm.wrist].getWorldPosition(new THREE.Vector3()));
+      target.copy(goal).sub(handVec);
+    }
+  }
+
+  // Swing an arm's elbow to swivel angle `deg` around the shoulder→wrist
+  // axis (0 = elbow hanging straight down), keeping the shoulder and the
+  // wrist pinned so the clasp — and the partner's hand — never move. We
+  // build the target elbow point on that circle and hand the actual roll to
+  // swivelLimb, which walks the roll only as far as the shoulder limits allow
+  // (bisecting for feasibility) so the endpoints stay put even when `deg`
+  // asks for more than the joint can give. The circle reference (world-down,
+  // or the figure's forward when the axis is vertical) is the manual
+  // counterpart of the old #swivelForPalm search, so `deg` reads the same.
+  #setElbowSwivel(f, arm, deg) {
+    const shoulder = f.nodes[arm.shoulder].getWorldPosition(new THREE.Vector3());
+    const wrist = f.nodes[arm.wrist].getWorldPosition(new THREE.Vector3());
+    const elbowPos = f.nodes[arm.elbow].getWorldPosition(new THREE.Vector3());
+    const axis = wrist.clone().sub(shoulder);
+    if (axis.lengthSq() < 1e-8) return;
+    axis.normalize();
+    const center = shoulder.clone().addScaledVector(axis, elbowPos.clone().sub(shoulder).dot(axis));
+    const u0 = new THREE.Vector3(0, -1, 0).addScaledVector(axis, axis.y);
+    if (u0.lengthSq() < 1e-4) {
+      u0.set(0, 0, 1).applyQuaternion(f.group.quaternion).addScaledVector(axis, -axis.dot(u0));
+    }
+    if (u0.lengthSq() < 1e-8) return;
+    u0.normalize();
+    const v0 = new THREE.Vector3().crossVectors(axis, u0);
+    const theta = deg * DEG;
+    const des = u0.multiplyScalar(Math.cos(theta)).addScaledVector(v0, Math.sin(theta));
+    swivelLimb(f, { root: arm.shoulder, mid: arm.elbow, effector: arm.wrist }, center.add(des));
   }
 
   // Where the clasp says an open-side hand's fingers should point right now

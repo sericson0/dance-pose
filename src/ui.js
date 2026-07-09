@@ -1,4 +1,4 @@
-import { JOINT_BY_NAME, JOINT_TITLES, BODY_PARTS } from './skeletonDef.js';
+import { JOINTS, JOINT_BY_NAME, JOINT_TITLES, BODY_PARTS } from './skeletonDef.js';
 import { keyAngles, tangoStats } from './analysis.js';
 
 const R2D = 180 / Math.PI;
@@ -7,24 +7,31 @@ const STORAGE_KEY = 'tangoPoseStudio.poses.v1';
 
 const AXIS_FALLBACK = { x: 'Forward / back', y: 'Twist', z: 'Side' };
 
+// Open vs. closed chain is only offered for the legs/pelvis (the joints with a
+// foot to plant); arms and the spine are always open chain.
+const CHAIN_JOINTS = new Set([
+  'pelvis', 'hip_L', 'knee_L', 'ankle_L', 'toes_L', 'hip_R', 'knee_R', 'ankle_R', 'toes_R',
+]);
+
 export function initUI(app) {
   const $ = (id) => document.getElementById(id);
 
   // ---------------------------------------------------------------- modes
   const modeButtons = [...document.querySelectorAll('#mode-buttons button')];
+  const selectMode = (mode) => {
+    modeButtons.forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
+    app.setMode(mode);
+  };
   for (const btn of modeButtons) {
-    btn.addEventListener('click', () => {
-      modeButtons.forEach((b) => b.classList.toggle('active', b === btn));
-      app.setMode(btn.dataset.mode);
-    });
+    btn.addEventListener('click', () => selectMode(btn.dataset.mode));
   }
 
-  const chainButtons = [...document.querySelectorAll('#chain-buttons button')];
-  for (const btn of chainButtons) {
-    btn.addEventListener('click', () => {
-      chainButtons.forEach((b) => b.classList.toggle('active', b === btn));
-      app.setChainMode(btn.dataset.chain);
-    });
+  // Collapsible sidebar sections: clicking a heading folds it away.
+  for (const section of document.querySelectorAll('#sidebar section')) {
+    const h2 = section.querySelector('h2');
+    if (!h2) continue;
+    h2.classList.add('collapse-toggle');
+    h2.addEventListener('click', () => section.classList.toggle('collapsed'));
   }
 
   // ---------------------------------------------------------------- embrace
@@ -32,17 +39,22 @@ export function initUI(app) {
   // releasing the hands releases the close embrace too.
   const embraceHands = $('embrace-hands');
   const embraceClose = $('embrace-close');
+  const embraceControls = $('embrace-controls');
   const syncEmbrace = () => app.setEmbrace({
     hands: embraceHands.checked,
     close: embraceClose.checked,
   });
+  // The clasp tilt/height/elbow sliders only matter with the arm frame held.
+  const syncEmbraceControls = () => { embraceControls.hidden = !embraceHands.checked; };
   embraceHands.addEventListener('change', () => {
     if (!embraceHands.checked) embraceClose.checked = false;
     syncEmbrace();
+    syncEmbraceControls();
   });
   embraceClose.addEventListener('change', () => {
     if (embraceClose.checked) embraceHands.checked = true;
     syncEmbrace();
+    syncEmbraceControls();
   });
   const embraceTilt = $('embrace-tilt');
   const embraceTiltVal = $('embrace-tilt-val');
@@ -58,6 +70,16 @@ export function initUI(app) {
     embraceHeightVal.textContent = embraceHeight.value;
     app.setClaspHeight(Number(embraceHeight.value) / 100);
   });
+  // Open-side elbow swivel per dancer (alternative embrace model): swings the
+  // elbow between the joined hands without moving either hand.
+  for (const role of ['leader', 'follower']) {
+    const slider = $(`embrace-elbow-${role}`);
+    const val = $(`embrace-elbow-${role}-val`);
+    slider.addEventListener('input', () => {
+      val.textContent = `${slider.value}°`;
+      app.setOpenElbow(role, Number(slider.value));
+    });
+  }
 
   const showButtons = [...document.querySelectorAll('#show-buttons button')];
   for (const btn of showButtons) {
@@ -69,7 +91,9 @@ export function initUI(app) {
 
   // ---------------------------------------------------------------- tools
   const undoBtn = $('undo-btn');
+  const redoBtn = $('redo-btn');
   undoBtn.addEventListener('click', () => app.undo());
+  redoBtn.addEventListener('click', () => app.redo());
   $('ground-btn').addEventListener('click', () => app.groundFeet());
   $('link-couple').addEventListener('change', (e) => { app.linkCouple = e.target.checked; });
   for (const btn of document.querySelectorAll('#view-buttons button')) {
@@ -125,6 +149,66 @@ export function initUI(app) {
   const jointPanel = $('joint-panel');
   const sliderRefs = []; // { input, valEl, node, axis }
 
+  // Joint picker: jump straight to any joint (they're invisible click targets in
+  // body view) without hunting in 3D. A Leader/Follower toggle chooses the dancer.
+  const jointSelect = $('joint-select');
+  const figToggleBtns = [...document.querySelectorAll('#joint-fig-toggle button')];
+  const figureForRole = (role) => (role === 'follower' ? app.follower : app.leader);
+  const activePickerRole = () =>
+    figToggleBtns.find((b) => b.classList.contains('active'))?.dataset.role || 'leader';
+
+  {
+    const groups = { center: [], L: [], R: [] };
+    for (const def of JOINTS) {
+      if (def.endpoint || !JOINT_TITLES[def.name]) continue;
+      const key = def.name.endsWith('_L') ? 'L' : def.name.endsWith('_R') ? 'R' : 'center';
+      groups[key].push(def);
+    }
+    const addGroup = (label, defs) => {
+      if (!defs.length) return;
+      const og = document.createElement('optgroup');
+      og.label = label;
+      for (const def of defs) {
+        const opt = document.createElement('option');
+        opt.value = def.name;
+        // Keep the full "Left / Right …" title so the closed select stays
+        // unambiguous; the optgroup label just aids scanning the open list.
+        opt.textContent = JOINT_TITLES[def.name] || def.name;
+        og.appendChild(opt);
+      }
+      jointSelect.appendChild(og);
+    };
+    addGroup('Spine & head', groups.center);
+    addGroup('Left side', groups.L);
+    addGroup('Right side', groups.R);
+  }
+
+  const pickJoint = (role) => {
+    const jointName = jointSelect.value; // capture first: selectMode deselects,
+    if (!jointName) return;              // which resets the dropdown via syncJointPicker
+    selectMode('rotate'); // the picker poses a joint, so switch to the rotate gizmo
+    app.selectJoint(figureForRole(role), jointName);
+  };
+  jointSelect.addEventListener('change', () => {
+    if (!jointSelect.value) { app.deselect(); return; }
+    pickJoint(activePickerRole());
+  });
+  figToggleBtns.forEach((btn) => btn.addEventListener('click', () => {
+    figToggleBtns.forEach((b) => b.classList.toggle('active', b === btn));
+    pickJoint(btn.dataset.role); // re-select the same joint on the chosen dancer
+  }));
+
+  // Keep the picker in step with joints selected by clicking in the 3D view.
+  function syncJointPicker() {
+    if (app.selected) {
+      jointSelect.value = app.selected.jointName;
+      const role = app.selected.figure === app.follower ? 'follower' : 'leader';
+      figToggleBtns.forEach((b) => b.classList.toggle('active', b.dataset.role === role));
+    } else {
+      jointSelect.value = '';
+    }
+  }
+
   function renderJointPanel() {
     sliderRefs.length = 0;
     if (!app.selected) {
@@ -142,6 +226,28 @@ export function initUI(app) {
     title.innerHTML = `<span>${JOINT_TITLES[jointName] || jointName}</span>
       <span class="fig-tag" style="background:${tagColor}">${figure.name}</span>`;
     jointPanel.appendChild(title);
+
+    // Legs/pelvis get the open/closed chain choice (defaulted by app.selectJoint
+    // from whether the foot is planted); everything else is always open chain.
+    if (CHAIN_JOINTS.has(jointName)) {
+      const caption = document.createElement('div');
+      caption.className = 'chain-caption';
+      caption.textContent = 'Open moves the leg below this joint. Closed keeps the foot planted and moves the body above.';
+      jointPanel.appendChild(caption);
+      const toggle = document.createElement('div');
+      toggle.className = 'chain-toggle btn-group';
+      toggle.innerHTML = `
+        <button data-chain="open">Open chain</button>
+        <button data-chain="closed">Closed chain</button>`;
+      const syncChain = () => toggle.querySelectorAll('button').forEach((b) =>
+        b.classList.toggle('active', b.dataset.chain === app.chainMode));
+      toggle.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => {
+        app.setChainMode(b.dataset.chain);
+        syncChain();
+      }));
+      syncChain();
+      jointPanel.appendChild(toggle);
+    }
 
     for (const axis of ['x', 'y', 'z']) {
       const [min, max] = def.limits[axis];
@@ -490,12 +596,16 @@ export function initUI(app) {
   renderJointPanel();
 
   return {
-    onSelectionChanged: renderJointPanel,
+    onSelectionChanged() {
+      renderJointPanel();
+      syncJointPicker();
+    },
     onPoseChanged() {
       renderJointPanel();
     },
     onHistoryChanged() {
       undoBtn.disabled = app.history.length === 0;
+      redoBtn.disabled = app.redoStack.length === 0;
     },
     refreshJointValues,
     updateStats,

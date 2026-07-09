@@ -66,6 +66,24 @@ body {
   color: var(--muted); margin-bottom: 8px; font-weight: 600;
 }
 
+/* Collapsible sections: click the heading to fold a section away. */
+#sidebar h2.collapse-toggle {
+  display: flex; justify-content: space-between; align-items: center;
+  cursor: pointer; user-select: none;
+}
+#sidebar h2.collapse-toggle::after {
+  content: '▾'; font-size: 9px; color: var(--muted);
+  transition: transform 0.15s ease;
+}
+#sidebar section.collapsed h2.collapse-toggle { margin-bottom: 0; }
+#sidebar section.collapsed h2.collapse-toggle::after { transform: rotate(-90deg); }
+#sidebar section.collapsed > *:not(h2) { display: none; }
+
+/* Legs-only chain toggle inside the joint panel. */
+.chain-toggle { display: flex; width: 100%; margin-bottom: 8px; }
+.chain-toggle button { flex: 1; }
+.chain-caption { font-size: 11px; color: var(--muted); margin-bottom: 8px; }
+
 .muted { color: var(--muted); font-size: 12px; }
 .check-row { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 6px; }
 .check-row label { display: flex; align-items: center; gap: 5px; cursor: pointer; }

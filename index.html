@@ -16,13 +16,8 @@
       <div id="mode-buttons" class="btn-group">
         <button data-mode="rotate" class="active" title="Click a joint, then drag the rings to rotate it (within anatomical limits)">Rotate joints</button>
         <button data-mode="ik" title="Click a hand or foot to drag the whole limb; click an elbow or knee to swivel it while the hand/foot and shoulder/hip stay put">Drag limb</button>
-        <button data-mode="move" title="Click a figure, then drag to move it on the floor">Move figure</button>
-        <button data-mode="turn" title="Click a figure, then drag the ring to turn it">Turn figure</button>
-        <button data-mode="pivot" title="Click a figure, then drag the ring to pivot it on the ball of its support foot (ochos, giros, calesita)">Pivot on foot</button>
-      </div>
-      <div id="chain-buttons" class="btn-group" title="Open: rotating a joint moves the limb below it. Closed: the foot/hand stays planted and the body above moves.">
-        <button data-chain="open" class="active">Open chain</button>
-        <button data-chain="closed">Closed chain</button>
+        <button data-mode="move" title="Click a figure, then drag to slide it on the floor. Arrow keys nudge: ↑↓ forward/back, ←→ turn (pivoting on the support foot). Shift = coarser.">Move figure</button>
+        <button data-mode="step" title="Click a dancer to take a walking step forward — keep clicking to walk. Arrow keys: ↑↓ step forward/back, ←→ turn. Turn on 'Move as couple' to walk the pair together.">Walk / step</button>
       </div>
       <div id="show-buttons" class="btn-group" title="Show one dancer or both">
         <button data-show="both" class="active">Both</button>
@@ -31,9 +26,10 @@
       </div>
       <div class="btn-group">
         <button id="undo-btn" disabled title="Undo the last pose change (Ctrl+Z)">↩ Undo</button>
+        <button id="redo-btn" disabled title="Redo the last undone change (Ctrl+Shift+Z / Ctrl+Y)">↪ Redo</button>
         <button id="ground-btn" title="Drop the shown dancers' feet back onto the floor, soles flat">Feet to floor</button>
       </div>
-      <label class="topbar-check" title="In Move/Turn mode, drag one dancer and the partner follows — the embrace moves as one unit">
+      <label class="topbar-check" title="Move, turn, or walk one dancer and the partner comes along — the embrace travels as one unit">
         <input type="checkbox" id="link-couple" /> Move as couple
       </label>
     </header>
@@ -73,19 +69,31 @@
             <input type="checkbox" id="embrace-close" /> Close embrace (torso contact)
           </label>
         </div>
-        <div class="slider-row">
-          <div class="lbl"><span title="How far the joined open-side hands lean from vertical (0° = fingers straight up)">Clasp tilt</span><span class="val" id="embrace-tilt-val">20°</span></div>
-          <input type="range" id="embrace-tilt" min="0" max="45" step="1" value="20" />
-          <div class="range-hint"><span>vertical</span><span>45°</span></div>
-        </div>
-        <div class="slider-row">
-          <div class="lbl"><span title="Height of the joined open-side hands, relative to the shoulders (0 = shoulder level, a natural close-embrace frame with the elbows hanging). Raising it lifts the hands and elbows toward a raised salon frame.">Clasp height</span><span class="val" id="embrace-height-val">0</span></div>
-          <input type="range" id="embrace-height" min="-6" max="8" step="1" value="0" />
-          <div class="range-hint"><span>low</span><span>high</span></div>
+        <div id="embrace-controls" hidden>
+          <div class="slider-row">
+            <div class="lbl"><span title="How far the joined open-side hands lean from vertical (0° = fingers straight up)">Clasp tilt</span><span class="val" id="embrace-tilt-val">20°</span></div>
+            <input type="range" id="embrace-tilt" min="0" max="45" step="1" value="20" />
+            <div class="range-hint"><span>vertical</span><span>45°</span></div>
+          </div>
+          <div class="slider-row">
+            <div class="lbl"><span title="Height of the joined open-side hands, relative to the shoulders (0 = shoulder level, a natural close-embrace frame with the elbows hanging). Raising it lifts the hands and elbows toward a raised salon frame.">Clasp height</span><span class="val" id="embrace-height-val">0</span></div>
+            <input type="range" id="embrace-height" min="-6" max="8" step="1" value="0" />
+            <div class="range-hint"><span>low</span><span>high</span></div>
+          </div>
+          <div class="slider-row">
+            <div class="lbl"><span title="Swing the leader's open-side (left) elbow around the shoulder→wrist line without moving the joined hands (0 = elbow hanging down).">Leader elbow</span><span class="val" id="embrace-elbow-leader-val">0°</span></div>
+            <input type="range" id="embrace-elbow-leader" min="-60" max="60" step="1" value="0" />
+            <div class="range-hint"><span>down</span><span>up</span></div>
+          </div>
+          <div class="slider-row">
+            <div class="lbl"><span title="Swing the follower's open-side (right) elbow around the shoulder→wrist line without moving the joined hands (0 = elbow hanging down).">Follower elbow</span><span class="val" id="embrace-elbow-follower-val">0°</span></div>
+            <input type="range" id="embrace-elbow-follower" min="-60" max="60" step="1" value="0" />
+            <div class="range-hint"><span>down</span><span>up</span></div>
+          </div>
         </div>
       </section>
 
-      <section>
+      <section class="collapsed">
         <h2>Highlight</h2>
         <div id="highlight-chips" class="chip-row"></div>
         <div class="btn-row">
@@ -95,7 +103,16 @@
 
       <section id="joint-section">
         <h2>Selected joint</h2>
-        <div id="joint-panel" class="muted">Click a joint on a figure to select it.</div>
+        <div class="row" id="joint-picker">
+          <div id="joint-fig-toggle" class="btn-group" title="Which dancer the joint list targets">
+            <button data-role="leader" class="active">Leader</button>
+            <button data-role="follower">Follower</button>
+          </div>
+          <select id="joint-select" title="Jump to a joint without hunting for it in the 3D view">
+            <option value="">Pick a joint…</option>
+          </select>
+        </div>
+        <div id="joint-panel" class="muted">Click a joint on a figure — or pick one above — to select it.</div>
       </section>
 
       <section>
@@ -103,7 +120,7 @@
         <div id="stats-panel"></div>
       </section>
 
-      <section>
+      <section class="collapsed">
         <h2>Compare poses</h2>
         <div class="btn-row">
           <button id="snap-a">Set A</button>
@@ -145,13 +162,13 @@
         </div>
       </section>
 
-      <section>
+      <section class="collapsed">
         <h2>Dancers</h2>
         <div id="figure-config"></div>
       </section>
     </aside>
 
-    <div id="hint">Click a joint to select · drag the gizmo to pose · right-drag to orbit · scroll to zoom</div>
+    <div id="hint">Click a joint to pose · in Move/Walk, click a dancer then use the arrow keys (↑↓ move/step · ←→ turn) · right-drag to orbit · scroll to zoom</div>
   </div>
   <script type="module" src="/src/main.js"></script>
 </body>

@@ -45,8 +45,8 @@ await page.screenshot({ path: `${outDir}/c-muscle.png` });
 await page.evaluate(() => {
   const a = window.__app;
   a.setVisibleFigures('leader');
-  a.setChainMode('closed');
-  a.selectJoint(a.leader, 'knee_L');
+  a.selectJoint(a.leader, 'knee_L'); // selecting a leg joint auto-picks a chain mode…
+  a.setChainMode('closed');          // …so force closed chain after selecting.
   a.editJoint(a.leader, 'knee_L', () => { a.leader.nodes.knee_L.rotation.x = 1.0; });
 });
 await setLayers(false, true, false);

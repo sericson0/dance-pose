@@ -3,14 +3,24 @@ import { COLLIDERS } from './skeletonDef.js';
 
 // Dancer-vs-dancer body collision: the two dancers may touch — the whole
 // point of the embrace — but never occupy each other's space. Each dancer is
-// a set of capsules around the body core (COLLIDERS in skeletonDef.js; arms
-// and hands are deliberately not colliders, the embrace rests them ON the
-// partner). Every frame the deepest capsule-pair penetration is resolved by
-// sliding one dancer horizontally along the contact normal until the two
-// surfaces just touch — so walking into your partner displaces them, exactly
-// like a real floor, and contact is preserved at zero distance rather than
-// pushed apart. Whichever dancer the user is editing keeps their ground; the
-// partner yields (same convention as the embrace constraints).
+// a set of capsules (COLLIDERS in skeletonDef.js): the body 'core'
+// (torso/head/legs/feet), plus thin 'arm' capsules (upper arm + forearm, no
+// hand) used only for the one arm the user is actively posing (see below).
+// Every frame the deepest capsule-pair penetration is resolved by sliding one
+// dancer horizontally along the contact normal until the two surfaces just
+// touch — so walking into your partner displaces them, exactly like a real
+// floor, and contact is preserved at zero distance rather than pushed apart.
+// Whichever dancer the user is editing keeps their ground; the partner yields
+// (same convention as the embrace constraints).
+//
+// Arms are colliders ONLY for the specific arm being posed right now (the
+// `editedArm` passed from main.js), and only against the partner's core — so
+// dragging an arm into your partner can't pass through them, it displaces them.
+// They are NOT colliders the rest of the time: the embrace and the authored
+// presets deliberately rest each dancer's arms ON and AROUND the partner (the
+// closed-side arm wraps the back, the hand lies on the deltoid), so a
+// standing-on arm capsule would shove the partner across the floor. The hand is
+// never a collider — it is exactly what the embrace rests on the partner.
 
 // Penetration deeper than this gets resolved; shallower counts as contact.
 const TOL = 0.002;
@@ -63,38 +73,47 @@ function closestSegSeg(p1, q1, p2, q2, c1, c2) {
   return c1.distanceTo(c2);
 }
 
-// World-space capsules for a figure's current pose.
-function capsules(figure) {
+// World-space capsules for a figure's current pose. The body core is always
+// included; the 'arm' capsules are included only for the side named by
+// `armSide` ('L'/'R'/null) — the arm the user is currently posing — so the
+// resting/wrapping embrace arms never act as colliders (see resolveBodyCollision).
+function capsules(figure, armSide = null) {
   const H = figure.height;
-  return COLLIDERS.map(({ from, to, r }) => ({
-    p: figure.worldPos(from),
-    q: figure.worldPos(to),
-    r: r * H,
-  }));
+  return COLLIDERS
+    .filter((c) => c.group !== 'arm' || (armSide && c.from.endsWith(`_${armSide}`)))
+    .map(({ from, to, r, group }) => ({
+      p: figure.worldPos(from),
+      q: figure.worldPos(to),
+      r: r * H,
+      group, from, to,
+    }));
 }
 
-// Smallest surface-to-surface clearance between the two dancers' capsule
-// sets: positive = air between them, 0 = touching, negative = penetration
-// depth. Used by the dev verification script.
+// Smallest surface-to-surface clearance between the two dancers' BODIES:
+// positive = air between them, 0 = touching, negative = penetration depth.
+// Body-core only (arms excluded) — this is the body-contact metric the embrace
+// and verification scripts read, and an arm resting on/around the partner is
+// contact, not body penetration. (Arm blocking is a resolver-only safeguard for
+// free posing; see resolveBodyCollision.)
 export function bodyClearance(a, b) {
   return bodyContacts(a, b)[0]?.clearance ?? Infinity;
 }
 
-// All capsule pairs sorted tightest-first: [{ a, b, clearance }] with the
-// COLLIDERS row names — for the dev verification scripts and radius tuning.
+// All body-core capsule pairs sorted tightest-first: [{ a, b, clearance }] with
+// the COLLIDERS row names — for the dev verification scripts and radius tuning.
 export function bodyContacts(a, b) {
   a.group.updateMatrixWorld(true);
   b.group.updateMatrixWorld(true);
-  const capsA = capsules(a);
+  const capsA = capsules(a); // body core only (no arm side named)
   const capsB = capsules(b);
   const out = [];
-  for (let i = 0; i < capsA.length; i++) {
-    for (let j = 0; j < capsB.length; j++) {
-      const dist = closestSegSeg(capsA[i].p, capsA[i].q, capsB[j].p, capsB[j].q, _c1, _c2);
+  for (const ca of capsA) {
+    for (const cb of capsB) {
+      const dist = closestSegSeg(ca.p, ca.q, cb.p, cb.q, _c1, _c2);
       out.push({
-        a: `${COLLIDERS[i].from}→${COLLIDERS[i].to}`,
-        b: `${COLLIDERS[j].from}→${COLLIDERS[j].to}`,
-        clearance: dist - (capsA[i].r + capsB[j].r),
+        a: `${ca.from}→${ca.to}`,
+        b: `${cb.from}→${cb.to}`,
+        clearance: dist - (ca.r + cb.r),
       });
     }
   }
@@ -102,13 +121,16 @@ export function bodyContacts(a, b) {
 }
 
 // Deepest penetration between the two capsule sets (pen ≤ 0 means clear),
-// with the contact points of the deepest pair.
-function maxPenetration(a, b) {
-  const capsA = capsules(a);
-  const capsB = capsules(b);
+// with the contact points of the deepest pair. `armA`/`armB` name each figure's
+// posed-arm side to include as a collider (null = body core only).
+function maxPenetration(a, b, armA = null, armB = null) {
+  const capsA = capsules(a, armA);
+  const capsB = capsules(b, armB);
   const worst = { pen: -Infinity, onA: new THREE.Vector3(), onB: new THREE.Vector3() };
   for (const ca of capsA) {
     for (const cb of capsB) {
+      // Arms never collide with arms (an arm only blocks the partner's core).
+      if (ca.group === 'arm' && cb.group === 'arm') continue;
       const dist = closestSegSeg(ca.p, ca.q, cb.p, cb.q, _c1, _c2);
       const pen = ca.r + cb.r - dist;
       if (pen > worst.pen) {
@@ -131,13 +153,23 @@ function maxPenetration(a, b) {
 // clearance along a slide non-monotone — a fixed-step push can oscillate
 // across a segment crossing and never settle. The bisection lands the two
 // surfaces just touching, to half a millimeter.
-export function resolveBodyCollision(a, b, activeFigure) {
+//
+// `editedArm` = { figure, side } names the one arm the user is posing this
+// frame (side 'L'/'R'); its upper-arm + forearm capsules are added so pushing
+// that arm into the partner blocks and displaces them like the body core does.
+// It rides `activeFigure` (the edited dancer, who keeps their ground), so the
+// capsules attach to `other` below and are tested against the yielding
+// partner's core. Null the rest of the time — the resting/wrapping embrace arms
+// are never colliders (they would shove the partner across the floor).
+export function resolveBodyCollision(a, b, activeFigure, editedArm = null) {
   if (!a.group.visible || !b.group.visible) return;
   const mover = activeFigure === b ? a : b;
   const other = mover === a ? b : a;
+  // The posed arm belongs to the edited (non-yielding) figure === `other`.
+  const otherArm = editedArm && editedArm.figure === other ? editedArm.side : null;
   mover.group.updateMatrixWorld(true);
   other.group.updateMatrixWorld(true);
-  const worst = maxPenetration(mover, other);
+  const worst = maxPenetration(mover, other, null, otherArm);
   if (worst.pen <= TOL) return;
 
   // Horizontal part of the deepest contact's normal; a near-vertical contact
@@ -156,7 +188,7 @@ export function resolveBodyCollision(a, b, activeFigure) {
   const penAt = (t) => {
     mover.group.position.copy(base).addScaledVector(dir, t);
     mover.group.updateMatrixWorld(true);
-    return maxPenetration(mover, other).pen;
+    return maxPenetration(mover, other, null, otherArm).pen;
   };
   // Bracket: grow the slide until everything clears (a horizontal slide far
   // enough along any direction separates two bounded bodies).
