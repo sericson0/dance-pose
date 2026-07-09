@@ -467,6 +467,7 @@ const app = {
   interpTick: null, // UI callback fed the current t while playing
   ghosts: { A: null, B: null }, // translucent snapshot figures
   history: [], // undo stack of serialized couple states
+  redoStack: [], // states walked back from, awaiting redo (cleared by any fresh edit)
   ui: null,
 
   // Undo: call before any change; Ctrl+Z / the Undo button walks back.
@@ -475,12 +476,25 @@ const app = {
     if (this.history[this.history.length - 1] === s) return;
     this.history.push(s);
     if (this.history.length > 60) this.history.shift();
+    this.redoStack.length = 0; // a fresh edit invalidates the redo trail
     if (this.ui) this.ui.onHistoryChanged();
   },
 
   undo() {
     const s = this.history.pop();
-    if (s) this.applyCoupleState(JSON.parse(s));
+    if (!s) return;
+    this.redoStack.push(JSON.stringify(this.getCoupleState('undo')));
+    this.applyCoupleState(JSON.parse(s));
+    if (this.ui) this.ui.onHistoryChanged();
+  },
+
+  // Redo: re-apply the last undone state; the state we leave goes back onto the
+  // undo stack, so undo/redo walk the same history both ways.
+  redo() {
+    const s = this.redoStack.pop();
+    if (!s) return;
+    this.history.push(JSON.stringify(this.getCoupleState('undo')));
+    this.applyCoupleState(JSON.parse(s));
     if (this.ui) this.ui.onHistoryChanged();
   },
 
@@ -954,6 +968,68 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   handleClick(e);
 });
 
+// Hover feedback: glow the joint under the cursor (rotate / drag modes) or show
+// a pointer over a draggable dancer (move / walk modes). The joint pick spheres
+// are invisible click targets in body view, so without this they're undiscoverable.
+const HOVER_EMISSIVE = 0xf5b942;
+let hoverSphere = null;
+
+// The pick sphere's opacity when not hovered: faintly shown in skeleton view,
+// invisible (but still clickable) otherwise — mirrors Figure.setLayers.
+function restingOpacity(figure) {
+  return figure.layers && figure.layers.skeleton ? 0.22 : 0;
+}
+
+function clearHover() {
+  if (hoverSphere) {
+    const { figure, jointName } = hoverSphere.userData;
+    const isSel = app.selected && app.selected.figure === figure && app.selected.jointName === jointName;
+    hoverSphere.material.emissive.set(isSel ? 0x3b6ea5 : 0x000000);
+    hoverSphere.material.opacity = restingOpacity(figure);
+    hoverSphere = null;
+  }
+  renderer.domElement.style.cursor = '';
+}
+
+function setHoverSphere(sphere) {
+  if (sphere === hoverSphere) return;
+  clearHover();
+  hoverSphere = sphere;
+  sphere.material.emissive.set(HOVER_EMISSIVE);
+  sphere.material.opacity = Math.max(sphere.material.opacity, 0.6);
+  renderer.domElement.style.cursor = 'pointer';
+}
+
+// A joint is actionable in drag mode only if it starts an IK chain (hand/foot)
+// or an elbow/knee swivel; in rotate mode every joint can be posed.
+function jointActionable(jointName) {
+  if (app.mode === 'ik') return !!(IK_CHAINS[jointName] || swivelChainFor(jointName));
+  return true;
+}
+
+renderer.domElement.addEventListener('pointerleave', clearHover);
+renderer.domElement.addEventListener('pointermove', (e) => {
+  if (downPos || tcontrols.dragging) return; // don't fight a click, gizmo drag, or orbit
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const visible = app.visibleFigures();
+
+  if (app.mode === 'move' || app.mode === 'step') {
+    clearHover();
+    const hits = raycaster.intersectObjects(visible.map((f) => f.group), true);
+    renderer.domElement.style.cursor = hits.some((h) => h.object.visible) ? 'pointer' : '';
+    return;
+  }
+
+  const spheres = visible.flatMap((f) => f.pickSpheres);
+  const hit = raycaster.intersectObjects(spheres, false)
+    .find((h) => jointActionable(h.object.userData.jointName));
+  if (hit) setHoverSphere(hit.object);
+  else clearHover();
+});
+
 function handleClick(e) {
   const rect = renderer.domElement.getBoundingClientRect();
   pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
@@ -1103,12 +1179,16 @@ app.setVisibleFiguresRefresh = applyVizVisibility;
 app.setViz(vizFlags);
 
 window.addEventListener('keydown', (e) => {
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
-    const t = e.target;
-    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA') && t.type !== 'range') return;
-    e.preventDefault();
-    app.undo();
-  }
+  if (!(e.ctrlKey || e.metaKey)) return;
+  const k = e.key.toLowerCase();
+  const redo = (k === 'z' && e.shiftKey) || k === 'y';
+  const undo = k === 'z' && !e.shiftKey;
+  if (!undo && !redo) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA') && t.type !== 'range') return;
+  e.preventDefault();
+  if (redo) app.redo();
+  else app.undo();
 });
 
 // Keyboard nudges for the active figure (Move / Step modes). Move: arrows slide

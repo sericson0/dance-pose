@@ -26,6 +26,7 @@
       </div>
       <div class="btn-group">
         <button id="undo-btn" disabled title="Undo the last pose change (Ctrl+Z)">↩ Undo</button>
+        <button id="redo-btn" disabled title="Redo the last undone change (Ctrl+Shift+Z / Ctrl+Y)">↪ Redo</button>
         <button id="ground-btn" title="Drop the shown dancers' feet back onto the floor, soles flat">Feet to floor</button>
       </div>
       <label class="topbar-check" title="Move, turn, or walk one dancer and the partner comes along — the embrace travels as one unit">
@@ -102,7 +103,16 @@
 
       <section id="joint-section">
         <h2>Selected joint</h2>
-        <div id="joint-panel" class="muted">Click a joint on a figure to select it.</div>
+        <div class="row" id="joint-picker">
+          <div id="joint-fig-toggle" class="btn-group" title="Which dancer the joint list targets">
+            <button data-role="leader" class="active">Leader</button>
+            <button data-role="follower">Follower</button>
+          </div>
+          <select id="joint-select" title="Jump to a joint without hunting for it in the 3D view">
+            <option value="">Pick a joint…</option>
+          </select>
+        </div>
+        <div id="joint-panel" class="muted">Click a joint on a figure — or pick one above — to select it.</div>
       </section>
 
       <section>
