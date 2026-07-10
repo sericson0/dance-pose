@@ -12,6 +12,12 @@ import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 const Y_AXIS = new THREE.Vector3(0, 1, 0);
 const _floorPt = new THREE.Vector3();
 
+// Per-muscle appearance (Muscles panel): a highlighted belly is recoloured warm
+// and glows; a hidden belly renders nearly transparent (see #applyMuscleStyle).
+const MUSCLE_HL_COLOR = 0xffce4a;
+const MUSCLE_HL_EMISSIVE = 0xffb020;
+const MUSCLE_HIDDEN_OPACITY = 0.06;
+
 // Centroid and smallest-variance axis (≈ the flat normal of a slab-like cloud,
 // e.g. a palm or a sole) of a set of points, via power iteration on
 // (trace·I − covariance): the dominant eigenvector of that shifted matrix is
@@ -330,6 +336,19 @@ export class Figure {
     return { rot, rayOf };
   }
 
+  // Scale + settle (+ mirror) bringing an atlas-frame geometry into this
+  // figure's local space. Shared by the skeleton and muscle bakes, which both
+  // live in the skeleton's atlas frame; Tneg also mirrors X to build the left
+  // side from the shipped right-side geometry.
+  #atlasBakeTransforms() {
+    const { atlasMinY, atlasHeight } = this.skeletonMesh;
+    const s = this.height / atlasHeight;
+    const settle = new THREE.Matrix4().makeTranslation(0, -atlasMinY * s, 0);
+    const Tpos = settle.clone().multiply(new THREE.Matrix4().makeScale(s, s, s));
+    const Tneg = settle.clone().multiply(new THREE.Matrix4().makeScale(-s, s, s)); // mirror
+    return { Tpos, Tneg };
+  }
+
   // Attach the imported atlas bones to our joint tree. Each bone is baked from
   // the shared atlas frame into a target joint node's local space (so it poses
   // with that joint), right-side bones are also mirrored across the sagittal
@@ -337,12 +356,9 @@ export class Figure {
   // material is merged into one mesh to keep the draw-call count low. Hand
   // fingers are also tucked from the atlas's wide fan (see #handDesplayRotations).
   #buildMeshSkeleton() {
-    const { bones, atlasMinY, atlasHeight } = this.skeletonMesh;
-    const s = this.height / atlasHeight;
+    const { bones } = this.skeletonMesh;
     this.group.updateMatrixWorld(true);
-    const settle = new THREE.Matrix4().makeTranslation(0, -atlasMinY * s, 0);
-    const Tpos = settle.clone().multiply(new THREE.Matrix4().makeScale(s, s, s));
-    const Tneg = settle.clone().multiply(new THREE.Matrix4().makeScale(-s, s, s)); // mirror
+    const { Tpos, Tneg } = this.#atlasBakeTransforms();
     // Atlas-frame rotations that tuck the fanned hand fingers together (applied
     // before T, so the mirror handles the left hand). Keyed by finger ray 1–5.
     const desplay = this.#handDesplayRotations(bones, HAND_DESPLAY);
@@ -448,17 +464,15 @@ export class Figure {
   // articulated joint (has an `insert`) is skinned between its two joints so it
   // stretches and bends as they move (see updateMuscleSkin).
   #buildMeshMuscles() {
-    const { atlasMinY, atlasHeight } = this.skeletonMesh;
-    const s = this.height / atlasHeight;
     this.group.updateMatrixWorld(true);
-    const settle = new THREE.Matrix4().makeTranslation(0, -atlasMinY * s, 0);
-    const Tpos = settle.clone().multiply(new THREE.Matrix4().makeScale(s, s, s));
-    const Tneg = settle.clone().multiply(new THREE.Matrix4().makeScale(-s, s, s)); // mirror
+    const { Tpos, Tneg } = this.#atlasBakeTransforms();
     // Resolve a limb base to a concrete side; central nodes pass through.
     const resolve = (base, side) => (LIMB_BASES.has(base) ? `${base}_${side}` : base);
 
     this.muscleMesh.muscles.forEach((m, i) => {
-      const material = i % 2 ? this.materials.muscleA : this.materials.muscleB;
+      // Each belly owns its material (its left/right copies share it), so the
+      // Muscles panel can recolour or fade one belly without touching the rest.
+      const material = (i % 2 ? this.materials.muscleA : this.materials.muscleB).clone();
       // Every shipped belly is right-side: place it (Tpos) and mirror to the
       // left (Tneg). The node side follows the copy's side.
       for (const [side, T, mirror] of [['R', Tpos, false], ['L', Tneg, true]]) {
@@ -484,6 +498,8 @@ export class Figure {
           if (mirror) reverseWinding(g);
           const mesh = new THREE.Mesh(g, material);
           mesh.userData.muscleName = m.label;
+          mesh.userData.isMuscle = true;
+          mesh.userData.muscleBaseColor = material.color.getHex();
           this.addMesh(nodeName, mesh, 'muscle', true, this.atlasNodes[nodeName] || null);
         }
       }
@@ -564,6 +580,8 @@ export class Figure {
     mesh.castShadow = true;
     mesh.frustumCulled = false; // vertices leave the baked bounds as joints move
     mesh.userData.muscleName = label;
+    mesh.userData.isMuscle = true;
+    mesh.userData.muscleBaseColor = material.color.getHex();
     mesh.userData.skinNode = originNode; // highlight groups it with this joint
     this.group.add(mesh);
     this.layerMeshes.muscle.push(mesh);
@@ -1027,6 +1045,13 @@ export class Figure {
     return n ? n.userData.jointName : null;
   }
 
+  // The joint a mesh belongs to: an explicit userData.skinNode when it has one
+  // (skinned muscles hang off `group`, not their joint node), else the node it
+  // is parented under (#nodeNameOf).
+  #jointNameOf(obj) {
+    return obj.userData.skinNode !== undefined ? obj.userData.skinNode : this.#nodeNameOf(obj);
+  }
+
   // Similarity fit ({ R, S, T }) that lays the atlas hand onto the clothed hand:
   // R rolls it to the glove's orientation, S scales it to the glove's size about
   // the wrist, and T seats the whole hand on the glove. Rather than build a palm
@@ -1379,12 +1404,66 @@ export class Figure {
   setHighlight(parts) {
     this.highlightParts = parts && parts.size ? new Set(parts) : null;
     this.#applyHighlight();
+    this.#applyMuscleStyle(); // muscles dim/light with the body-part highlight too
+  }
+
+  // Muscles panel: hide a set of bellies (render them nearly transparent) and/or
+  // highlight a set (recolour + glow). Labels match userData.muscleName, so both
+  // the left and right copy of a named belly respond together.
+  setMuscleHidden(labels) {
+    this.hiddenMuscles = labels && labels.size ? new Set(labels) : null;
+    this.#applyMuscleStyle();
+  }
+
+  setMuscleLit(labels) {
+    this.litMuscles = labels && labels.size ? new Set(labels) : null;
+    this.#applyMuscleStyle();
+  }
+
+  // Resolve each imported muscle belly's look from three inputs: the panel's
+  // hidden set (transparent), its highlight set (warm glow), and the body-part
+  // highlight (dim the bellies outside the chosen part). Each belly owns its
+  // material, so states are set in place. Fallback (procedural) muscles carry no
+  // isMuscle flag and keep flowing through #applyHighlight instead.
+  #applyMuscleStyle() {
+    const hidden = this.hiddenMuscles;
+    const lit = this.litMuscles;
+    const parts = this.highlightParts;
+    for (const mesh of this.layerMeshes.muscle) {
+      if (!mesh.userData.isMuscle) continue;
+      const label = mesh.userData.muscleName;
+      let state;
+      if (hidden && hidden.has(label)) state = 'hidden';
+      else if (lit && lit.has(label)) state = 'lit';
+      else if (parts) {
+        const jointName = this.#jointNameOf(mesh);
+        const part = jointName ? PART_OF_NODE[jointName] : null;
+        state = parts.has(part) ? 'lit' : 'dim';
+      } else state = 'normal';
+
+      const mat = mesh.material;
+      if (state === 'lit') {
+        mat.color.setHex(MUSCLE_HL_COLOR);
+        mat.emissive.setHex(MUSCLE_HL_EMISSIVE);
+        mat.emissiveIntensity = 0.5;
+        mat.transparent = false; mat.opacity = 1; mat.depthWrite = true;
+      } else {
+        mat.color.setHex(mesh.userData.muscleBaseColor);
+        mat.emissive.setHex(0x000000);
+        mat.emissiveIntensity = 1;
+        if (state === 'hidden') { mat.transparent = true; mat.opacity = MUSCLE_HIDDEN_OPACITY; mat.depthWrite = false; }
+        else if (state === 'dim') { mat.transparent = true; mat.opacity = 0.13; mat.depthWrite = false; }
+        else { mat.transparent = false; mat.opacity = 1; mat.depthWrite = true; }
+      }
+      mesh.castShadow = state !== 'hidden';
+    }
   }
 
   #applyHighlight() {
     const parts = this.highlightParts;
     this.group.traverse((o) => {
       if (!o.isMesh || o.userData.isPick) return;
+      if (o.userData.isMuscle) return; // imported muscles are styled by #applyMuscleStyle
       o.userData.baseMaterial ??= o.material;
       const base = o.userData.baseMaterial;
       if (!parts || o.userData.noHighlight) {
@@ -1396,12 +1475,7 @@ export class Figure {
       }
       // Skinned muscles hang off the group, not a joint node, so they carry the
       // joint they belong to explicitly; everything else walks up to its node.
-      let jointName = o.userData.skinNode;
-      if (jointName === undefined) {
-        let n = o;
-        while (n && n.userData.jointName === undefined) n = n.parent;
-        jointName = n ? n.userData.jointName : null;
-      }
+      const jointName = this.#jointNameOf(o);
       const part = jointName ? PART_OF_NODE[jointName] : null;
       o.material = this.#highlightVariant(base, parts.has(part) ? 'lit' : 'dim');
     });

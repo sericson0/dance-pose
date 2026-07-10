@@ -5,6 +5,7 @@ import {
 
 const _a = new THREE.Vector3();
 const _b = new THREE.Vector3();
+const _c = new THREE.Vector3();
 
 // Whole-body center of gravity from the segment mass model (de Leva tables).
 export function computeCOG(figure, target = new THREE.Vector3()) {
@@ -32,18 +33,13 @@ export function footContactsBySide(figure, threshold = 0.035) {
   for (const [side, nodeName, corners] of patches) {
     const node = figure.nodes[nodeName];
     for (const [x, y, z] of corners) {
-      const p = node.localToWorld(new THREE.Vector3(
+      const p = node.localToWorld(_c.set(
         x * figure.height, y * figure.height, z * figure.height,
       ));
       if (p.y < threshold) bySide[side].push({ x: p.x, z: p.z });
     }
   }
   return bySide;
-}
-
-export function footContactPoints(figure, threshold = 0.035) {
-  const bySide = footContactsBySide(figure, threshold);
-  return [...bySide.L, ...bySide.R];
 }
 
 // Convex hull in the floor plane (Andrew's monotone chain).

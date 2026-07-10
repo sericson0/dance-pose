@@ -15,11 +15,18 @@ const CHAIN_JOINTS = new Set([
 
 export function initUI(app) {
   const $ = (id) => document.getElementById(id);
+  // Toggle the .active class across a button group; `isOn` picks the winner.
+  const setActive = (btns, isOn) => btns.forEach((b) => b.classList.toggle('active', isOn(b)));
+  // Snapshot undo history when a slider drag or keyboard focus begins.
+  const pushHistoryOnEdit = (input) => {
+    input.addEventListener('pointerdown', () => app.pushHistory());
+    input.addEventListener('focus', () => app.pushHistory());
+  };
 
   // ---------------------------------------------------------------- modes
   const modeButtons = [...document.querySelectorAll('#mode-buttons button')];
   const selectMode = (mode) => {
-    modeButtons.forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
+    setActive(modeButtons, (b) => b.dataset.mode === mode);
     app.setMode(mode);
   };
   for (const btn of modeButtons) {
@@ -84,7 +91,7 @@ export function initUI(app) {
   const showButtons = [...document.querySelectorAll('#show-buttons button')];
   for (const btn of showButtons) {
     btn.addEventListener('click', () => {
-      showButtons.forEach((b) => b.classList.toggle('active', b === btn));
+      setActive(showButtons, (b) => b === btn);
       app.setVisibleFigures(btn.dataset.show);
     });
   }
@@ -145,6 +152,101 @@ export function initUI(app) {
     syncHighlight();
   });
 
+  // ---------------------------------------------------------------- muscles
+  // Per-muscle controls: uncheck a belly to fade it out (transparent), or hit
+  // its "highlight" chip to recolour it. Both act on both dancers by label.
+  const muscleList = $('muscle-list');
+  const muscleClearHl = $('muscle-clear-hl');
+  const muscleLayerNote = $('muscle-layer-note');
+  const hiddenMuscles = new Set();
+  const litMuscles = new Set();
+
+  const MUSCLE_REGION = {
+    chest: 'Chest & back', shoulder: 'Upper arm', elbow: 'Forearm',
+    spine: 'Abdomen', hip: 'Hip & thigh', knee: 'Lower leg',
+  };
+  const MUSCLE_REGION_ORDER = ['chest', 'shoulder', 'elbow', 'spine', 'hip', 'knee'];
+
+  function renderMuscleList() {
+    if (!app.muscles || !app.muscles.length) {
+      muscleList.className = 'muted';
+      muscleList.textContent = 'Muscle atlas unavailable in this session.';
+      return;
+    }
+    const byNode = new Map();
+    for (const m of app.muscles) {
+      if (!byNode.has(m.node)) byNode.set(m.node, []);
+      byNode.get(m.node).push(m.label);
+    }
+    const nodes = [...byNode.keys()].sort(
+      (a, b) => MUSCLE_REGION_ORDER.indexOf(a) - MUSCLE_REGION_ORDER.indexOf(b));
+    muscleList.className = '';
+    muscleList.innerHTML = '';
+    for (const node of nodes) {
+      const group = document.createElement('div');
+      group.className = 'muscle-group';
+      const title = document.createElement('div');
+      title.className = 'muscle-group-title';
+      title.textContent = MUSCLE_REGION[node] || node;
+      group.appendChild(title);
+      for (const label of byNode.get(node)) {
+        const row = document.createElement('div');
+        row.className = 'muscle-row';
+        const lbl = document.createElement('label');
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = !hiddenMuscles.has(label);
+        cb.addEventListener('change', () => {
+          if (cb.checked) hiddenMuscles.delete(label); else hiddenMuscles.add(label);
+          app.setMuscleHidden(hiddenMuscles);
+        });
+        lbl.append(cb, document.createTextNode(` ${label}`));
+        const hl = document.createElement('button');
+        hl.className = 'chip muscle-hl';
+        hl.textContent = 'highlight';
+        hl.title = 'Highlight this muscle';
+        hl.classList.toggle('active', litMuscles.has(label));
+        hl.addEventListener('click', () => {
+          if (litMuscles.has(label)) litMuscles.delete(label); else litMuscles.add(label);
+          hl.classList.toggle('active', litMuscles.has(label));
+          app.setMuscleLit(litMuscles);
+          muscleClearHl.disabled = litMuscles.size === 0;
+        });
+        row.append(lbl, hl);
+        group.appendChild(row);
+      }
+      muscleList.appendChild(group);
+    }
+  }
+
+  $('muscle-show-all').addEventListener('click', () => {
+    hiddenMuscles.clear();
+    app.setMuscleHidden(hiddenMuscles);
+    renderMuscleList();
+  });
+  $('muscle-hide-all').addEventListener('click', () => {
+    for (const m of (app.muscles || [])) hiddenMuscles.add(m.label);
+    app.setMuscleHidden(hiddenMuscles);
+    renderMuscleList();
+  });
+  muscleClearHl.addEventListener('click', () => {
+    litMuscles.clear();
+    app.setMuscleLit(litMuscles);
+    muscleClearHl.disabled = true;
+    renderMuscleList();
+  });
+
+  // The panel only shows through the Muscles layer — nudge the user to enable it.
+  const syncMuscleNote = () => { muscleLayerNote.hidden = $('layer-muscle').checked; };
+  $('layer-muscle').addEventListener('change', syncMuscleNote);
+  $('muscle-enable-layer').addEventListener('click', () => {
+    $('layer-muscle').checked = true;
+    syncLayers();
+    syncMuscleNote();
+  });
+  syncMuscleNote();
+  renderMuscleList();
+
   // ---------------------------------------------------------------- joint panel
   const jointPanel = $('joint-panel');
   const sliderRefs = []; // { input, valEl, node, axis }
@@ -194,7 +296,7 @@ export function initUI(app) {
     pickJoint(activePickerRole());
   });
   figToggleBtns.forEach((btn) => btn.addEventListener('click', () => {
-    figToggleBtns.forEach((b) => b.classList.toggle('active', b === btn));
+    setActive(figToggleBtns, (b) => b === btn);
     pickJoint(btn.dataset.role); // re-select the same joint on the chosen dancer
   }));
 
@@ -203,7 +305,7 @@ export function initUI(app) {
     if (app.selected) {
       jointSelect.value = app.selected.jointName;
       const role = app.selected.figure === app.follower ? 'follower' : 'leader';
-      figToggleBtns.forEach((b) => b.classList.toggle('active', b.dataset.role === role));
+      setActive(figToggleBtns, (b) => b.dataset.role === role);
     } else {
       jointSelect.value = '';
     }
@@ -239,8 +341,8 @@ export function initUI(app) {
       toggle.innerHTML = `
         <button data-chain="open">Open chain</button>
         <button data-chain="closed">Closed chain</button>`;
-      const syncChain = () => toggle.querySelectorAll('button').forEach((b) =>
-        b.classList.toggle('active', b.dataset.chain === app.chainMode));
+      const syncChain = () => setActive(toggle.querySelectorAll('button'),
+        (b) => b.dataset.chain === app.chainMode);
       toggle.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => {
         app.setChainMode(b.dataset.chain);
         syncChain();
@@ -262,8 +364,7 @@ export function initUI(app) {
         <div class="range-hint"><span>${min}°</span><span>${max}°</span></div>`;
       const input = row.querySelector('input');
       const valEl = row.querySelector('.val');
-      input.addEventListener('pointerdown', () => app.pushHistory());
-      input.addEventListener('focus', () => app.pushHistory());
+      pushHistoryOnEdit(input);
       input.addEventListener('input', () => {
         app.editJoint(figure, jointName, () => { node.rotation[axis] = Number(input.value) * D2R; });
         valEl.textContent = `${(node.rotation[axis] * R2D).toFixed(0)}°`;
@@ -284,8 +385,7 @@ export function initUI(app) {
         <div class="range-hint"><span>low</span><span>tall</span></div>`;
       const input = row.querySelector('input');
       const valEl = row.querySelector('.val');
-      input.addEventListener('pointerdown', () => app.pushHistory());
-      input.addEventListener('focus', () => app.pushHistory());
+      pushHistoryOnEdit(input);
       input.addEventListener('input', () => {
         app.setPelvisHeight(figure, Number(input.value) / 100);
         valEl.textContent = `${Number(input.value).toFixed(0)} cm`;
@@ -406,8 +506,7 @@ export function initUI(app) {
     interpSlider.value = Math.round(t * 1000);
     interpVal.textContent = `${Math.round(t * 100)}%`;
   };
-  interpSlider.addEventListener('pointerdown', () => app.pushHistory());
-  interpSlider.addEventListener('focus', () => app.pushHistory());
+  pushHistoryOnEdit(interpSlider);
   interpSlider.addEventListener('input', () => {
     const t = Number(interpSlider.value) / 1000;
     app.applyInterp(t);

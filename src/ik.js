@@ -3,6 +3,11 @@ import * as THREE from 'three';
 const _R = new THREE.Vector3();
 const _M = new THREE.Vector3();
 const _E = new THREE.Vector3();
+// Reused quaternion scratch. solveTwoBone and swivelLimb never nest, so they
+// can share these without aliasing.
+const _q1 = new THREE.Quaternion();
+const _q2 = new THREE.Quaternion();
+const _q3 = new THREE.Quaternion();
 
 // Analytic two-bone IK (shoulder→elbow→wrist, hip→knee→ankle).
 //  1. Set the hinge (mid) angle from the law of cosines.
@@ -34,18 +39,15 @@ export function solveTwoBone(figure, chain, targetWorld) {
 
   // Swing the root so the effector points at the target.
   figure.group.updateMatrixWorld(true);
-  const effNow = eff.getWorldPosition(new THREE.Vector3());
-  const from = effNow.sub(_R).normalize();
-  const to = targetWorld.clone().sub(_R).normalize();
+  const from = eff.getWorldPosition(_E).sub(_R).normalize(); // _E free after `b`
+  const to = _M.copy(targetWorld).sub(_R).normalize();       // _M free after `b`
   if (from.lengthSq() < 1e-8 || to.lengthSq() < 1e-8) return;
-  const qDelta = new THREE.Quaternion().setFromUnitVectors(from, to);
+  const qDelta = _q1.setFromUnitVectors(from, to);
 
-  const parentQ = root.parent.getWorldQuaternion(new THREE.Quaternion());
-  const parentQInv = parentQ.clone().invert();
+  const parentQ = root.parent.getWorldQuaternion(_q2);
+  const parentQInv = _q3.copy(parentQ).invert();
   // local' = P⁻¹ · Δ · P · local
-  const newLocal = new THREE.Quaternion()
-    .copy(parentQInv).multiply(qDelta).multiply(parentQ).multiply(root.quaternion);
-  root.quaternion.copy(newLocal);
+  root.quaternion.copy(parentQInv.multiply(qDelta).multiply(parentQ).multiply(root.quaternion));
   figure.clampJoint(chain.root);
   figure.group.updateMatrixWorld(true);
 }
@@ -92,9 +94,10 @@ export function swivelLimb(figure, chain, targetWorld) {
   const parentQInv = parentQ.clone().invert();
   const q0 = root.quaternion.clone(); // the root's local rotation before the roll
   // The root's local rotation after rolling the whole limb by `theta` about the
-  // world axis: local' = P⁻¹ · Rot(axis, θ) · P · local.
-  const rolled = (theta) => parentQInv.clone()
-    .multiply(new THREE.Quaternion().setFromAxisAngle(axis, theta))
+  // world axis: local' = P⁻¹ · Rot(axis, θ) · P · local. Returns shared scratch
+  // (_q1); every caller copies it into root.quaternion before the next roll.
+  const rolled = (theta) => _q1.copy(parentQInv)
+    .multiply(_q2.setFromAxisAngle(axis, theta))
     .multiply(parentQ).multiply(q0);
   // A roll is feasible if it lands the root within its joint limits — i.e. the
   // clamp leaves it unchanged (so the applied rotation stays a pure axis roll

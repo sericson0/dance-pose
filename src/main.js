@@ -352,6 +352,14 @@ function swivelChainFor(jointName) {
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 
+// Aim the shared raycaster at a pointer event's client coords.
+function pointerRay(e) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+}
+
 // ---------------------------------------------------------- whole-figure helpers
 const _UP = new THREE.Vector3(0, 1, 0);
 
@@ -587,6 +595,15 @@ const app = {
   setHighlight(parts) {
     this.highlightParts = parts;
     for (const f of this.figures) f.setHighlight(parts);
+  },
+
+  // Muscles panel: hide (make transparent) / highlight (recolour) individual
+  // bellies by label, across both dancers (see Figure.setMuscleHidden/Lit).
+  setMuscleHidden(labels) {
+    for (const f of this.figures) f.setMuscleHidden(labels);
+  },
+  setMuscleLit(labels) {
+    for (const f of this.figures) f.setMuscleLit(labels);
   },
 
   // The lower of the two ankles — the foot the dancer is standing on.
@@ -893,6 +910,13 @@ const app = {
   },
 };
 
+// Muscle catalog for the Muscles panel: unique bellies (deduped by label, each
+// tagged with its region node), or empty when the muscle atlas failed to load.
+app.muscles = muscleMeshes
+  ? [...new Map(muscleMeshes.muscles.map((m) => [m.label, m.node])).entries()]
+    .map(([label, node]) => ({ label, node }))
+  : [];
+
 // When a drag begins: snapshot for undo, remember the closed-chain anchor so
 // we can pin it back each frame, and capture start transforms for a linked
 // couple drag.
@@ -922,8 +946,6 @@ tcontrols.addEventListener('dragging-changed', (e) => {
   }
 });
 
-const _yAxis = new THREE.Vector3(0, 1, 0);
-
 tcontrols.addEventListener('objectChange', () => {
   if (app.ikState) {
     // Keep the IK target where the limb can reach without going underground.
@@ -947,7 +969,7 @@ tcontrols.addEventListener('objectChange', () => {
       // about the dragged dancer so the embrace turns as one unit.
       const { dragged, other, draggedPos, draggedYaw, otherPos, otherYaw } = app.coupleDrag;
       const dYaw = dragged.group.rotation.y - draggedYaw;
-      const rel = otherPos.clone().sub(draggedPos).applyAxisAngle(_yAxis, dYaw);
+      const rel = otherPos.clone().sub(draggedPos).applyAxisAngle(_UP, dYaw);
       other.group.position.copy(draggedPos).add(rel);
       other.group.position.x += dragged.group.position.x - draggedPos.x;
       other.group.position.z += dragged.group.position.z - draggedPos.z;
@@ -1010,10 +1032,7 @@ function jointActionable(jointName) {
 renderer.domElement.addEventListener('pointerleave', clearHover);
 renderer.domElement.addEventListener('pointermove', (e) => {
   if (downPos || tcontrols.dragging) return; // don't fight a click, gizmo drag, or orbit
-  const rect = renderer.domElement.getBoundingClientRect();
-  pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-  pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-  raycaster.setFromCamera(pointer, camera);
+  pointerRay(e);
   const visible = app.visibleFigures();
 
   if (app.mode === 'move' || app.mode === 'step') {
@@ -1031,10 +1050,7 @@ renderer.domElement.addEventListener('pointermove', (e) => {
 });
 
 function handleClick(e) {
-  const rect = renderer.domElement.getBoundingClientRect();
-  pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-  pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-  raycaster.setFromCamera(pointer, camera);
+  pointerRay(e);
 
   const visible = app.visibleFigures();
   if (app.mode === 'move' || app.mode === 'step') {

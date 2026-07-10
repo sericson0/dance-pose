@@ -70,12 +70,12 @@ function longBone(fig, nodeName, a, b, { rMid, rEnd, double = false, sep = 0 }) 
   const perp = perpendicular(dir).multiplyScalar(sep * H);
   const offsets = double ? [perp, perp.clone().negate()] : [new THREE.Vector3()];
   for (const off of offsets) {
-    const shaft = new THREE.Mesh(
+    const shaftMesh = new THREE.Mesh(
       new THREE.CylinderGeometry(rMid * H, rMid * H, shaftLen, 12),
       fig.materials.bone,
     );
-    alignY(shaft, a.clone().add(off), b.clone().add(off));
-    fig.addMesh(nodeName, shaft, 'skeleton');
+    alignY(shaftMesh, a.clone().add(off), b.clone().add(off));
+    fig.addMesh(nodeName, shaftMesh, 'skeleton');
   }
   // Condyles at both ends (shared centre for double bones).
   for (const end of [a, b]) {

@@ -196,10 +196,42 @@ export function classifyMuscle(rawName) {
   return insert ? { node, insert } : { node };
 }
 
-// Human-readable muscle label from an atlas name: drop the ".r"/".l" side tag
-// and a trailing "muscle" word ("Gluteus maximus muscle.r" → "Gluteus maximus").
+// Human-readable muscle label from an atlas name. GLTFLoader sanitises the
+// source names (spaces/dots → underscores, so "Gluteus maximus muscle.r" arrives
+// as "Gluteus_maximus_muscler"): restore the spaces, drop the trailing side tag
+// (a ".r"/".l" or a merged "r"/"l"), and drop a trailing "muscle" word →
+// "Gluteus maximus". Every shipped belly is right-side, so the tail is always a
+// single side letter.
 export function muscleLabel(rawName) {
-  return rawName.replace(/\s*\.[rl]\s*$/i, '').replace(/\s+muscle$/i, '').trim();
+  return rawName
+    .replace(/_/g, ' ')
+    .replace(/\s*\.?\s*[rl]$/i, '')
+    .replace(/\s+muscle$/i, '')
+    .trim();
+}
+
+// Load a Draco-compressed GLB (the decoder is self-hosted under public/draco,
+// copied from three's addons, so the tool stays offline-friendly) and return the
+// parsed gltf with world matrices resolved.
+async function loadDracoGLTF(url) {
+  const draco = new DRACOLoader().setDecoderPath(`${import.meta.env.BASE_URL}draco/`);
+  const loader = new GLTFLoader().setDRACOLoader(draco);
+  const gltf = await loader.loadAsync(url);
+  draco.dispose();
+  gltf.scene.updateMatrixWorld(true);
+  return gltf;
+}
+
+// Clone a mesh's geometry baked into the shared atlas (world) frame and stripped
+// to position + normal (computing normals if absent) so the pieces merge cleanly.
+function bakeToWorld(o) {
+  const g = o.geometry.clone();
+  g.applyMatrix4(o.matrixWorld);
+  for (const key of Object.keys(g.attributes)) {
+    if (key !== 'position' && key !== 'normal') g.deleteAttribute(key);
+  }
+  if (!g.attributes.normal) g.computeVertexNormals();
+  return g;
 }
 
 // Load a muscle atlas GLB and return per-muscle atlas-space geometry, ready for
@@ -207,22 +239,13 @@ export function muscleLabel(rawName) {
 // individually. Every shipped muscle is a right-side belly, so all are mirrored
 // to build the left side.
 export async function loadMuscleMeshes(url) {
-  const draco = new DRACOLoader().setDecoderPath(`${import.meta.env.BASE_URL}draco/`);
-  const loader = new GLTFLoader().setDRACOLoader(draco);
-  const gltf = await loader.loadAsync(url);
-  draco.dispose();
-  gltf.scene.updateMatrixWorld(true);
+  const gltf = await loadDracoGLTF(url);
   const muscles = [];
   gltf.scene.traverse((o) => {
     if (!o.isMesh) return;
     const cls = classifyMuscle(o.name);
     if (!cls) return;
-    const g = o.geometry.clone();
-    g.applyMatrix4(o.matrixWorld);
-    for (const key of Object.keys(g.attributes)) {
-      if (key !== 'position' && key !== 'normal') g.deleteAttribute(key);
-    }
-    if (!g.attributes.normal) g.computeVertexNormals();
+    const g = bakeToWorld(o);
     muscles.push({
       name: o.name, label: muscleLabel(o.name),
       node: cls.node, insert: cls.insert, geometry: g,
@@ -236,13 +259,7 @@ export async function loadMuscleMeshes(url) {
 // ready for the figure to scale/mirror/attach. Geometry is stripped to
 // position+normal so the pieces merge cleanly under a single bone material.
 export async function loadSkeletonBones(url) {
-  // The GLB is Draco-compressed; the decoder is self-hosted under public/draco
-  // (copied from three's addons) so the tool stays offline-friendly.
-  const draco = new DRACOLoader().setDecoderPath(`${import.meta.env.BASE_URL}draco/`);
-  const loader = new GLTFLoader().setDRACOLoader(draco);
-  const gltf = await loader.loadAsync(url);
-  draco.dispose();
-  gltf.scene.updateMatrixWorld(true);
+  const gltf = await loadDracoGLTF(url);
   const bones = [];
   const box = new THREE.Box3();
   // The file carries only right-side + axial bones, grouped under "Bones"
@@ -257,12 +274,7 @@ export async function loadSkeletonBones(url) {
     if (!o.isMesh) return;
     const cls = classifyBone(o.name);
     if (!cls) return;
-    const g = o.geometry.clone();
-    g.applyMatrix4(o.matrixWorld); // bake into the shared atlas frame
-    for (const key of Object.keys(g.attributes)) {
-      if (key !== 'position' && key !== 'normal') g.deleteAttribute(key);
-    }
-    if (!g.attributes.normal) g.computeVertexNormals();
+    const g = bakeToWorld(o);
     g.computeBoundingBox();
     box.union(g.boundingBox);
     bones.push({
@@ -314,11 +326,7 @@ export const normBoneName = norm;
 // Returns the parsed scene plus its bind-pose extents; each figure clones it
 // (SkeletonUtils) and retargets the bones onto its own joints.
 export async function loadBodyMesh(url) {
-  const draco = new DRACOLoader().setDecoderPath(`${import.meta.env.BASE_URL}draco/`);
-  const loader = new GLTFLoader().setDRACOLoader(draco);
-  const gltf = await loader.loadAsync(url);
-  draco.dispose();
-  gltf.scene.updateMatrixWorld(true);
+  const gltf = await loadDracoGLTF(url);
   // Bind pose = rest scene; setFromObject applies each mesh node's transform
   // (FBX2glTF keeps the vertex buffers Z-up behind a rotated mesh node, so raw
   // geometry bounds would measure the wrong axis).

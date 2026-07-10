@@ -120,12 +120,10 @@ export function bodyContacts(a, b) {
   return out.sort((x, y) => x.clearance - y.clearance);
 }
 
-// Deepest penetration between the two capsule sets (pen ≤ 0 means clear),
-// with the contact points of the deepest pair. `armA`/`armB` name each figure's
-// posed-arm side to include as a collider (null = body core only).
-function maxPenetration(a, b, armA = null, armB = null) {
-  const capsA = capsules(a, armA);
-  const capsB = capsules(b, armB);
+// Deepest penetration between two capsule sets (pen ≤ 0 means clear), with the
+// contact points of the deepest pair. Callers build the sets with capsules(),
+// naming each figure's posed-arm side to include as a collider (null = core only).
+function maxPenetrationBetween(capsA, capsB) {
   const worst = { pen: -Infinity, onA: new THREE.Vector3(), onB: new THREE.Vector3() };
   for (const ca of capsA) {
     for (const cb of capsB) {
@@ -169,7 +167,10 @@ export function resolveBodyCollision(a, b, activeFigure, editedArm = null) {
   const otherArm = editedArm && editedArm.figure === other ? editedArm.side : null;
   mover.group.updateMatrixWorld(true);
   other.group.updateMatrixWorld(true);
-  const worst = maxPenetration(mover, other, null, otherArm);
+  // `other` (the edited dancer) holds still while we slide `mover`, so its
+  // capsule set is built once and reused across the bracket/bisect below.
+  const capsOther = capsules(other, otherArm);
+  const worst = maxPenetrationBetween(capsules(mover), capsOther);
   if (worst.pen <= TOL) return;
 
   // Horizontal part of the deepest contact's normal; a near-vertical contact
@@ -188,7 +189,7 @@ export function resolveBodyCollision(a, b, activeFigure, editedArm = null) {
   const penAt = (t) => {
     mover.group.position.copy(base).addScaledVector(dir, t);
     mover.group.updateMatrixWorld(true);
-    return maxPenetration(mover, other, null, otherArm).pen;
+    return maxPenetrationBetween(capsules(mover), capsOther).pen;
   };
   // Bracket: grow the slide until everything clears (a horizontal slide far
   // enough along any direction separates two bounded bodies).
