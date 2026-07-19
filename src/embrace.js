@@ -288,6 +288,18 @@ export class Embrace {
 
   // Close embrace: restore the contact distance by sliding the partner of the
   // actively edited dancer (default: the follower keeps the embrace).
+  //
+  // Deliberately a plain pull to the exact held distance, even when that
+  // drives the mover into the partner's body: the collision resolver that
+  // runs right after (main.js's loop) pushes back out along the deepest
+  // contact's normal, and the tangential remainder of that pull/push pair is
+  // a collide-and-slide step that walks the mover AROUND an interposed knee
+  // or trailing foot, a little each frame, until the couple nestles into full
+  // contact — or comes to rest surface-on-surface where the push-back exactly
+  // cancels the pull. Don't "fix" the overshoot by stopping the pull where
+  // the bodies first touch: that freezes the couple at the first graze it
+  // meets (often 10+ cm short of contact) because the sliding that gets them
+  // the rest of the way never happens.
   maintainTorso(activeFigure) {
     if (!this.close) return;
     this.leader.group.updateMatrixWorld(true);

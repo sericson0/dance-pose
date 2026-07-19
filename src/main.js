@@ -2,13 +2,13 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { Figure } from './figure.js';
-import { IK_CHAINS, JOINT_BY_NAME, ANCHOR_FOR } from './skeletonDef.js';
+import { IK_CHAINS, JOINT_BY_NAME, ANCHOR_FOR, DEG } from './skeletonDef.js';
 import { solveTwoBone, swivelLimb, editWithAnchor, pinAnchor, feetToFloor, flattenFoot } from './ik.js';
 import { balanceReport, coupleReport, footContactsBySide } from './analysis.js';
 import { PRESETS } from './presets.js';
 import { loadSkeletonBones, loadMuscleMeshes, loadBodyMesh } from './skeletonMesh.js';
 import { Embrace } from './embrace.js';
-import { resolveBodyCollision, bodyClearance } from './collision.js';
+import { resolveBodyCollision, bodyClearance, bodyContacts } from './collision.js';
 import { initUI } from './ui.js';
 
 // ---------------------------------------------------------------- scene
@@ -149,8 +149,12 @@ async function tryLoadBody(file) {
 }
 const [manBody, womanBody] = await Promise.all([tryLoadBody('man.glb'), tryLoadBody('woman.glb')]);
 
+// soleScale fits each figure's balance footprint to its OWN rendered shoe (the
+// shared corner tables in skeletonDef.js are sized to the man's): the woman's
+// heeled shoe ends 0.073H ahead of her ankle vs the man's 0.095H, so her
+// forward corners pull in by 0.78.
 const leader = new Figure({ name: 'Leader', height: 1.78, mass: 75, color: 0x4d8fd1, skeleton: skeletonBones, muscles: muscleMeshes, body: manBody, bodyKey: 'man' });
-const follower = new Figure({ name: 'Follower', height: 1.65, mass: 60, color: 0xc95f8e, skin: 0xe0b092, skeleton: skeletonBones, muscles: muscleMeshes, body: womanBody, bodyKey: 'woman', heelRise: 0.012 });
+const follower = new Figure({ name: 'Follower', height: 1.65, mass: 60, color: 0xc95f8e, skin: 0xe0b092, skeleton: skeletonBones, muscles: muscleMeshes, body: womanBody, bodyKey: 'woman', heelRise: 0.012, soleScale: { front: 0.78 } });
 scene.add(leader.group, follower.group);
 
 // Embrace constraints (open-side hand clasp, close-embrace torso contact),
@@ -341,6 +345,31 @@ const swivelTarget = new THREE.Mesh(
 swivelTarget.visible = false;
 scene.add(swivelTarget);
 
+// Floor target for the toe-caress drag (startToeCaress): a flat ring lying on
+// the floor where the big toe rests. The gizmo moves it in the floor plane
+// only; the holder stays unrotated so the gizmo axes stay world-aligned.
+const caressTarget = new THREE.Object3D();
+{
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(0.02, 0.035, 24),
+    new THREE.MeshBasicMaterial({ color: 0xffe08a, side: THREE.DoubleSide, transparent: true, opacity: 0.85 }),
+  );
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.y = 0.002;
+  caressTarget.add(ring);
+}
+caressTarget.visible = false;
+scene.add(caressTarget);
+
+// Drag handle for the Move-hips mode: sits at the pelvis; dragging it slides
+// the hips (and, rigidly, everything above) while planted feet stay put.
+const hipsTarget = new THREE.Mesh(
+  new THREE.SphereGeometry(0.028, 14, 10),
+  new THREE.MeshBasicMaterial({ color: 0xc9a2ff, transparent: true, opacity: 0.85 }),
+);
+hipsTarget.visible = false;
+scene.add(hipsTarget);
+
 // The two-bone chain whose middle joint is `jointName` (elbow/knee), or null.
 function swivelChainFor(jointName) {
   for (const chain of Object.values(IK_CHAINS)) {
@@ -372,11 +401,32 @@ const CHAIN_JOINTS = new Set([
 // Walking: the free foot lands STEP_STRIDE·H ahead of the planted foot, the body
 // rolls STEP_ADVANCE of that stride forward per step, and the pelvis sits at
 // WALK_PELVIS·H — a slight walking crouch, since a fully straight leg (the rest
-// pose) can only reach straight down, so the hip must drop for the foot to reach
-// forward and still touch the floor.
-const STEP_STRIDE = 0.20;
+// pose) can only reach straight down. The crouch is shallower than the legs
+// alone would need: the foot roll extends each leg's reach the rest of the way
+// (the front heel-strike pivots the ankle in around the heel, the trailing
+// heel peels because the leg has run out of length — which is exactly why real
+// heels peel).
+const STEP_STRIDE = 0.24;
 const STEP_ADVANCE = 0.5;
 const WALK_PELVIS = 0.51;
+
+// Gait shaping — the step ends on the classic double-support "contact" moment
+// (heel just struck ahead, trailing foot pushing off the ball) and animates
+// through the tango collection (the free foot brushes past the support ankle,
+// caressing the floor). Tango walks level — the crouch height holds throughout,
+// no vertical bob; the pelvis yaws into the step while the chest counter-yaws
+// so the shoulders stay with the partner (dissociation).
+const STEP_DURATION = 0.55;      // seconds a step plays over (a re-press snaps it)
+const HEEL_STRIKE_DEG = 12;      // stepping forward: land heel first, toe up
+const TOE_LAND_DEG = 30;         // stepping backward: reach with a pointed toe
+const SUPPORT_ROLL_DEG = 28;     // forward: the trailing foot peels onto the ball
+const SUPPORT_RELEASE_DEG = -8;  // backward: the leading foot releases toe-up instead
+const SWING_LIFT = 0.010;        // the swing foot caresses the floor, barely lifted (·H)
+const BRUSH_FRAC = 0.030;        // collection: swing ankle passes this close to the support (·H)
+const STEP_DISSOC_DEG = 6;       // pelvis yaw into the step (chest counter-yaws)
+const STEP_SWAY = 0.010;         // transient weight shift over the support foot (·H)
+
+const smoothstep = (u) => u * u * (3 - 2 * u);
 
 // The dancer's forward on the floor (local +Z projected onto the ground plane).
 function figureForward(figure, out = new THREE.Vector3()) {
@@ -396,12 +446,169 @@ function rotateAbout(figure, point, dYaw) {
   figure.group.updateMatrixWorld(true);
 }
 
-// One footfall for `figure` (dir +1 forward, -1 back): the support foot holds its
-// spot on the floor while the body rolls forward over it and the free foot swings
-// a stride ahead, both landing flat. Which foot swings alternates (the trailing
-// foot leads), so repeated calls walk. Uses the two-bone leg IK to plant the feet
-// and a walking crouch so the legs can reach.
-function takeStep(figure, dir) {
+// Reach one leg's ankle toward `target` (where the ankle would sit with a FLAT
+// sole) and shape the foot by `pitchDeg`: plantarflex > 0 rolls onto the ball /
+// points the toe, dorsiflex < 0 lands the heel with the toe up. The pitch is a
+// rotation of the whole foot about its ground contact — the ball for a roll,
+// the heel for a heel-strike — so the ankle target itself swings along that
+// arc (up-and-forward for a heel-off, up-and-back for a toe-up). Pitching in
+// place around a rest-height ankle instead digs the sole into the floor, and
+// the ground correction then folds the knee into a squat chasing it. Finally
+// the target is nudged vertically so the foot's lowest sole corner sits
+// exactly on the floor (`ground`), or merely never below it (a swing foot
+// mid-flight); iterated because re-solving the leg tips the shank, which
+// moves the sole.
+function plantFoot(figure, side, target, pitchDeg = 0, ground = true) {
+  const chain = { root: `hip_${side}`, mid: `knee_${side}`, effector: `ankle_${side}`, hingeSign: 1 };
+  const t = target.clone();
+  let pitch = pitchDeg;
+  if (pitch) {
+    const H = figure.height;
+    const fwd = figureForward(figure);
+    const lat = new THREE.Vector3().crossVectors(fwd, _UP).normalize();
+    // Flat-foot contact point the pitch pivots about (toes node / heel corner).
+    const pivot = pitch > 0
+      ? target.clone().addScaledVector(fwd, 0.090 * H).addScaledVector(_UP, -0.030 * H)
+      : target.clone().addScaledVector(fwd, -0.033 * H).addScaledVector(_UP, -0.035 * H);
+    const flatVec = target.clone().sub(pivot);
+    const hip = figure.worldPos(`hip_${side}`, new THREE.Vector3());
+    const reach = (Math.abs(JOINT_BY_NAME[`knee_${side}`].offset[1])
+      + Math.abs(JOINT_BY_NAME[`ankle_${side}`].offset[1])) * H;
+    const arced = (deg) => flatVec.clone()
+      .applyQuaternion(new THREE.Quaternion().setFromAxisAngle(lat, -deg * DEG)).add(pivot);
+    if (ground) {
+      // Arcing the ankle up shortens the hip→ankle distance, and two-bone IK
+      // absorbs ALL such slack in the knee — a 28° heel-off around a planted
+      // ball would fold the knee to ~75°, a squat no walker makes. A real
+      // push-off leg stays long: peel the heel only as far as keeps the leg
+      // out near its reach (0.95·reach ≈ a 36° knee, the same bend the
+      // authored trailing-grazing-toe preset carries).
+      while (Math.abs(pitch) > 1 && hip.distanceTo(arced(pitch)) < 0.95 * reach) {
+        pitch -= pitchDeg / 8;
+      }
+      if (Math.abs(pitch) <= 1) pitch = 0;
+    }
+    if (pitch) t.copy(arced(pitch));
+  }
+  for (let i = 0; i < 4; i++) {
+    solveTwoBone(figure, chain, t);
+    flattenFoot(figure, side, pitch * DEG);
+    const low = figure.footLowY(side);
+    if (low < -1e-4 || (ground && low > 1e-4)) t.y -= low;
+    else break;
+  }
+}
+
+// Floor-caress leg control: pose `side`'s leg so its TOE PAD rests exactly on
+// the floor at `pt` (world XZ) — the tango lápiz / tendu. The foot stays flat
+// while the target is under the body and rolls up onto a pointed toe as the
+// leg reaches away; hip, knee, ankle and toes absorb all of the movement. The
+// toe pad is the pinned contact (all other sole corners share its plane or
+// sit behind it), so the sole never digs below the floor and the caress can
+// never lift the body — clampToFloor reacts only to penetration.
+function caressToe(figure, side, pt) {
+  const H = figure.height;
+  const chain = { root: `hip_${side}`, mid: `knee_${side}`, effector: `ankle_${side}`, hingeSign: 1 };
+  const ankleNode = figure.nodes[`ankle_${side}`];
+  const toesNode = figure.nodes[`toes_${side}`];
+  figure.nodes[`toes_${side}`].rotation.set(0, 0, 0); // pads stay in the sole plane
+  figure.group.updateMatrixWorld(true);
+
+  // The contact point: this figure's toe-pad center (midpoint of its fitted
+  // toe corners), in the toes joint's frame.
+  const tc = figure.toeCorners[`_${side}`];
+  const pad = new THREE.Vector3(
+    (tc[0][0] + tc[1][0]) / 2, (tc[0][1] + tc[1][1]) / 2, (tc[0][2] + tc[1][2]) / 2,
+  ).multiplyScalar(H);
+
+  // Clamp the target inside the leg's reach (leg long + foot pointed) so the
+  // solve converges with the toe ON the floor instead of hovering toward an
+  // unreachable spot.
+  const hip = figure.worldPos(`hip_${side}`, new THREE.Vector3());
+  const legLen = (Math.abs(JOINT_BY_NAME[`knee_${side}`].offset[1])
+    + Math.abs(JOINT_BY_NAME[`ankle_${side}`].offset[1])) * H;
+  const toesOff = JOINT_BY_NAME[`toes_${side}`].offset;
+  const footLen = pad.clone().add(new THREE.Vector3(toesOff[0] * H, toesOff[1] * H, toesOff[2] * H)).length();
+  const maxR = Math.sqrt(Math.max(0, (legLen + footLen) ** 2 - hip.y ** 2)) * 0.99;
+  const target = new THREE.Vector3(pt.x - hip.x, 0, pt.z - hip.z);
+  if (target.length() > maxR) target.setLength(maxR);
+  target.x += hip.x;
+  target.z += hip.z;
+
+  // The leg pose the reach probes below restore to.
+  const padW = new THREE.Vector3();
+  const names = [`hip_${side}`, `knee_${side}`, `ankle_${side}`, `toes_${side}`];
+  const saved = names.map((n) => figure.nodes[n].rotation.clone());
+
+  // Solve the leg toward a floor point; returns how far the pad ends off the
+  // floor. Restores the entry pose first so repeated probes are independent.
+  const solveAt = (tx, tz) => {
+    names.forEach((n, i) => figure.nodes[n].rotation.copy(saved[i]));
+    figure.nodes[`toes_${side}`].rotation.set(0, 0, 0); // pads stay in the sole plane
+    for (let i = 0; i < 12; i++) {
+      figure.group.updateMatrixWorld(true);
+      padW.copy(pad);
+      toesNode.localToWorld(padW);
+      const ex = tx - padW.x;
+      const ey = -padW.y;
+      const ez = tz - padW.z;
+      if (Math.hypot(ex, ey, ez) < 5e-4 && figure.footLowY(side) > -1e-4) break;
+      // Carry the ankle by the toe error, then pitch the foot about the ankle
+      // so the pad lands back on the floor (flattenFoot aimed at y = 0).
+      const ankleT = figure.worldPos(`ankle_${side}`, new THREE.Vector3());
+      ankleT.x += ex; ankleT.y += ey; ankleT.z += ez;
+      solveTwoBone(figure, chain, ankleT);
+      figure.group.updateMatrixWorld(true);
+      const A = figure.worldPos(`ankle_${side}`, new THREE.Vector3());
+      padW.copy(pad);
+      toesNode.localToWorld(padW);
+      const horiz = Math.hypot(padW.x - A.x, padW.z - A.z);
+      if (horiz > 1e-5) {
+        ankleNode.rotation.x += Math.atan2(padW.y, horiz);
+        figure.clampJoint(`ankle_${side}`);
+      }
+      // If pinning the pad under a low ankle dorsiflexed the heel into the
+      // floor, sit the sole flat instead; the next pass raises the ankle.
+      figure.group.updateMatrixWorld(true);
+      if (figure.footLowY(side) < -1e-4) flattenFoot(figure, side);
+    }
+    figure.group.updateMatrixWorld(true);
+    padW.copy(pad);
+    toesNode.localToWorld(padW);
+    return padW.y;
+  };
+
+  // The distance clamp above is isotropic, but joint limits make the true
+  // reach directional (hip extension caps the back reach, ab/adduction the
+  // sides). If the toe can't get DOWN to the floor at the target, pull the
+  // target in toward the point directly below the hip until it can — the toe
+  // stays ON the floor at the farthest reachable point instead of floating
+  // toward the cursor. Bisecting along this hip ray (not the drag path) keeps
+  // reachability monotone: every point on it is a plain tendu, from a
+  // collected foot at the hip out to the limit boundary.
+  if (solveAt(target.x, target.z) > 0.003) {
+    let lo = 0;
+    let hi = 1;
+    for (let it = 0; it < 7; it++) {
+      const mid = (lo + hi) / 2;
+      const y = solveAt(
+        hip.x + (target.x - hip.x) * mid,
+        hip.z + (target.z - hip.z) * mid,
+      );
+      if (y < 0.003) lo = mid; else hi = mid;
+    }
+    solveAt(hip.x + (target.x - hip.x) * lo, hip.z + (target.z - hip.z) * lo);
+  }
+  figure.group.updateMatrixWorld(true);
+}
+
+// Capture one footfall for `figure` (dir +1 forward, -1 back) as a step state:
+// the support foot holds its floor spot while the body rolls over it and the
+// free foot swings a stride ahead. Which foot swings alternates (the trailing
+// foot leads), so repeated calls walk. The state is posed by poseStep(u) —
+// u = 1 is the finished contact pose; smaller u are the roll-through, with the
+// swing foot collecting past the support ankle.
+function beginStep(figure, dir, strideM = null, forceSwing = null) {
   const H = figure.height;
   const g = figure.group;
   g.updateMatrixWorld(true);
@@ -409,45 +616,127 @@ function takeStep(figure, dir) {
   const lat = new THREE.Vector3().crossVectors(fwd, _UP).normalize();
   const travel = fwd.clone().multiplyScalar(dir);
   const ankleRestY = 0.039 * H;
-  const stride = STEP_STRIDE * H;
+  // A linked partner steps the INITIATOR's stride (see stepFigure): two
+  // different strides walk the couple apart a few cm per step until they
+  // rest foot-against-foot — a follower really does match the leader's
+  // step length.
+  const stride = strideM ?? STEP_STRIDE * H;
 
   const aL = figure.worldPos('ankle_L', new THREE.Vector3());
   const aR = figure.worldPos('ankle_R', new THREE.Vector3());
   const pL = aL.dot(travel);
   const pR = aR.dot(travel);
   let swing;
-  if (Math.abs(pL - pR) > 0.02 * H) swing = pL < pR ? 'L' : 'R'; // trailing foot swings through
+  if (forceSwing) swing = forceSwing;                            // linked partner mirrors the leader
+  else if (Math.abs(pL - pR) > 0.02 * H) swing = pL < pR ? 'L' : 'R'; // trailing foot swings through
   else swing = figure.__swing === 'L' ? 'R' : 'L';               // collected stance: alternate
   const support = swing === 'L' ? 'R' : 'L';
+  figure.__swing = swing;
 
   // Support foot: hold its floor spot (its current XZ, dropped to rest height).
   const supPos = (support === 'L' ? aL : aR).clone();
   supPos.y = ankleRestY;
   // Swing foot: land it a stride ahead of the support foot along travel, keeping
   // its lateral offset so the feet stay on their own rails.
-  const swCur = swing === 'L' ? aL : aR;
-  const latOff = swCur.clone().sub(supPos).dot(lat);
+  const swStart = (swing === 'L' ? aL : aR).clone();
+  const latOff = swStart.clone().sub(supPos).dot(lat);
   const swPos = supPos.clone().addScaledVector(travel, stride).addScaledVector(lat, latOff);
   swPos.y = ankleRestY;
 
-  // Drop into a walking crouch (a straight leg can only reach straight down) and
-  // roll the body forward over the support foot.
-  figure.nodes.pelvis.position.y = Math.min(figure.nodes.pelvis.position.y, WALK_PELVIS * H);
-  g.position.addScaledVector(travel, stride * STEP_ADVANCE);
+  // Dissociation: the stepping side's hip leads the stride; the chest
+  // counter-yaws by the same amount so the shoulders (and the embrace) keep
+  // facing the partner — their yaw sum is preserved, not zeroed, so an
+  // authored trunk twist survives the walk.
+  const yawSign = (swing === 'L' ? -1 : 1) * dir;
+  const pelvisYawStart = figure.nodes.pelvis.rotation.y;
+  const chestYawStart = figure.nodes.chest.rotation.y;
+  const pelvisYawEnd = yawSign * STEP_DISSOC_DEG * DEG;
+  const chestYawEnd = chestYawStart + pelvisYawStart - pelvisYawEnd;
+
+  // The body ends STEP_ADVANCE of the way between the two planted feet —
+  // anchored along the travel line to the SUPPORT FOOT, not accumulated from
+  // the body's own position: accumulating 0.5·stride per step while the feet
+  // leapfrog a full stride leaves the body drifting back over the support
+  // foot, with the front foot landing a full stride ahead — beyond the
+  // leg's reach, so it floated. The dancer's own stance offset (how far the
+  // body rides ahead of the feet midpoint — the apilado/close-embrace lean
+  // carries the feet behind the chest) is measured and preserved, so a
+  // leaning couple doesn't get snapped apart by the anchoring. Only the
+  // along-travel coordinate is corrected; the lateral stays the body's own.
+  const stanceOffset = THREE.MathUtils.clamp(
+    g.position.clone().sub(aL.clone().add(aR).multiplyScalar(0.5)).dot(travel),
+    -0.05 * H, 0.05 * H,
+  );
+  const alongCorr = supPos.clone().sub(g.position).dot(travel)
+    + STEP_ADVANCE * stride + stanceOffset;
+  return {
+    dir, swing, support, supPos, swStart, swPos, latOff, travel, lat,
+    H, ankleRestY, stride,
+    bodyStart: g.position.clone(),
+    bodyEnd: g.position.clone().addScaledVector(travel, alongCorr),
+    // Walking crouch: a straight leg can only reach straight down, so the
+    // pelvis eases down to where the reaching legs can touch the floor.
+    pelvisYStart: figure.nodes.pelvis.position.y,
+    pelvisYEnd: Math.min(figure.nodes.pelvis.position.y, WALK_PELVIS * H),
+    pelvisYawStart, pelvisYawEnd, chestYawStart, chestYawEnd,
+    swingPitchStart: figure.nodes[`ankle_${swing}`].rotation.x,
+    swingPitchEnd: (dir > 0 ? -HEEL_STRIKE_DEG : TOE_LAND_DEG) * DEG,
+  };
+}
+
+// Pose one moment of a step, u ∈ [0, 1].
+function poseStep(figure, st, u) {
+  const g = figure.group;
+  const H = st.H;
+
+  // Body: roll along the travel line, bowing transiently sideways over the
+  // support foot (the weight really passes onto it at mid-step) — the bow
+  // returns to the line by u = 1, so nothing accumulates across steps.
+  const swaySign = Math.sign(st.supPos.clone().sub(st.bodyEnd).dot(st.lat)) || 1;
+  g.position.lerpVectors(st.bodyStart, st.bodyEnd, u)
+    .addScaledVector(st.lat, swaySign * STEP_SWAY * H * Math.sin(Math.PI * u));
+  figure.nodes.pelvis.position.y = THREE.MathUtils.lerp(st.pelvisYStart, st.pelvisYEnd, Math.min(1, 2 * u));
+  figure.nodes.pelvis.rotation.y = THREE.MathUtils.lerp(st.pelvisYawStart, st.pelvisYawEnd, u);
+  figure.nodes.chest.rotation.y = THREE.MathUtils.lerp(st.chestYawStart, st.chestYawEnd, u);
+  figure.clampJoint('chest');
   g.updateMatrixWorld(true);
 
-  // Plant both feet flat on the floor at their targets (the knees bend to reach).
-  for (const [side, pos] of [[support, supPos], [swing, swPos]]) {
-    solveTwoBone(figure, { root: `hip_${side}`, mid: `knee_${side}`, effector: `ankle_${side}`, hingeSign: 1 }, pos);
-    flattenFoot(figure, side);
-  }
+  // Support foot: hold its spot. Stepping forward it peels onto the ball as
+  // the body passes over (heel-off — the ankle rises, the toe pad keeps the
+  // floor); stepping backward the leading foot releases toe-up instead,
+  // heel grounded.
+  const roll = smoothstep(THREE.MathUtils.clamp((u - 0.35) / 0.65, 0, 1));
+  const supPitch = (st.dir > 0 ? SUPPORT_ROLL_DEG : SUPPORT_RELEASE_DEG) * roll;
+  plantFoot(figure, st.support, st.supPos, supPitch, true);
 
-  // Settle the lowest point onto the floor, then let the loop's clamp hold it.
+  // Swing foot: travel to its landing, collecting past the support ankle
+  // (the tango brush) while caressing the floor, and pitch from however it
+  // left the ground to its landing attitude (heel-first forward, pointed
+  // toe backward).
+  const swTarget = new THREE.Vector3().lerpVectors(st.swStart, st.swPos, u);
+  const brushLat = Math.sign(st.latOff || (st.swing === 'L' ? -1 : 1)) * BRUSH_FRAC * H;
+  swTarget.addScaledVector(st.lat, (brushLat - st.latOff) * Math.sin(Math.PI * u));
+  swTarget.y += SWING_LIFT * H * Math.sin(Math.PI * u);
+  const swPitch = THREE.MathUtils.lerp(st.swingPitchStart, st.swingPitchEnd, u) / DEG;
+  // Mid-flight the foot only must not pierce the floor; at u = 1 it lands.
+  plantFoot(figure, st.swing, swTarget, swPitch, u >= 1);
+
   g.updateMatrixWorld(true);
+  figure.syncAtlasNodes();
+}
+
+// Finish a step: the contact pose, settled onto the floor.
+function finalizeStep(figure, st) {
+  poseStep(figure, st, 1);
+  const g = figure.group;
   g.position.y -= figure.lowestPointY();
   g.updateMatrixWorld(true);
   figure.syncAtlasNodes();
-  figure.__swing = swing;
+}
+
+// One immediate footfall (no animation) — scripts and the couple's snap path.
+function takeStep(figure, dir) {
+  finalizeStep(figure, beginStep(figure, dir));
 }
 
 const app = {
@@ -457,6 +746,8 @@ const app = {
   // Smallest surface clearance between the two dancers' body colliders
   // (negative = penetration) — for the dev verification scripts.
   bodyClearance: () => bodyClearance(leader, follower),
+  // The tightest collider pairs by name, tightest first — for radius tuning.
+  bodyContacts: (n = 5) => bodyContacts(leader, follower).slice(0, n),
   figures: [leader, follower],
   presets: PRESETS,
   mode: 'rotate',
@@ -467,6 +758,8 @@ const app = {
   swivelState: null, // { figure, chain } while dragging an elbow/knee pole handle
   ckc: null, // { node, matrix } captured while dragging in closed-chain mode
   linkCouple: false, // move/turn/step act on both dancers as one unit
+  stepAnims: [], // in-flight walking steps ({ figure, st, t }), advanced by the loop
+  animateSteps: true, // steps play through the roll/collection (false = snap)
   coupleDrag: null, // start transforms captured while dragging a linked couple
   figDragY: null, // root height captured when a figure drag starts
   interpStates: null, // { A, B } couple states driving the A→B scrubber
@@ -534,17 +827,41 @@ const app = {
     }
     figure.group.updateMatrixWorld(true);
     const contacts = footContactsBySide(figure);
-    const planted = ['L', 'R'].filter((side) => contacts[side].length > 0).map((side) => {
+    this.moveHips(figure, { x: 0, y: y - figure.nodes.pelvis.position.y, z: 0 },
+      { L: contacts.L.length > 0, R: contacts.R.length > 0 });
+  },
+
+  // Which feet the Move-hips mode keeps planted (UI checkboxes in the topbar;
+  // auto-set from floor contact when a dancer is picked in that mode).
+  hipsPlant: { L: true, R: true },
+
+  // Translate a dancer's hips: the pelvis and everything above move together
+  // (no posture angle changes), while each foot marked planted keeps its world
+  // position AND sole orientation — the planted leg's hip/knee/ankle re-solve
+  // to accommodate, as far as the joint limits allow. Unplanted legs ride
+  // along rigidly. Horizontal goes through the figure root, vertical through
+  // the pelvis joint (a crouch/rise, clamped to the hip-height slider range).
+  // Returns the vertical delta actually applied.
+  moveHips(figure, delta, planted = this.hipsPlant) {
+    figure.group.updateMatrixWorld(true);
+    const keep = [];
+    for (const side of ['L', 'R']) {
+      if (!planted[side]) continue;
       const ankle = figure.nodes[`ankle_${side}`];
-      return {
+      keep.push({
         side,
         pos: ankle.getWorldPosition(new THREE.Vector3()),
         quat: ankle.getWorldQuaternion(new THREE.Quaternion()),
-      };
-    });
-    figure.nodes.pelvis.position.y = y;
+      });
+    }
+    const H = figure.height;
+    const py = THREE.MathUtils.clamp(figure.nodes.pelvis.position.y + (delta.y || 0), 0.34 * H, 0.58 * H);
+    const dy = py - figure.nodes.pelvis.position.y;
+    figure.group.position.x += delta.x || 0;
+    figure.group.position.z += delta.z || 0;
+    figure.nodes.pelvis.position.y = py;
     figure.group.updateMatrixWorld(true);
-    for (const { side, pos, quat } of planted) {
+    for (const { side, pos, quat } of keep) {
       solveTwoBone(figure, {
         root: `hip_${side}`, mid: `knee_${side}`, effector: `ankle_${side}`, hingeSign: 1,
       }, pos);
@@ -554,7 +871,9 @@ const app = {
       ankle.quaternion.copy(parentQ.invert().multiply(quat));
       figure.clampJoint(`ankle_${side}`);
     }
+    figure.syncAtlasNodes();
     figure.group.updateMatrixWorld(true);
+    return dy;
   },
 
   setChainMode(mode) {
@@ -650,15 +969,37 @@ const app = {
   stepFigure(figure, dir = 1) {
     this.pushHistory();
     this.activeFigure = figure;
-    takeStep(figure, dir);
+    const led = this.beginFigureStep(figure, dir);
     if (this.linkCouple) {
       const partner = this.figures.find((f) => f !== figure);
       if (partner && partner.group.visible) {
         const sameWay = figureForward(figure).dot(figureForward(partner)) >= 0;
-        takeStep(partner, sameWay ? dir : -dir);
+        // The partner matches the initiator's stride AND mirrors the foot
+        // (his left pairs her right): a facing couple's same-letter feet are
+        // on opposite rails, so same-foot stepping drives the stepping leg
+        // into the partner's standing leg and the couple jams leg-on-leg.
+        // Facing the same way (shadow position) the feet pair unmirrored.
+        this.beginFigureStep(partner, sameWay ? dir : -dir, STEP_STRIDE * figure.height,
+          sameWay ? led.swing : (led.swing === 'L' ? 'R' : 'L'));
       }
     }
     if (this.ui) this.ui.onPoseChanged();
+  },
+
+  // Start one figure's step, animated through the roll/collection by the
+  // render loop (animateSteps off = snap to the finished contact pose, the
+  // old behavior). A re-press mid-step snaps the running step to its end
+  // first, so rapid stepping stays responsive and never double-poses a leg.
+  beginFigureStep(figure, dir, strideM = null, forceSwing = null) {
+    const i = this.stepAnims.findIndex((a) => a.figure === figure);
+    if (i >= 0) {
+      finalizeStep(figure, this.stepAnims[i].st);
+      this.stepAnims.splice(i, 1);
+    }
+    const st = beginStep(figure, dir, strideM, forceSwing);
+    if (this.animateSteps) this.stepAnims.push({ figure, st, t: 0 });
+    else finalizeStep(figure, st);
+    return st;
   },
 
   // Slide a figure across the floor along its facing (Move-mode keyboard nudge);
@@ -748,8 +1089,12 @@ const app = {
     this.activeFigure = null;
     this.ikState = null;
     this.swivelState = null;
+    this.caressState = null;
+    this.hipsState = null;
     ikTarget.visible = false;
     swivelTarget.visible = false;
+    caressTarget.visible = false;
+    hipsTarget.visible = false;
     tcontrols.detach();
     if (this.ui) this.ui.onSelectionChanged();
   },
@@ -817,6 +1162,60 @@ const app = {
     if (chain) swivelLimb(figure, chain, new THREE.Vector3(target.x, target.y, target.z));
   },
 
+  // Drag a leg by its toe with the big toe kept ON the floor: a ring target
+  // slides in the floor plane and the leg re-solves so the toe pad caresses
+  // it — flat foot under the body, rolling up to a point as it reaches away
+  // (see caressToe). Started by clicking a toes joint in Drag limb mode.
+  startToeCaress(figure, side) {
+    this.deselect();
+    this.selected = { figure, jointName: `toes_${side}` };
+    this.chainMode = 'open';
+    const sphere = figure.jointSphereByName[`toes_${side}`];
+    if (sphere) sphere.material.emissive.set(0x3b6ea5);
+    this.caressState = { figure, side };
+    figure.group.updateMatrixWorld(true);
+    const tc = figure.toeCorners[`_${side}`];
+    const pad = new THREE.Vector3(
+      (tc[0][0] + tc[1][0]) / 2, (tc[0][1] + tc[1][1]) / 2, (tc[0][2] + tc[1][2]) / 2,
+    ).multiplyScalar(figure.height);
+    figure.nodes[`toes_${side}`].localToWorld(pad);
+    caressTarget.position.set(pad.x, 0, pad.z);
+    caressTarget.visible = true;
+    tcontrols.setMode('translate');
+    tcontrols.showX = tcontrols.showZ = true;
+    tcontrols.showY = false;
+    tcontrols.attach(caressTarget);
+    if (this.ui) this.ui.onSelectionChanged();
+  },
+
+  // Scriptable caress (headless verification): big toe to (x, z) on the floor.
+  caressFoot(figure, side, pt) {
+    caressToe(figure, side, new THREE.Vector3(pt.x, 0, pt.z));
+    figure.syncAtlasNodes();
+    figure.group.updateMatrixWorld(true);
+  },
+
+  // PNG snapshot of the current 3D view, gizmos and drag handles hidden.
+  photoDataURL() {
+    const hidden = [];
+    for (const o of [tcontrols, ikTarget, swivelTarget, caressTarget, hipsTarget]) {
+      if (o.visible) { hidden.push(o); o.visible = false; }
+    }
+    renderer.render(scene, camera);
+    const url = renderer.domElement.toDataURL('image/png');
+    for (const o of hidden) o.visible = true;
+    return url;
+  },
+
+  // Download the snapshot as tangle-<timestamp>.png (the 📷 Photo button).
+  capturePhoto() {
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    const a = document.createElement('a');
+    a.href = this.photoDataURL();
+    a.download = `tangle-${stamp}.png`;
+    a.click();
+  },
+
   selectFigure(figure) {
     this.deselect();
     this.activeFigure = figure;
@@ -828,6 +1227,20 @@ const app = {
       tcontrols.setMode('translate');
       tcontrols.showX = tcontrols.showZ = true;
       tcontrols.showY = false;
+    } else if (this.mode === 'hips') {
+      // Move-hips: a handle at the pelvis, draggable on all three axes. The
+      // planted-feet checkboxes default to whichever feet touch the floor.
+      figure.group.updateMatrixWorld(true);
+      const contacts = footContactsBySide(figure);
+      this.hipsPlant = { L: contacts.L.length > 0, R: contacts.R.length > 0 };
+      figure.worldPos('pelvis', hipsTarget.position);
+      hipsTarget.userData.figure = figure;
+      hipsTarget.visible = true;
+      this.hipsState = { figure, last: hipsTarget.position.clone() };
+      tcontrols.attach(hipsTarget);
+      tcontrols.setMode('translate');
+      tcontrols.showX = tcontrols.showY = tcontrols.showZ = true;
+      if (this.ui) this.ui.onHipsPlantChanged();
     }
   },
 
@@ -923,6 +1336,12 @@ app.muscles = muscleMeshes
 tcontrols.addEventListener('dragging-changed', (e) => {
   if (!e.value) { app.ckc = null; app.coupleDrag = null; app.figDragY = null; return; }
   app.pushHistory();
+  if (app.hipsState && tcontrols.object === hipsTarget) {
+    // Hips drag: deltas accumulate from here (see the objectChange handler);
+    // the figure-drag captures below must not see the handle as a figure.
+    app.hipsState.last.copy(hipsTarget.position);
+    return;
+  }
   if (!app.selected && tcontrols.object?.userData.figure) {
     app.figDragY = tcontrols.object.position.y;
   }
@@ -956,6 +1375,22 @@ tcontrols.addEventListener('objectChange', () => {
   } else if (app.swivelState) {
     // The pole handle stays where dragged; the elbow swivels to aim at it.
     swivelLimb(app.swivelState.figure, app.swivelState.chain, swivelTarget.position);
+    if (app.ui) app.ui.refreshJointValues();
+  } else if (app.caressState) {
+    // The ring stays on the floor; the leg re-solves so the toe pad rests on it.
+    caressTarget.position.y = 0;
+    caressToe(app.caressState.figure, app.caressState.side, caressTarget.position);
+    if (app.ui) app.ui.refreshJointValues();
+  } else if (app.hipsState && tcontrols.object === hipsTarget) {
+    // Hips drag: apply the handle's delta; planted feet stay put via leg IK.
+    // The vertical axis clamps at the crouch range — track the applied height
+    // so a clamped drag can't accumulate.
+    const { figure, last } = app.hipsState;
+    const delta = hipsTarget.position.clone().sub(last);
+    const dy = app.moveHips(figure, delta, app.hipsPlant);
+    last.copy(hipsTarget.position);
+    last.y += dy - delta.y;
+    hipsTarget.position.y = last.y;
     if (app.ui) app.ui.refreshJointValues();
   } else if (app.selected) {
     app.selected.figure.clampJoint(app.selected.jointName);
@@ -1035,7 +1470,7 @@ renderer.domElement.addEventListener('pointermove', (e) => {
   pointerRay(e);
   const visible = app.visibleFigures();
 
-  if (app.mode === 'move' || app.mode === 'step') {
+  if (app.mode === 'move' || app.mode === 'step' || app.mode === 'hips') {
     clearHover();
     const hits = raycaster.intersectObjects(visible.map((f) => f.group), true);
     renderer.domElement.style.cursor = hits.some((h) => h.object.visible) ? 'pointer' : '';
@@ -1053,7 +1488,7 @@ function handleClick(e) {
   pointerRay(e);
 
   const visible = app.visibleFigures();
-  if (app.mode === 'move' || app.mode === 'step') {
+  if (app.mode === 'move' || app.mode === 'step' || app.mode === 'hips') {
     const hits = raycaster.intersectObjects(visible.map((f) => f.group), true);
     const hit = hits.find((h) => h.object.visible);
     if (hit) {
@@ -1077,7 +1512,11 @@ function handleClick(e) {
   }
   const { figure, jointName } = hits[0].object.userData;
   if (app.mode === 'ik') {
-    if (IK_CHAINS[jointName]) app.startIK(figure, jointName);
+    // The toes start a floor caress (big toe pinned to the floor); the other
+    // effectors keep the free-space IK drag.
+    const toe = jointName.match(/^(?:toes|toe)_(L|R)$/);
+    if (toe) app.startToeCaress(figure, toe[1]);
+    else if (IK_CHAINS[jointName]) app.startIK(figure, jointName);
     else if (swivelChainFor(jointName)) app.startSwivel(figure, jointName);
     // clicks on other joints in drag mode are ignored
   } else {
@@ -1100,6 +1539,10 @@ function embraceEditing() {
   if (tcontrols.dragging && tcontrols.object?.userData.figure) {
     return { figure: tcontrols.object.userData.figure, jointName: null };
   }
+  // A stepping dancer is the active mover: the embrace pull and the body
+  // collision displace the partner, never the dancer mid-step (a leader
+  // walking into the follower moves her — the sacada convention).
+  if (app.stepAnims.length) return { figure: app.stepAnims[0].figure, jointName: null };
   return null;
 }
 
@@ -1133,6 +1576,19 @@ function animate() {
     app.applyInterp(app.interpT);
     if (app.interpTick) app.interpTick(app.interpT);
     if (app.interpT >= 1) app.interpPlaying = false;
+  }
+
+  // Advance in-flight walking steps: roll the body over the support foot,
+  // collect the swing foot past it, land on the contact pose (see poseStep).
+  for (let i = app.stepAnims.length - 1; i >= 0; i--) {
+    const anim = app.stepAnims[i];
+    anim.t += dt;
+    if (anim.t >= STEP_DURATION) {
+      finalizeStep(anim.figure, anim.st);
+      app.stepAnims.splice(i, 1);
+    } else {
+      poseStep(anim.figure, anim.st, smoothstep(anim.t / STEP_DURATION));
+    }
   }
 
   // Keep the embrace through whatever moved this frame: torso contact first

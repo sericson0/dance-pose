@@ -96,7 +96,18 @@ function capsules(figure, armSide = null) {
 // contact, not body penetration. (Arm blocking is a resolver-only safeguard for
 // free posing; see resolveBodyCollision.)
 export function bodyClearance(a, b) {
-  return bodyContacts(a, b)[0]?.clearance ?? Infinity;
+  a.group.updateMatrixWorld(true);
+  b.group.updateMatrixWorld(true);
+  const capsA = capsules(a); // body core only (no arm side named)
+  const capsB = capsules(b);
+  let min = Infinity;
+  for (const ca of capsA) {
+    for (const cb of capsB) {
+      const c = closestSegSeg(ca.p, ca.q, cb.p, cb.q, _c1, _c2) - (ca.r + cb.r);
+      if (c < min) min = c;
+    }
+  }
+  return min;
 }
 
 // All body-core capsule pairs sorted tightest-first: [{ a, b, clearance }] with
@@ -173,46 +184,49 @@ export function resolveBodyCollision(a, b, activeFigure, editedArm = null) {
   const worst = maxPenetrationBetween(capsules(mover), capsOther);
   if (worst.pen <= TOL) return;
 
-  // Horizontal part of the deepest contact's normal; a near-vertical contact
-  // (one body part directly above the other) falls back to the chest-to-chest
-  // direction, and exactly coaxial dancers to world +Z.
-  const dir = worst.onA.clone().sub(worst.onB);
-  dir.y = 0;
-  if (dir.lengthSq() < 1e-6) {
-    dir.copy(mover.worldPos('chest')).sub(other.worldPos('chest'));
-    dir.y = 0;
-  }
-  if (dir.lengthSq() < 1e-8) dir.set(0, 0, 1);
-  dir.normalize();
+  // Horizontal separation directions, best first: the deepest contact's
+  // normal, then the chest-to-chest axis (also covers a near-vertical contact,
+  // one body part directly above the other), then world +Z for exactly coaxial
+  // dancers. Each is tried in turn until one brackets — interleaved limbs can
+  // wedge the deepest contact's normal so no slide along it separates, and
+  // giving up there would leave the dancers inside each other.
+  const candidates = [];
+  const candidate = (v) => {
+    v.y = 0;
+    if (v.lengthSq() > 1e-6) candidates.push(v.normalize());
+  };
+  candidate(worst.onA.clone().sub(worst.onB));
+  candidate(mover.worldPos('chest').sub(other.worldPos('chest')));
+  candidates.push(new THREE.Vector3(0, 0, 1));
 
   const base = mover.group.position.clone();
-  const penAt = (t) => {
-    mover.group.position.copy(base).addScaledVector(dir, t);
-    mover.group.updateMatrixWorld(true);
-    return maxPenetrationBetween(capsules(mover), capsOther).pen;
-  };
-  // Bracket: grow the slide until everything clears (a horizontal slide far
-  // enough along any direction separates two bounded bodies).
-  let hi = worst.pen + SLACK;
-  let bracketed = false;
-  for (let i = 0; i < 10; i++) {
-    if (penAt(hi) <= 0) { bracketed = true; break; }
-    hi *= 2;
-  }
-  if (!bracketed) {
-    // Cannot separate along this direction (should not happen) — stay put
-    // rather than catapult the dancer.
-    mover.group.position.copy(base);
+  for (const dir of candidates) {
+    const penAt = (t) => {
+      mover.group.position.copy(base).addScaledVector(dir, t);
+      mover.group.updateMatrixWorld(true);
+      return maxPenetrationBetween(capsules(mover), capsOther).pen;
+    };
+    // Bracket: grow the slide until everything clears.
+    let hi = worst.pen + SLACK;
+    let bracketed = false;
+    for (let i = 0; i < 10; i++) {
+      if (penAt(hi) <= 0) { bracketed = true; break; }
+      hi *= 2;
+    }
+    if (!bracketed) continue; // wedged along this direction — try the next
+    // Bisect down to the touching point.
+    let lo = 0;
+    for (let i = 0; i < 24 && hi - lo > 0.0005; i++) {
+      const mid = (lo + hi) / 2;
+      if (penAt(mid) > 0) lo = mid;
+      else hi = mid;
+    }
+    mover.group.position.copy(base).addScaledVector(dir, hi + SLACK);
     mover.group.updateMatrixWorld(true);
     return;
   }
-  // Bisect down to the touching point.
-  let lo = 0;
-  for (let i = 0; i < 24 && hi - lo > 0.0005; i++) {
-    const mid = (lo + hi) / 2;
-    if (penAt(mid) > 0) lo = mid;
-    else hi = mid;
-  }
-  mover.group.position.copy(base).addScaledVector(dir, hi + SLACK);
+  // No direction separates (should not happen) — stay put rather than
+  // catapult the dancer.
+  mover.group.position.copy(base);
   mover.group.updateMatrixWorld(true);
 }

@@ -1,5 +1,8 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* [hidden] must win over any class display (e.g. .topbar-check's flex). */
+[hidden] { display: none !important; }
+
 :root {
   --bg: #16181d;
   --panel: #1f232b;
@@ -127,6 +130,27 @@ button.linkish {
   color: var(--accent); text-decoration: underline; cursor: pointer;
 }
 button.linkish:hover { border: none; color: #fff; }
+
+/* Joint grid picker: center joints as a full-width chip row, then the left/
+   right joints as paired two-column rows (halves the list length). */
+#joint-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 10px; }
+#joint-grid button { padding: 4px 6px; font-size: 11.5px; }
+#joint-grid button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+#joint-grid .grid-head {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px;
+  color: var(--muted); text-align: center; padding-top: 2px;
+}
+#joint-grid .grid-center { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 4px; }
+#joint-grid .grid-center button { flex: 1; }
+
+/* Foot map: top-down outline of one foot with the COG drop point */
+#footmap-fig, #footmap-foot { flex: 1; display: flex; }
+#footmap-section .btn-group button { flex: 1; padding: 5px 4px; }
+#footmap-canvas {
+  width: 100%; height: 175px; display: block;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+  margin-bottom: 5px;
+}
 
 /* Joint panel */
 .joint-title { font-weight: 600; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }

@@ -1,5 +1,6 @@
-import { JOINTS, JOINT_BY_NAME, JOINT_TITLES, BODY_PARTS } from './skeletonDef.js';
-import { keyAngles, tangoStats } from './analysis.js';
+import * as THREE from 'three';
+import { JOINT_BY_NAME, JOINT_TITLES, BODY_PARTS } from './skeletonDef.js';
+import { keyAngles, tangoStats, convexHull2D, stabilityMargin } from './analysis.js';
 
 const R2D = 180 / Math.PI;
 const D2R = Math.PI / 180;
@@ -25,13 +26,23 @@ export function initUI(app) {
 
   // ---------------------------------------------------------------- modes
   const modeButtons = [...document.querySelectorAll('#mode-buttons button')];
+  const hipsPlantBox = $('hips-plant');
   const selectMode = (mode) => {
     setActive(modeButtons, (b) => b.dataset.mode === mode);
     app.setMode(mode);
+    // The planted-feet choice only exists while moving the hips.
+    hipsPlantBox.hidden = mode !== 'hips';
   };
   for (const btn of modeButtons) {
     btn.addEventListener('click', () => selectMode(btn.dataset.mode));
   }
+
+  // Move-hips planted feet: auto-set from floor contact when a dancer is
+  // picked (app.selectFigure → onHipsPlantChanged), user-overridable here.
+  const plantL = $('plant-L');
+  const plantR = $('plant-R');
+  plantL.addEventListener('change', () => { app.hipsPlant.L = plantL.checked; });
+  plantR.addEventListener('change', () => { app.hipsPlant.R = plantR.checked; });
 
   // Collapsible sidebar sections: clicking a heading folds it away.
   for (const section of document.querySelectorAll('#sidebar section')) {
@@ -106,6 +117,7 @@ export function initUI(app) {
   for (const btn of document.querySelectorAll('#view-buttons button')) {
     btn.addEventListener('click', () => app.setView(btn.dataset.view));
   }
+  $('photo-btn').addEventListener('click', () => app.capturePhoto());
 
   // ---------------------------------------------------------------- layers
   const syncLayers = () => {
@@ -251,63 +263,68 @@ export function initUI(app) {
   const jointPanel = $('joint-panel');
   const sliderRefs = []; // { input, valEl, node, axis }
 
-  // Joint picker: jump straight to any joint (they're invisible click targets in
-  // body view) without hunting in 3D. A Leader/Follower toggle chooses the dancer.
-  const jointSelect = $('joint-select');
+  // Joint picker: jump straight to any joint (they're invisible click targets
+  // in body view) without hunting in 3D. A Leader/Follower toggle chooses the
+  // dancer; the joints render as a compact grid — the spine/head chips first,
+  // then the left/right joints as PAIRED two-column rows (half the rows of a
+  // flat list, and the columns carry the side so labels stay short).
+  const jointGrid = $('joint-grid');
   const figToggleBtns = [...document.querySelectorAll('#joint-fig-toggle button')];
   const figureForRole = (role) => (role === 'follower' ? app.follower : app.leader);
   const activePickerRole = () =>
     figToggleBtns.find((b) => b.classList.contains('active'))?.dataset.role || 'leader';
+  const jointButtons = new Map(); // jointName -> its grid button
 
-  {
-    const groups = { center: [], L: [], R: [] };
-    for (const def of JOINTS) {
-      if (def.endpoint || !JOINT_TITLES[def.name]) continue;
-      const key = def.name.endsWith('_L') ? 'L' : def.name.endsWith('_R') ? 'R' : 'center';
-      groups[key].push(def);
-    }
-    const addGroup = (label, defs) => {
-      if (!defs.length) return;
-      const og = document.createElement('optgroup');
-      og.label = label;
-      for (const def of defs) {
-        const opt = document.createElement('option');
-        opt.value = def.name;
-        // Keep the full "Left / Right …" title so the closed select stays
-        // unambiguous; the optgroup label just aids scanning the open list.
-        opt.textContent = JOINT_TITLES[def.name] || def.name;
-        og.appendChild(opt);
-      }
-      jointSelect.appendChild(og);
-    };
-    addGroup('Spine & head', groups.center);
-    addGroup('Left side', groups.L);
-    addGroup('Right side', groups.R);
-  }
-
-  const pickJoint = (role) => {
-    const jointName = jointSelect.value; // capture first: selectMode deselects,
-    if (!jointName) return;              // which resets the dropdown via syncJointPicker
+  const pickJoint = (role, jointName) => {
     selectMode('rotate'); // the picker poses a joint, so switch to the rotate gizmo
     app.selectJoint(figureForRole(role), jointName);
   };
-  jointSelect.addEventListener('change', () => {
-    if (!jointSelect.value) { app.deselect(); return; }
-    pickJoint(activePickerRole());
-  });
+
+  {
+    const gridButton = (name, label) => {
+      const btn = document.createElement('button');
+      btn.textContent = label;
+      btn.title = JOINT_TITLES[name] || name;
+      btn.addEventListener('click', () => pickJoint(activePickerRole(), name));
+      jointButtons.set(name, btn);
+      return btn;
+    };
+    const center = document.createElement('div');
+    center.className = 'grid-center';
+    for (const [name, label] of [
+      ['pelvis', 'Pelvis'], ['spine', 'Lumbar'], ['chest', 'Chest'], ['neck', 'Neck'], ['head', 'Head'],
+    ]) center.appendChild(gridButton(name, label));
+    jointGrid.appendChild(center);
+    for (const side of ['Left', 'Right']) {
+      const head = document.createElement('div');
+      head.className = 'grid-head';
+      head.textContent = side;
+      jointGrid.appendChild(head);
+    }
+    for (const [base, label] of [
+      ['scapula', 'Shoulder blade'], ['shoulder', 'Shoulder'], ['elbow', 'Elbow'], ['wrist', 'Wrist'],
+      ['hip', 'Hip'], ['knee', 'Knee'], ['ankle', 'Ankle'], ['toes', 'Toes'],
+    ]) {
+      jointGrid.appendChild(gridButton(`${base}_L`, label));
+      jointGrid.appendChild(gridButton(`${base}_R`, label));
+    }
+  }
+
   figToggleBtns.forEach((btn) => btn.addEventListener('click', () => {
+    const jointName = app.selected?.jointName; // re-select on the chosen dancer
     setActive(figToggleBtns, (b) => b === btn);
-    pickJoint(btn.dataset.role); // re-select the same joint on the chosen dancer
+    if (jointName) pickJoint(btn.dataset.role, jointName);
   }));
 
   // Keep the picker in step with joints selected by clicking in the 3D view.
   function syncJointPicker() {
-    if (app.selected) {
-      jointSelect.value = app.selected.jointName;
-      const role = app.selected.figure === app.follower ? 'follower' : 'leader';
+    const sel = app.selected;
+    for (const [name, btn] of jointButtons) {
+      btn.classList.toggle('active', !!sel && sel.jointName === name);
+    }
+    if (sel) {
+      const role = sel.figure === app.follower ? 'follower' : 'leader';
       setActive(figToggleBtns, (b) => b.dataset.role === role);
-    } else {
-      jointSelect.value = '';
     }
   }
 
@@ -450,6 +467,7 @@ export function initUI(app) {
   }
 
   function updateStats({ a, b, couple }) {
+    renderFootMap({ a, b });
     let html = '';
     if (a) html += figureBlock(app.leader, a, '#7fb3e8');
     if (b) html += figureBlock(app.follower, b, '#e89ab8');
@@ -470,6 +488,180 @@ export function initUI(app) {
         </div>`;
     }
     statsPanel.innerHTML = html;
+  }
+
+  // ---------------------------------------------------------------- foot map
+  // Top-down outline of one foot with the COG's floor point over it — where
+  // the weight falls on the support foot (heel / mid-foot / ball, on or off
+  // the foot). Redrawn with the stats tick (see updateStats).
+  const fmCanvas = $('footmap-canvas');
+  const fmNote = $('footmap-note');
+  const fmFigBtns = [...document.querySelectorAll('#footmap-fig button')];
+  const fmFootBtns = [...document.querySelectorAll('#footmap-foot button')];
+  let fmFig = 'leader';
+  let fmFoot = 'auto'; // 'auto' = the current support foot
+  for (const btn of fmFigBtns) {
+    btn.addEventListener('click', () => {
+      fmFig = btn.dataset.fig;
+      setActive(fmFigBtns, (b) => b === btn);
+    });
+  }
+  for (const btn of fmFootBtns) {
+    btn.addEventListener('click', () => {
+      fmFoot = btn.dataset.foot;
+      setActive(fmFootBtns, (b) => b === btn);
+    });
+  }
+
+  const _fmV = new THREE.Vector3();
+  const _fmW = new THREE.Vector3();
+
+  function renderFootMap(reps) {
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = fmCanvas.clientWidth || 296;
+    const cssH = fmCanvas.clientHeight || 175;
+    if (fmCanvas.width !== Math.round(cssW * dpr)) {
+      fmCanvas.width = Math.round(cssW * dpr);
+      fmCanvas.height = Math.round(cssH * dpr);
+    }
+    const ctx = fmCanvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    const figure = fmFig === 'leader' ? app.leader : app.follower;
+    const rep = fmFig === 'leader' ? reps.a : reps.b;
+    if (!rep || !figure.group.visible) {
+      fmNote.textContent = `${figure.name} is hidden.`;
+      return;
+    }
+    // Which foot: the weighted support foot, else the lower ankle.
+    let side = fmFoot;
+    if (side === 'auto') {
+      side = rep.weight?.support
+        ?? (figure.worldPos('ankle_L', _fmV).y <= figure.worldPos('ankle_R', _fmW).y ? 'L' : 'R');
+    }
+
+    // Sole corners in world, traced around the outline: heel-in, heel-out,
+    // ball-out, toe-out, toe-in, ball-in (foot corner order is hi/ho/bo/bi and
+    // toe corners to/ti — see skeletonDef).
+    const H = figure.height;
+    figure.group.updateMatrixWorld(true);
+    const fc = figure.footCorners[`_${side}`];
+    const tc = figure.toeCorners[`_${side}`];
+    const ankleNode = figure.nodes[`ankle_${side}`];
+    const toesNode = figure.nodes[`toes_${side}`];
+    const corner = (node, [x, y, z]) => {
+      const p = node.localToWorld(_fmV.set(x * H, y * H, z * H));
+      return { x: p.x, z: p.z };
+    };
+    const pts = [
+      corner(ankleNode, fc[0]), corner(ankleNode, fc[1]), corner(ankleNode, fc[2]),
+      corner(toesNode, tc[0]), corner(toesNode, tc[1]), corner(ankleNode, fc[3]),
+    ];
+    const cog = { x: rep.cog.x, z: rep.cog.z };
+    const margin = stabilityMargin(cog, convexHull2D(pts));
+
+    // 2D frame: v runs heel→toe (drawn upward), u lateral. Falls back to the
+    // figure's facing when the foot points straight down.
+    const A = figure.worldPos(`ankle_${side}`, _fmV.clone());
+    const T = figure.worldPos(`toe_${side}`, _fmW.clone());
+    let fx = T.x - A.x;
+    let fz = T.z - A.z;
+    const fLen = Math.hypot(fx, fz);
+    if (fLen < 0.05 * H) {
+      const f = _fmW.set(0, 0, 1).applyQuaternion(figure.group.quaternion);
+      fx = f.x; fz = f.z;
+    }
+    const fn = Math.hypot(fx, fz) || 1;
+    fx /= fn; fz /= fn;
+    const cx = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+    const cz = pts.reduce((s, p) => s + p.z, 0) / pts.length;
+    const toUV = (p) => ({
+      u: (p.x - cx) * fz - (p.z - cz) * fx,
+      v: (p.x - cx) * fx + (p.z - cz) * fz,
+    });
+    const uvPts = pts.map(toUV);
+    const uvCog = toUV(cog);
+
+    // Fit foot + COG in view; the foot never smaller than half the canvas.
+    let minU = Infinity; let maxU = -Infinity; let minV = Infinity; let maxV = -Infinity;
+    for (const p of [...uvPts, uvCog]) {
+      minU = Math.min(minU, p.u); maxU = Math.max(maxU, p.u);
+      minV = Math.min(minV, p.v); maxV = Math.max(maxV, p.v);
+    }
+    const pad = 22;
+    const scale = Math.min(
+      (cssW - 2 * pad) / Math.max(maxU - minU, 1e-6),
+      (cssH - 2 * pad) / Math.max(maxV - minV, 1e-6),
+      (cssH - 2 * pad) / (0.16 * H), // don't zoom in past ~a foot filling the height
+    );
+    const midU = (minU + maxU) / 2;
+    const midV = (minV + maxV) / 2;
+    const px = (p) => ({
+      x: cssW / 2 + (p.u - midU) * scale,
+      y: cssH / 2 - (p.v - midV) * scale,
+    });
+
+    // Foot outline: smooth closed curve through the corners (midpoint quads).
+    const col = fmFig === 'leader' ? '#7fb3e8' : '#e89ab8';
+    const P = uvPts.map(px);
+    ctx.beginPath();
+    const mid = (a2, b2) => ({ x: (a2.x + b2.x) / 2, y: (a2.y + b2.y) / 2 });
+    let m0 = mid(P[P.length - 1], P[0]);
+    ctx.moveTo(m0.x, m0.y);
+    for (let i = 0; i < P.length; i++) {
+      const m1 = mid(P[i], P[(i + 1) % P.length]);
+      ctx.quadraticCurveTo(P[i].x, P[i].y, m1.x, m1.y);
+    }
+    ctx.closePath();
+    ctx.fillStyle = `${col}2e`;
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 1.5;
+    ctx.fill();
+    ctx.stroke();
+
+    // Ball line (where the toes flex) and heel/toe labels.
+    ctx.strokeStyle = `${col}88`;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(P[2].x, P[2].y);
+    ctx.lineTo(P[5].x, P[5].y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#9aa3b2';
+    ctx.font = '9px "Segoe UI", system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    const heelMid = mid(P[0], P[1]);
+    const toeMid = mid(P[3], P[4]);
+    ctx.fillText('heel', heelMid.x, Math.min(heelMid.y + 12, cssH - 4));
+    ctx.fillText('toe', toeMid.x, Math.max(toeMid.y - 6, 9));
+
+    // COG drop point: ring + dot, green over the foot, red off it.
+    const g = px(uvCog);
+    const ok = margin !== null && margin > 0;
+    ctx.strokeStyle = ok ? '#5fce7f' : '#e0645f';
+    ctx.fillStyle = ok ? '#5fce7f' : '#e0645f';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(g.x, g.y, 6.5, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(g.x, g.y, 2.2, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Where along the foot the weight falls (same zones as the stats line).
+    const fAx = T.x - A.x;
+    const fAz = T.z - A.z;
+    const fSq = fAx * fAx + fAz * fAz;
+    let zone = '';
+    if (fSq > 1e-9) {
+      const t = ((cog.x - A.x) * fAx + (cog.z - A.z) * fAz) / fSq;
+      zone = t < 0.35 ? 'over the heel' : (t > 0.7 ? 'over the ball' : 'over the mid-foot');
+    }
+    const cm = margin === null ? null : Math.abs(margin * 100).toFixed(1);
+    fmNote.textContent = margin === null
+      ? `${figure.name} · ${side === 'L' ? 'left' : 'right'} foot`
+      : `${figure.name} · ${side === 'L' ? 'left' : 'right'} foot — COG ${cm} cm ${ok ? `inside, ${zone}` : 'outside the foot'}`;
   }
 
   // ---------------------------------------------------------------- compare
@@ -705,6 +897,11 @@ export function initUI(app) {
     onHistoryChanged() {
       undoBtn.disabled = app.history.length === 0;
       redoBtn.disabled = app.redoStack.length === 0;
+    },
+    // Move-hips mode picked a dancer: mirror its auto-planted feet choice.
+    onHipsPlantChanged() {
+      plantL.checked = app.hipsPlant.L;
+      plantR.checked = app.hipsPlant.R;
     },
     refreshJointValues,
     updateStats,

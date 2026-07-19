@@ -21,7 +21,10 @@ await new Promise((r) => setTimeout(r, 2000));
 const problems = [];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ---- 1. New presets: apply each, check the floor clamp didn't lift anyone.
+// ---- 1. New presets: apply each, check everyone actually stands ON the floor
+// (lowest contact within a toe of y = 0 — neither hovering nor dug in). The
+// root height itself is NOT the gate: a counter-lean pose like the colgada
+// legitimately carries group.y negative while the pinned feet stay grounded.
 const newPresets = ['Back ocho', 'Colgada', 'Volcada', 'Parada', 'Giro'];
 for (const prefix of newPresets) {
   const diag = await page.evaluate(async (pfx) => {
@@ -32,8 +35,8 @@ for (const prefix of newPresets) {
     await new Promise((r) => setTimeout(r, 350)); // let clampToFloor run
     const stats = document.getElementById('stats-panel').innerText.replace(/\n/g, ' | ');
     return {
-      liftL: app.leader.group.position.y,
-      liftF: app.follower.group.position.y,
+      lowL: app.leader.lowestPointY(),
+      lowF: app.follower.lowestPointY(),
       stats,
     };
   }, prefix);
@@ -41,10 +44,10 @@ for (const prefix of newPresets) {
   const slug = prefix.toLowerCase().replace(/[^a-z]+/g, '-');
   await sleep(150);
   await page.screenshot({ path: `${outDir}/preset-${slug}.png` });
-  if (Math.abs(diag.liftL) > 0.02 || Math.abs(diag.liftF) > 0.02) {
-    problems.push(`${prefix}: clamp lift L=${diag.liftL.toFixed(3)} F=${diag.liftF.toFixed(3)}`);
+  if (diag.lowL < -0.005 || diag.lowL > 0.02 || diag.lowF < -0.005 || diag.lowF > 0.02) {
+    problems.push(`${prefix}: floor contact off L=${diag.lowL.toFixed(3)} F=${diag.lowF.toFixed(3)}`);
   }
-  console.log(`--- ${prefix}\n    lift L=${diag.liftL.toFixed(3)} F=${diag.liftF.toFixed(3)}\n    ${diag.stats}`);
+  console.log(`--- ${prefix}\n    low L=${diag.lowL.toFixed(3)} F=${diag.lowF.toFixed(3)}\n    ${diag.stats}`);
 }
 
 // ---- 2. Weight stats on the standing pose: expect a roughly even split.

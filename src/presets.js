@@ -13,17 +13,21 @@ import { feetToFloor } from './ik.js';
 // join the hands there (see embrace.js). Closed side: his right arm wraps
 // around her UNDER her left arm, hers drapes over his to his right shoulder —
 // the swivel authored here is what keeps that layering when the constraints
-// re-solve the arms every frame.
+// re-solve the arms every frame. Heads: the V placement (presets put her
+// slightly toward his closed side) passes her head by his right cheek, so
+// both heads turn a little the same way — his gaze out over the open side,
+// her face nestled toward his right cheek — and tip a few degrees toward
+// each other (temple to temple), chins lifted off the forward body curve.
 function embraceArms(leader, follower) {
   leader.setJointDegrees({
     shoulder_L: { x: -30, y: 30, z: 15 }, elbow_L: { x: -120, y: -30 }, wrist_L: { x: -15 },
     shoulder_R: { x: -55, z: -18, y: 20 }, elbow_R: { x: -70 },
-    spine: { x: 4 }, chest: { x: 4 }, neck: { y: 12 },
+    spine: { x: 4 }, chest: { x: 4 }, neck: { x: -5, y: 12, z: 4 },
   });
   follower.setJointDegrees({
     shoulder_R: { x: -30, y: -30, z: -15 }, elbow_R: { x: -120, y: 30 }, wrist_R: { x: -15 },
     shoulder_L: { x: -65, z: 22 }, elbow_L: { x: -50 },
-    spine: { x: 4 }, chest: { x: 4 }, neck: { y: 12 },
+    spine: { x: 4 }, chest: { x: 4 }, neck: { x: -5, y: 12, z: 4 },
   });
 }
 
@@ -52,6 +56,15 @@ export const PRESETS = [
       place(leader, 0, -0.17, 0);
       place(follower, -0.05, 0.17, 180);
       embraceArms(leader, follower);
+      // Both incline gently into the shared frame (weight toward the balls
+      // of the feet, chests meeting a shade before the hips — the "slight
+      // pyramid" of the close embrace), then re-ground the soles.
+      leader.setJointDegrees({ pelvis: { x: 3 } });
+      follower.setJointDegrees({ pelvis: { x: 3 } });
+      leader.group.updateMatrixWorld(true);
+      follower.group.updateMatrixWorld(true);
+      feetToFloor(leader);
+      feetToFloor(follower);
     },
   },
   {

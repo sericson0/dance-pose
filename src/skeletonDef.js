@@ -167,19 +167,26 @@ export const MASS_SEGMENTS = [
 // support. The heel/ball corners live in the ankle's local frame; the toe-tip
 // corners live in the toes joint's frame so they follow toe flexion (a curled
 // or lifted toe stops counting as its flat-foot floor point).
+// Sized to the RENDERED shoe of the clothed avatars (measured from the skinned
+// mesh: the man's shoe spans ankle−0.059H … ankle+0.095H long and ≈0.058H wide
+// at the ball), so the drawn support base matches the foot the user sees — the
+// old corners overhung the shoe by several cm at the toe and sides. Note the
+// rig's toes joint (ankle+0.090H) sits near the shoe TIP, so the toe-pad
+// corners live only a little ahead of it. A figure whose avatar wears a
+// different shoe scales these via its `soleScale` option (see Figure).
 // Order: heel-in, heel-out, ball-out, ball-in.
 export const FOOT_CORNERS_L = [
-  [-0.030, -0.039, -0.055],
-  [0.030, -0.039, -0.055],
-  [0.038, -0.039, 0.095],
-  [-0.038, -0.039, 0.095],
+  [-0.024, -0.039, -0.055],
+  [0.024, -0.039, -0.055],
+  [0.028, -0.039, 0.075],
+  [-0.028, -0.039, 0.075],
 ];
 export const FOOT_CORNERS_R = FOOT_CORNERS_L.map(([x, y, z]) => [-x, y, z]);
 // Toe-tip corners in the toes joint's frame (joint at ankle-local
 // (0, -0.030, 0.090); sole plane is 0.009H below it). Order: toe-out, toe-in.
 export const TOE_CORNERS_L = [
-  [0.038, -0.009, 0.045],
-  [-0.038, -0.009, 0.045],
+  [0.014, -0.009, 0.010],
+  [-0.014, -0.009, 0.010],
 ];
 export const TOE_CORNERS_R = TOE_CORNERS_L.map(([x, y, z]) => [-x, y, z]);
 

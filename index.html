@@ -15,7 +15,8 @@
       <h1>TAngle</h1>
       <div id="mode-buttons" class="btn-group">
         <button data-mode="rotate" class="active" title="Click a joint, then drag the rings to rotate it (within anatomical limits)">Rotate joints</button>
-        <button data-mode="ik" title="Click a hand or foot to drag the whole limb; click an elbow or knee to swivel it while the hand/foot and shoulder/hip stay put">Drag limb</button>
+        <button data-mode="ik" title="Click a hand or foot to drag the whole limb; click the toes to caress the floor (the big toe stays down while the leg reaches); click an elbow or knee to swivel it while the hand/foot and shoulder/hip stay put">Drag limb</button>
+        <button data-mode="hips" title="Click a dancer, then drag the handle at the hips: the whole upper body moves with them (posture unchanged) while the planted feet keep their spot — those legs bend to accommodate. Pick which feet are planted with the toolbar checkboxes.">Move hips</button>
         <button data-mode="move" title="Click a figure, then drag to slide it on the floor. Arrow keys nudge: ↑↓ forward/back, ←→ turn (pivoting on the support foot). Shift = coarser.">Move figure</button>
         <button data-mode="step" title="Click a dancer to take a walking step forward — keep clicking to walk. Arrow keys: ↑↓ step forward/back, ←→ turn. Turn on 'Move as couple' to walk the pair together.">Walk / step</button>
       </div>
@@ -32,6 +33,11 @@
       <label class="topbar-check" title="Move, turn, or walk one dancer and the partner comes along — the embrace travels as one unit">
         <input type="checkbox" id="link-couple" /> Move as couple
       </label>
+      <span class="topbar-check" id="hips-plant" hidden title="Feet that stay planted while the hips move — a planted leg's joints re-solve to keep the foot in place; an unplanted foot rides along with the body">
+        <span>Planted:</span>
+        <label><input type="checkbox" id="plant-L" checked /> left</label>
+        <label><input type="checkbox" id="plant-R" checked /> right</label>
+      </span>
     </header>
 
     <aside id="sidebar">
@@ -54,6 +60,9 @@
           <button data-view="side" title="Profile view — read posture and lean">Side</button>
           <button data-view="top" title="Bird's eye — read foot placement and hip/shoulder rotation">Top</button>
           <button data-view="three" title="Default ¾ view">¾ view</button>
+        </div>
+        <div class="btn-row">
+          <button id="photo-btn" title="Save a PNG photo of the current 3D view (gizmos and drag handles hidden)">📷 Save photo</button>
         </div>
       </section>
 
@@ -117,20 +126,35 @@
       <section id="joint-section">
         <h2>Selected joint</h2>
         <div class="row" id="joint-picker">
-          <div id="joint-fig-toggle" class="btn-group" title="Which dancer the joint list targets">
+          <div id="joint-fig-toggle" class="btn-group" title="Which dancer the joint grid targets">
             <button data-role="leader" class="active">Leader</button>
             <button data-role="follower">Follower</button>
           </div>
-          <select id="joint-select" title="Jump to a joint without hunting for it in the 3D view">
-            <option value="">Pick a joint…</option>
-          </select>
         </div>
+        <div id="joint-grid" title="Pick a joint to pose without hunting for it in the 3D view"></div>
         <div id="joint-panel" class="muted">Click a joint on a figure — or pick one above — to select it.</div>
       </section>
 
       <section>
         <h2>Balance &amp; angles</h2>
         <div id="stats-panel"></div>
+      </section>
+
+      <section id="footmap-section">
+        <h2>Foot map</h2>
+        <div class="row">
+          <div id="footmap-fig" class="btn-group" title="Whose foot to map">
+            <button data-fig="leader" class="active">Leader</button>
+            <button data-fig="follower">Follower</button>
+          </div>
+          <div id="footmap-foot" class="btn-group" title="Which foot: the current support foot, or pin left/right">
+            <button data-foot="auto" class="active">Support</button>
+            <button data-foot="L">L</button>
+            <button data-foot="R">R</button>
+          </div>
+        </div>
+        <canvas id="footmap-canvas"></canvas>
+        <div id="footmap-note" class="muted"></div>
       </section>
 
       <section class="collapsed">
@@ -181,7 +205,7 @@
       </section>
     </aside>
 
-    <div id="hint">Click a joint to pose · in Move/Walk, click a dancer then use the arrow keys (↑↓ move/step · ←→ turn) · right-drag to orbit · scroll to zoom</div>
+    <div id="hint">Click a joint to pose · Drag limb: the toes caress the floor · Move hips slides the body over planted feet · Move/Walk: arrows (↑↓ move/step · ←→ turn) · right-drag to orbit · scroll to zoom</div>
   </div>
   <script type="module" src="/src/main.js"></script>
 </body>

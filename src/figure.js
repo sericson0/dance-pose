@@ -113,9 +113,15 @@ const FLOOR_CLEARANCE = {
   hand_L: 0.012, hand_R: 0.012,
   hip_L: 0.055, hip_R: 0.055,
   knee_L: 0.042, knee_R: 0.042,
-  toes_L: 0.008, toes_R: 0.008, // ball of the foot: sole is 0.009H below the joint
-  toe_L: 0.004, toe_R: 0.004,
 };
+
+// Nodes whose floor contact the sole corner sets fully describe — skipped by
+// lowestPointY's joint-clearance sweep. The rig's toe segment overshoots the
+// rendered shoe (the toes joint sits near the shoe TIP), so clearing the
+// phantom toe endpoint would lift a pointed foot off a toe that is visibly
+// on the floor. The corner sets are fitted to the shoe (soleScale) and their
+// toe pads sit at/just past its tip, so they bound the shoe in any pitch.
+const CORNER_NODES = new Set(['toes_L', 'toes_R', 'toe_L', 'toe_R']);
 
 // Body-view capsule radii per segment (fractions of height).
 const BODY_RADII = {
@@ -148,7 +154,7 @@ const FINGER_AXIS = new THREE.Vector3(0, 0, 1);
 const _fingerQ = new THREE.Quaternion();
 
 export class Figure {
-  constructor({ name, height = 1.72, mass = 70, color = 0x4d8fd1, skin = 0xd9a68a, skeleton = null, muscles = null, body = null, bodyKey = null, heelRise = 0 }) {
+  constructor({ name, height = 1.72, mass = 70, color = 0x4d8fd1, skin = 0xd9a68a, skeleton = null, muscles = null, body = null, bodyKey = null, heelRise = 0, soleScale = null }) {
     this.name = name;
     this.height = height;
     this.mass = mass;
@@ -160,6 +166,12 @@ export class Figure {
     // heel lifts) so a heeled avatar's foot sits natively on the floor instead
     // of being squashed flat, and the skeletal foot pitches to match.
     this.heelRise = heelRise;
+    // Per-figure sole footprint scale ({ front, width }, both default 1): the
+    // shared FOOT_CORNERS/TOE_CORNERS tables are sized to the man's shoe, and
+    // this stretches/shrinks them so the balance footprint hugs THIS avatar's
+    // shoe (the woman's heeled shoe is shorter in height-fractions). `front`
+    // scales everything ahead of the ankle toward it; `width` scales laterally.
+    this.soleScale = { front: 1, width: 1, ...(soleScale || {}) };
     this.color = color;
     this.skin = skin;
     this.skeletonMesh = skeleton; // parsed atlas bones, or null → procedural bones
@@ -231,6 +243,20 @@ export class Figure {
       if (def.parent) this.nodes[def.parent].add(node);
       else this.group.add(node);
     }
+
+    // Balance/contact sole corners for THIS figure: the shared tables scaled by
+    // `soleScale` so the footprint matches the avatar's own shoe. The heel
+    // stays put (z ≤ 0); everything ahead of the ankle scales toward it. The
+    // toe-pad corners live in the toes joint's frame, so their scale acts on
+    // the ankle-frame position (joint offset + corner) before converting back
+    // — a strong shrink legally lands them slightly BEHIND the toes joint
+    // (a short heeled shoe ends behind the rig's toe segment).
+    const toesZ = JOINT_BY_NAME.toes_L.offset[2];
+    const { front, width } = this.soleScale;
+    const scaleFoot = (corners) => corners.map(([x, y, z]) => [x * width, y, z > 0 ? z * front : z]);
+    const scaleToe = (corners) => corners.map(([x, y, z]) => [x * width, y, (toesZ + z) * front - toesZ]);
+    this.footCorners = { _L: scaleFoot(FOOT_CORNERS_L), _R: scaleFoot(FOOT_CORNERS_R) };
+    this.toeCorners = { _L: scaleToe(TOE_CORNERS_L), _R: scaleToe(TOE_CORNERS_R) };
 
     // The single neutral rest: the imported skeleton's own joint centers
     // (figure-local), estimated where its bone clusters meet. The body avatar
@@ -1245,10 +1271,12 @@ export class Figure {
     }
     // Floor corners: drop back to the shoe sole. The ankle raise floated them by
     // heelLift; the shoe still contacts heel-block + ball flat on the floor, so
-    // just lower each corner by heelRise (fraction of height) — no pitch.
+    // just lower each corner by heelRise (fraction of height) — no pitch. Bases
+    // on this figure's soleScale-fitted corners (built in #build), not the raw
+    // shared tables.
     const drop = (corners) => corners.map(([x, y, z]) => [x, y - this.heelRise, z]);
-    this.footCorners = { _L: drop(FOOT_CORNERS_L), _R: drop(FOOT_CORNERS_R) };
-    this.toeCorners = { _L: drop(TOE_CORNERS_L), _R: drop(TOE_CORNERS_R) };
+    this.footCorners = { _L: drop(this.footCorners._L), _R: drop(this.footCorners._R) };
+    this.toeCorners = { _L: drop(this.toeCorners._L), _R: drop(this.toeCorners._R) };
   }
 
   // Curl one hand's fingers (0 = bind pose, 1 = closed around the partner's
@@ -1567,6 +1595,28 @@ export class Figure {
     return this.nodes[jointName].getWorldPosition(target);
   }
 
+  // Lowest sole corner of one foot ('L' | 'R'), world Y — how far this foot's
+  // sole (heel, ball and toe corners; the heeled follower's dropped set) is
+  // off the floor. The walk uses it to land a heel-strike or a grazing toe
+  // exactly on y = 0 whatever the ankle pitch.
+  footLowY(side) {
+    this.group.updateMatrixWorld(true);
+    const H = this.height;
+    let minY = Infinity;
+    for (const [nodeName, corners] of [
+      [`ankle_${side}`, this.footCorners?.[`_${side}`] ?? (side === 'L' ? FOOT_CORNERS_L : FOOT_CORNERS_R)],
+      [`toes_${side}`, this.toeCorners?.[`_${side}`] ?? (side === 'L' ? TOE_CORNERS_L : TOE_CORNERS_R)],
+    ]) {
+      const node = this.nodes[nodeName];
+      for (const [x, y, z] of corners) {
+        _floorPt.set(x * H, y * H, z * H);
+        node.localToWorld(_floorPt);
+        if (_floorPt.y < minY) minY = _floorPt.y;
+      }
+    }
+    return minY;
+  }
+
   // Lowest floor-relevant point of the body: foot sole corners plus every
   // joint padded by its flesh clearance.
   lowestPointY() {
@@ -1585,6 +1635,7 @@ export class Figure {
       }
     }
     for (const def of JOINTS) {
+      if (CORNER_NODES.has(def.name)) continue; // the sole corners own the foot
       this.nodes[def.name].getWorldPosition(_floorPt);
       const y = _floorPt.y - (FLOOR_CLEARANCE[def.name] ?? 0.02) * H;
       if (y < minY) minY = y;

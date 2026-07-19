@@ -164,8 +164,13 @@ export function editWithAnchor(figure, anchorNode, mutate) {
   pinAnchor(figure, anchorNode, before);
 }
 
-// One-step correction that pitches the ankle so the sole sits level.
-export function flattenFoot(figure, side) {
+// One-step correction that pitches the ankle so the sole sits level — or, with
+// `pitchRad`, rolled that far off level (plantarflex > 0 onto the ball, dorsi-
+// flex < 0 onto the heel). The flatten error and the roll are composed BEFORE
+// the joint clamp: clamping the flatten alone first would eat range the roll
+// still had (a shank tipped back 30° plus a 28° roll is a legal -2°, but
+// flatten-then-roll clamps at -25° and lands at +3°).
+export function flattenFoot(figure, side, pitchRad = 0) {
   const ankleNode = figure.nodes[`ankle_${side}`];
   const toeNode = figure.nodes[`toe_${side}`];
   // A flat sole includes flat toes; the toe-tip height math below assumes it.
@@ -178,7 +183,7 @@ export function flattenFoot(figure, side) {
   // Desired toe height: sole depth below the ankle.
   const desiredY = A.y - 0.035 * figure.height;
   const err = Math.atan2(T.y - desiredY, horiz);
-  ankleNode.rotation.x += err; // pitch toe down by the error
+  ankleNode.rotation.x += err + pitchRad; // pitch toe down by the error, then roll
   figure.clampJoint(`ankle_${side}`);
   figure.group.updateMatrixWorld(true);
 }
