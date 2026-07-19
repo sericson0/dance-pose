@@ -134,8 +134,45 @@ export function initUI(app) {
     cog: $('show-cog').checked,
     support: $('show-support').checked,
     couple: $('show-couple-cog').checked,
+    dissoc: $('show-dissoc').checked,
   });
-  ['show-cog', 'show-support', 'show-couple-cog'].forEach((id) => $(id).addEventListener('change', syncViz));
+  ['show-cog', 'show-support', 'show-couple-cog', 'show-dissoc'].forEach((id) => $(id).addEventListener('change', syncViz));
+
+  // ---------------------------------------------------------------- pins
+  // Contact pins (see pins.js): the list mirrors app.pins; authoring happens
+  // in the 3D view via the Pin-spots mode.
+  const pinList = $('pin-list');
+  const pinClear = $('pin-clear');
+  const endName = (end) => JOINT_TITLES[end.node] || end.node;
+
+  function renderPins() {
+    const n = app.pins.count();
+    const pending = app.pinPending;
+    pinList.innerHTML = '';
+    if (!n && !pending) {
+      pinList.innerHTML = '<span class="muted">No pins yet — use the Pin spots mode.</span>';
+    }
+    app.pins.pins.forEach((pin, i) => {
+      const row = document.createElement('div');
+      row.className = 'pose-item';
+      row.innerHTML = `<span class="name">${i + 1} · ${endName(pin.leader)} ↔ ${endName(pin.follower)}</span>`;
+      const del = document.createElement('button');
+      del.textContent = '✕';
+      del.title = 'Release this pin';
+      del.addEventListener('click', () => app.removePin(i));
+      row.appendChild(del);
+      pinList.appendChild(row);
+    });
+    if (pending) {
+      const note = document.createElement('div');
+      note.className = 'muted';
+      note.textContent = `First spot set on the ${pending.figure.name.toLowerCase()} (${endName(pending).toLowerCase()}) — now click the matching spot on the partner.`;
+      pinList.appendChild(note);
+    }
+    pinClear.disabled = !n;
+  }
+  pinClear.addEventListener('click', () => app.clearPins());
+  renderPins();
 
   // ---------------------------------------------------------------- highlight
   const highlightChips = $('highlight-chips');
@@ -682,17 +719,22 @@ export function initUI(app) {
   ghostA.addEventListener('change', syncGhosts);
   ghostB.addEventListener('change', syncGhosts);
 
+  // The COG floor trail traces the sequence when it has one, else A→B —
+  // one checkbox governs it either way (see app.trailStates).
+  const syncPath = () => app.setPathVisible(
+    (!!(snaps.A && snaps.B) || app.seqStates.length >= 2) && showPath.checked,
+  );
+  showPath.addEventListener('change', syncPath);
+
   // The scrubber, play button, and COG path all need both snapshots.
   function syncInterp() {
     const ready = !!(snaps.A && snaps.B);
     app.setInterpStates(snaps.A, snaps.B);
     interpRow.hidden = !ready;
     interpPlay.disabled = !ready;
-    app.setPathVisible(ready && showPath.checked);
+    syncRecordButtons();
+    syncPath();
   }
-  showPath.addEventListener('change', () => {
-    app.setPathVisible(!!(snaps.A && snaps.B) && showPath.checked);
-  });
 
   const setInterpLabel = (t) => {
     interpSlider.value = Math.round(t * 1000);
@@ -707,6 +749,11 @@ export function initUI(app) {
   interpPlay.addEventListener('click', () => {
     app.pushHistory();
     app.playInterp(setInterpLabel);
+  });
+  $('interp-record').addEventListener('click', () => {
+    if (!snaps.A || !snaps.B) return;
+    app.pushHistory();
+    app.recordPlayback([snaps.A, snaps.B], 'tangle-a-b');
   });
 
   function takeSnapshot(which) {
@@ -769,6 +816,118 @@ export function initUI(app) {
   };
   $('recall-a').addEventListener('click', () => recallSnap('A'));
   $('recall-b').addEventListener('click', () => recallSnap('B'));
+
+  // ---------------------------------------------------------------- sequence
+  // Movement timeline: an ordered chain of couple-state keyframes, scrubbed /
+  // played / recorded as one figure (see app.seqStates). Persisted per
+  // session so a half-authored giro survives a reload.
+  const SEQ_KEY = 'tangoPoseStudio.sequence.v1';
+  const seqList = $('seq-list');
+  const seqRow = $('seq-row');
+  const seqSlider = $('seq-slider');
+  const seqVal = $('seq-val');
+  const seqPlay = $('seq-play');
+  const seqRecord = $('seq-record');
+  const seqClear = $('seq-clear');
+  const seqExport = $('seq-export');
+  const interpRecord = $('interp-record');
+
+  // Both ⏺ buttons: armed when their chain can play, locked while a capture runs.
+  function syncRecordButtons() {
+    const busy = !!app.recording;
+    interpRecord.disabled = busy || !(snaps.A && snaps.B);
+    seqRecord.disabled = busy || app.seqStates.length < 2;
+    interpRecord.textContent = busy ? '⏺ Recording…' : '⏺ Record';
+    seqRecord.textContent = busy ? '⏺ Recording…' : '⏺ Record video';
+  }
+
+  const setSeqLabel = (t) => {
+    seqSlider.value = Math.round(t * 1000);
+    seqVal.textContent = `${Math.round(t * 100)}%`;
+  };
+  pushHistoryOnEdit(seqSlider);
+  seqSlider.addEventListener('input', () => {
+    const t = Number(seqSlider.value) / 1000;
+    app.applySeqT(t);
+    seqVal.textContent = `${Math.round(t * 100)}%`;
+  });
+  seqPlay.addEventListener('click', () => {
+    app.pushHistory();
+    app.playSeq(setSeqLabel);
+  });
+  seqRecord.addEventListener('click', () => {
+    app.pushHistory();
+    app.recordPlayback(app.seqStates, 'tangle-sequence');
+  });
+  $('seq-add').addEventListener('click', () => app.seqAdd());
+  seqClear.addEventListener('click', () => app.setSeqStates([]));
+
+  function renderSequence() {
+    const n = app.seqStates.length;
+    seqList.innerHTML = n ? ''
+      : '<span class="muted">No keyframes yet — pose the couple and add one.</span>';
+    app.seqStates.forEach((state, i) => {
+      const row = document.createElement('div');
+      row.className = 'pose-item';
+      row.innerHTML = `<span class="name">${i + 1}</span>`;
+      const btn = (label, title, fn, disabled = false) => {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.title = title;
+        b.disabled = disabled;
+        b.addEventListener('click', fn);
+        row.appendChild(b);
+      };
+      btn('Show', 'Jump the couple to this keyframe', () => app.seqApply(i));
+      btn('⟳', 'Overwrite this keyframe with the current pose', () => app.seqUpdate(i));
+      btn('↑', 'Play this keyframe earlier', () => app.seqMove(i, -1), i === 0);
+      btn('↓', 'Play this keyframe later', () => app.seqMove(i, 1), i === n - 1);
+      btn('✕', 'Delete this keyframe', () => app.seqDelete(i));
+      seqList.appendChild(row);
+    });
+    seqRow.hidden = n < 2;
+    seqPlay.disabled = n < 2;
+    seqClear.disabled = n === 0;
+    seqExport.disabled = n < 2;
+    syncRecordButtons();
+    syncPath();
+    try { localStorage.setItem(SEQ_KEY, JSON.stringify(app.seqStates)); } catch { /* storage full */ }
+  }
+
+  seqExport.addEventListener('click', () => {
+    const payload = { app: 'tangle', type: 'sequence', version: 1, states: app.seqStates };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'tango-sequence.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+  $('seq-import').addEventListener('click', () => $('seq-file').click());
+  $('seq-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const data = JSON.parse(await file.text());
+      const states = Array.isArray(data) ? data : data.states;
+      if (!Array.isArray(states) || states.length < 2 || !states.every((s) => s && s.figures)) {
+        throw new Error('not a sequence');
+      }
+      app.setSeqStates(states);
+    } catch {
+      alert('Could not read that file as a sequence.');
+    }
+    e.target.value = '';
+  });
+
+  // Restore the previous session's sequence (before the first render below).
+  try {
+    const saved = JSON.parse(localStorage.getItem(SEQ_KEY));
+    if (Array.isArray(saved) && saved.length && saved.every((s) => s && s.figures)) {
+      app.setSeqStates(saved);
+    }
+  } catch { /* corrupted storage: start empty */ }
+  renderSequence();
 
   // ---------------------------------------------------------------- presets
   const presetSelect = $('preset-select');
@@ -902,6 +1061,18 @@ export function initUI(app) {
     onHipsPlantChanged() {
       plantL.checked = app.hipsPlant.L;
       plantR.checked = app.hipsPlant.R;
+    },
+    // The sequence keyframes changed (add/update/reorder/delete/import).
+    onSequenceChanged() {
+      renderSequence();
+    },
+    // A pin was authored, released, or a pending first spot changed.
+    onPinsChanged() {
+      renderPins();
+    },
+    // A video capture started or finished: refresh the ⏺ buttons.
+    onRecordingChanged() {
+      syncRecordButtons();
     },
     refreshJointValues,
     updateStats,

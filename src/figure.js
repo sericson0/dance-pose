@@ -439,12 +439,21 @@ export class Figure {
   // the bones hung on it pivot about the anatomical joint and stay welded to
   // their neighbours through any bend. A whole limb chain must be seated
   // together (a bone welds to its neighbour only if both ride matching trees),
-  // so this covers the complete arm chain scapula → shoulder → elbow → wrist;
-  // the scapula stays a rig node (it anchors the chain and barely articulates).
+  // so this covers the complete arm chain scapula → shoulder → elbow → wrist
+  // (the scapula stays a rig node — it anchors the chain and barely
+  // articulates) and the complete leg chain hip → knee → ankle → toes, with
+  // the pelvis as its rig anchor.
   #buildAtlasNodes(atlasRest) {
     this.group.updateMatrixWorld(true);
     const gInv = this.group.matrixWorld.clone().invert();
     const rigLocal = (name) => this.nodes[name].getWorldPosition(new THREE.Vector3()).applyMatrix4(gInv);
+    // A heeled figure raises its rig ankle (and the toes riding it) by heelLift
+    // so the shoe stands natively (see #build); the seated foot pivots must sit
+    // in that same lifted frame — the retargeted shoe bones snap to the lifted
+    // atlas centers (see #buildMeshBody's target()), so an unlifted seat would
+    // pivot the foot below the shoe.
+    const lifted = (name, v) => (v && this._heelLift && /^(ankle|toes)_/.test(name)
+      ? v.clone().setY(v.y + this._heelLift) : v);
     // [seated base, parent base, parent is a rig node?]. Rest rotations are all
     // identity, so a parent's local axes equal the figure axes and the child's
     // local offset is a plain figure-local subtraction.
@@ -452,13 +461,18 @@ export class Figure {
       ['shoulder', 'scapula', true],
       ['elbow', 'shoulder', false],
       ['wrist', 'elbow', false],
+      ['hip', 'pelvis', true],
+      ['knee', 'hip', false],
+      ['ankle', 'knee', false],
+      ['toes', 'ankle', false],
     ];
     for (const side of ['_L', '_R']) {
       for (const [base, par, parIsRig] of chain) {
-        const name = `${base}${side}`, parName = `${par}${side}`;
-        const center = atlasRest.get(name);
+        const name = `${base}${side}`;
+        const parName = LIMB_BASES.has(par) ? `${par}${side}` : par;
+        const center = lifted(name, atlasRest.get(name));
         const parent = parIsRig ? this.nodes[parName] : this.atlasNodes[parName];
-        const parCenter = parIsRig ? rigLocal(parName) : atlasRest.get(parName);
+        const parCenter = parIsRig ? rigLocal(parName) : lifted(parName, atlasRest.get(parName));
         if (!center || !parent || !parCenter) continue;
         const node = new THREE.Object3D();
         node.position.copy(center).sub(parCenter);
@@ -916,9 +930,9 @@ export class Figure {
         const jointName = `${tpl.joint}${suffix}`;
         const bone = boneByName.get(boneName);
         // Ride the same atlas limb sub-tree as the skeleton bones and muscles
-        // (#seatNode) where the joint is seated, so the clothed arm pivots about
+        // (#seatNode) where the joint is seated, so the clothed limb pivots about
         // the anatomical joint centre too and stays welded to the skeleton
-        // through any bend; unseated joints (torso/legs) keep their rig node.
+        // through any bend; unseated joints (torso) keep their rig node.
         const node = this.#seatNode(jointName);
         if (!bone || !node) continue;
         const q = bindPos(bone);
@@ -937,9 +951,10 @@ export class Figure {
         }
         alignR.set(boneName, R);
         // Snap the bone origin to the atlas joint, expressed in the PARENT node's
-        // rest frame. An atlas seat node already sits at the atlas joint, so the
-        // offset is zero; a rig node (torso/legs) carries the rig→atlas delta.
-        const seatRest = this.atlasNodes[jointName] ? atlas.get(jointName) : rest[jointName];
+        // rest frame. An atlas seat node already sits at the atlas joint (heel
+        // lift included — target() and the seat agree), so the offset is zero;
+        // a rig node (torso) carries the rig→atlas delta.
+        const seatRest = this.atlasNodes[jointName] ? target(jointName) : rest[jointName];
         const originDelta = target(jointName).clone().sub(seatRest);
         plans.set(bone, { node, jointName, q, rotBind, R, axialLen, originDelta, jointY: target(jointName).y, squash: !!tpl.squash });
       }
@@ -1209,7 +1224,10 @@ export class Figure {
     const P = new THREE.Vector3();
     const off = new THREE.Vector3();
     for (const side of ['_L', '_R']) {
-      const A = this.nodes[`ankle${side}`].getWorldPosition(new THREE.Vector3()).applyMatrix4(gInv);
+      // The pitch target is the seated ankle — the atlas node when the leg
+      // chain is seated (where the retargeted shoe's foot bone sits), else the
+      // rig node.
+      const A = this.#seatNode(`ankle${side}`).getWorldPosition(new THREE.Vector3()).applyMatrix4(gInv);
       // Skeleton foot vertices (ankle + toes meshes), figure-local.
       const verts = [];
       for (const mesh of this.layerMeshes.skeleton) {
@@ -1257,10 +1275,11 @@ export class Figure {
       }
       const R = new THREE.Quaternion().setFromAxisAngle(axis, dir * (lo + hi) / 2);
       // Apply to the ankle + toes skeleton meshes (rotate about the ball B; a
-      // mesh parented at node P needs local offset B + R·(P − B) − P).
+      // mesh parented at node P needs local offset B + R·(P − B) − P). P is the
+      // mesh's ACTUAL parent — the seated atlas node when the leg is seated.
       for (const base of ['ankle', 'toes']) {
         const nodeName = `${base}${side}`;
-        this.nodes[nodeName].getWorldPosition(P).applyMatrix4(gInv);
+        this.#seatNode(nodeName).getWorldPosition(P).applyMatrix4(gInv);
         off.copy(P).sub(B).applyQuaternion(R).add(B).sub(P);
         for (const mesh of this.layerMeshes.skeleton) {
           if (this.#nodeNameOf(mesh) !== nodeName) continue;

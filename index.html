@@ -19,6 +19,7 @@
         <button data-mode="hips" title="Click a dancer, then drag the handle at the hips: the whole upper body moves with them (posture unchanged) while the planted feet keep their spot — those legs bend to accommodate. Pick which feet are planted with the toolbar checkboxes.">Move hips</button>
         <button data-mode="move" title="Click a figure, then drag to slide it on the floor. Arrow keys nudge: ↑↓ forward/back, ←→ turn (pivoting on the support foot). Shift = coarser.">Move figure</button>
         <button data-mode="step" title="Click a dancer to take a walking step forward — keep clicking to walk. Arrow keys: ↑↓ step forward/back, ←→ turn. Turn on 'Move as couple' to walk the pair together.">Walk / step</button>
+        <button data-mode="pin" title="Pin a spot on one dancer to a spot on the other: click the first spot, then the matching spot on the partner. Pinned spots stay together through moves, steps and turns — author a custom hold, or a parada's foot contact. Manage pins in the sidebar.">Pin spots</button>
       </div>
       <div id="show-buttons" class="btn-group" title="Show one dancer or both">
         <button data-show="both" class="active">Both</button>
@@ -54,6 +55,7 @@
         </div>
         <div class="check-row">
           <label><input type="checkbox" id="show-couple-cog" checked /> Couple COG</label>
+          <label title="Draw each dancer's hip axis (their color) and shoulder axis (white) on the floor, with a wedge sweeping the twist between them — tango dissociation. Clearest in the Top view."><input type="checkbox" id="show-dissoc" /> Dissociation</label>
         </div>
         <div class="btn-row" id="view-buttons">
           <button data-view="front" title="Look along the line of dance">Front</button>
@@ -99,6 +101,15 @@
             <input type="range" id="embrace-elbow-follower" min="-60" max="60" step="1" value="0" />
             <div class="range-hint"><span>down</span><span>up</span></div>
           </div>
+        </div>
+      </section>
+
+      <section class="collapsed" id="pins-section">
+        <h2>Contact pins</h2>
+        <div class="muted">Hold a spot on one dancer against a spot on the other through any move — his palm on her back, foot against foot for a parada. Author them with the <b>Pin spots</b> mode: click the first spot, then the matching spot on the partner. The partner of whoever you edit adapts: a pinned arm or leg re-solves to keep the contact, a torso spot pulls the whole dancer along.</div>
+        <div id="pin-list"></div>
+        <div class="btn-row">
+          <button id="pin-clear" disabled>Clear all pins</button>
         </div>
       </section>
 
@@ -177,8 +188,33 @@
         </div>
         <div class="btn-row">
           <button id="interp-play" disabled title="Animate the couple from pose A to pose B">▶ Play A→B</button>
+          <button id="interp-record" disabled title="Play A→B while recording the 3D view, then download it as a .webm video">⏺ Record</button>
         </div>
         <div id="compare-panel" class="muted">Snapshot two poses to see joint-angle and COG changes.</div>
+      </section>
+
+      <section class="collapsed" id="sequence-section">
+        <h2>Sequence</h2>
+        <div class="muted">Chain keyframes into a whole figure (a giro is 4+ poses): pose the couple, add a keyframe, repeat — then scrub or play the movement.</div>
+        <div class="btn-row">
+          <button id="seq-add" title="Append the current couple pose as a keyframe">+ Add keyframe</button>
+          <button id="seq-clear" disabled title="Remove every keyframe">Clear</button>
+        </div>
+        <div id="seq-list"></div>
+        <div class="slider-row" id="seq-row" hidden>
+          <div class="lbl"><span>Movement</span><span class="val" id="seq-val">0%</span></div>
+          <input type="range" id="seq-slider" min="0" max="1000" step="1" value="0" />
+          <div class="range-hint"><span>start</span><span>end</span></div>
+        </div>
+        <div class="btn-row">
+          <button id="seq-play" disabled title="Animate the couple through every keyframe">▶ Play</button>
+          <button id="seq-record" disabled title="Play the sequence while recording the 3D view, then download it as a .webm video">⏺ Record video</button>
+        </div>
+        <div class="btn-row">
+          <button id="seq-export" disabled title="Download the sequence as a JSON file">Export file</button>
+          <button id="seq-import" title="Load a sequence JSON file">Import file</button>
+          <input type="file" id="seq-file" accept=".json" hidden />
+        </div>
       </section>
 
       <section>

@@ -8,6 +8,7 @@ import { balanceReport, coupleReport, footContactsBySide } from './analysis.js';
 import { PRESETS } from './presets.js';
 import { loadSkeletonBones, loadMuscleMeshes, loadBodyMesh } from './skeletonMesh.js';
 import { Embrace } from './embrace.js';
+import { ContactPins, nearestJointNode } from './pins.js';
 import { resolveBodyCollision, bodyClearance, bodyContacts } from './collision.js';
 import { initUI } from './ui.js';
 
@@ -161,6 +162,21 @@ scene.add(leader.group, follower.group);
 // re-applied every frame in the loop below.
 const embrace = new Embrace(leader, follower);
 
+// User-authored contact pins (a spot on each dancer held together — custom
+// holds, paradas), also re-applied every frame. See pins.js.
+const pins = new ContactPins(leader, follower);
+scene.add(pins.group);
+
+// The first spot of a pin being authored in Pin-spots mode, awaiting its
+// partner spot: a marker that rides the clicked body part until the second
+// click lands (or the mode changes).
+const pinPendingMarker = new THREE.Mesh(
+  new THREE.SphereGeometry(0.014, 12, 8),
+  new THREE.MeshBasicMaterial({ color: 0xffe08a, transparent: true, opacity: 0.9 }),
+);
+pinPendingMarker.visible = false;
+scene.add(pinPendingMarker);
+
 // -------------------------------------------------------- balance visuals
 class BalanceViz {
   constructor(colorHex) {
@@ -223,6 +239,100 @@ const vizFollower = new BalanceViz(0xe89ab8);
 const vizCouple = new BalanceViz(0xffe08a);
 scene.add(vizLeader.group, vizFollower.group, vizCouple.group);
 
+// ------------------------------------------------- dissociation visual
+// Tango dissociation made visible on the floor: the hip axis (hip_L↔hip_R)
+// and the shoulder axis (shoulder_L↔shoulder_R), both projected onto the
+// floor under the dancer, with a translucent wedge sweeping the twist angle
+// between them. Reads best in the Top view; the number lives in the stats
+// panel (tangoStats), this is the picture.
+class DissociationViz {
+  static WEDGE_SEGS = 24;
+
+  constructor(colorHex) {
+    this.group = new THREE.Group();
+    const lineGeo = () => new THREE.BufferGeometry()
+      .setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+    // Hip axis: the dancer's own color. Shoulder axis: white, so the twist
+    // between the two lines is unmistakable.
+    this.hipLine = new THREE.Line(lineGeo(), new THREE.LineBasicMaterial({
+      color: colorHex, transparent: true, opacity: 0.95,
+    }));
+    this.shoulderLine = new THREE.Line(lineGeo(), new THREE.LineBasicMaterial({
+      color: 0xf5f2e8, transparent: true, opacity: 0.95,
+    }));
+    // Wedge fan between the two axes: center + rim points, rebuilt per frame.
+    const segs = DissociationViz.WEDGE_SEGS;
+    const wedgeGeo = new THREE.BufferGeometry();
+    wedgeGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array((segs + 2) * 3), 3));
+    const idx = [];
+    for (let i = 0; i < segs; i++) idx.push(0, i + 1, i + 2);
+    wedgeGeo.setIndex(idx);
+    this.wedge = new THREE.Mesh(wedgeGeo, new THREE.MeshBasicMaterial({
+      color: colorHex, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthWrite: false,
+    }));
+    this.group.add(this.hipLine, this.shoulderLine, this.wedge);
+    this.group.visible = false;
+  }
+
+  #axisDir(figure, left, right, out) {
+    figure.worldPos(left, out).sub(figure.worldPos(right, DissociationViz._t));
+    out.y = 0;
+    return out.lengthSq() > 1e-8 ? out.normalize() : null;
+  }
+
+  update(figure) {
+    const H = figure.height;
+    const hipDir = this.#axisDir(figure, 'hip_L', 'hip_R', DissociationViz._hip);
+    const shDir = this.#axisDir(figure, 'shoulder_L', 'shoulder_R', DissociationViz._sh);
+    if (!hipDir || !shDir) { this.group.visible = false; return; }
+    this.group.visible = this._on !== false;
+    const c = figure.worldPos('pelvis', DissociationViz._c);
+    c.y = 0.006;
+
+    const setLine = (line, dir, halfLen) => {
+      const pts = line.geometry.attributes.position;
+      pts.setXYZ(0, c.x - dir.x * halfLen, c.y, c.z - dir.z * halfLen);
+      pts.setXYZ(1, c.x + dir.x * halfLen, c.y + 0.001, c.z + dir.z * halfLen);
+      pts.needsUpdate = true;
+    };
+    setLine(this.hipLine, hipDir, 0.20 * H);
+    setLine(this.shoulderLine, shDir, 0.25 * H);
+
+    // Fan from the hip axis to the shoulder axis (signed, so the wedge opens
+    // the way the shoulders actually twisted), on the left-hand ends.
+    const angle = Math.atan2(
+      hipDir.x * shDir.z - hipDir.z * shDir.x, hipDir.dot(shDir),
+    );
+    const segs = DissociationViz.WEDGE_SEGS;
+    const r = 0.17 * H;
+    const wp = this.wedge.geometry.attributes.position;
+    wp.setXYZ(0, c.x, c.y, c.z);
+    for (let i = 0; i <= segs; i++) {
+      const a = -angle * (i / segs); // rotate about +Y from hipDir toward shDir
+      const cos = Math.cos(a);
+      const sin = Math.sin(a);
+      const dx = hipDir.x * cos - hipDir.z * sin;
+      const dz = hipDir.x * sin + hipDir.z * cos;
+      wp.setXYZ(i + 1, c.x + dx * r, c.y, c.z + dz * r);
+    }
+    wp.needsUpdate = true;
+    this.wedge.geometry.computeBoundingSphere();
+  }
+
+  setVisible(on) {
+    this._on = on;
+    if (!on) this.group.visible = false;
+  }
+}
+DissociationViz._t = new THREE.Vector3();
+DissociationViz._hip = new THREE.Vector3();
+DissociationViz._sh = new THREE.Vector3();
+DissociationViz._c = new THREE.Vector3();
+
+const dissocLeader = new DissociationViz(0x7fb3e8);
+const dissocFollower = new DissociationViz(0xe89ab8);
+scene.add(dissocLeader.group, dissocFollower.group);
+
 // ------------------------------------------------- pose interpolation (A→B)
 // Component-wise joint lerp is safe: both endpoints respect the joint limits,
 // and each limit interval is convex.
@@ -243,8 +353,22 @@ function lerpPose(a, b, t) {
   };
 }
 
-// Floor trace of the three COGs along the A→B movement, vertex-colored by
-// balance: the entity's own color while balanced, red where it loses the base.
+// Pose the couple at t ∈ [0, 1] along a chain of couple states — the A→B
+// lerp generalized to any number of keyframes (equal time per segment). The
+// scrubber/player of both the A/B compare and the movement sequence land here.
+function applyStatesT(states, t) {
+  const segs = states.length - 1;
+  const u = THREE.MathUtils.clamp(t, 0, 1) * segs;
+  const i = Math.min(Math.floor(u), segs - 1);
+  app.figures.forEach((f, j) => f.setPose(lerpPose(states[i].figures[j], states[i + 1].figures[j], u - i)));
+}
+
+// Tempo shared by the A→B player and the sequence player (seconds per segment).
+const SEQ_SEG_SECONDS = 2.4;
+
+// Floor trace of the three COGs along the A→B / sequence movement, vertex-
+// colored by balance: the entity's own color while balanced, red where it
+// loses the base.
 const trailGroup = new THREE.Group();
 scene.add(trailGroup);
 
@@ -272,14 +396,13 @@ function updateCogTrail() {
     line.material.dispose();
     trailGroup.remove(line);
   }
-  if (!app.interpStates) return;
-  const { A, B } = app.interpStates;
+  const states = app.trailStates();
+  if (!states) return;
   const saved = app.getCoupleState('__trail');
   const series = { a: [], b: [], couple: [] };
-  const N = 48;
+  const N = 32 * (states.length - 1) + 1;
   for (let i = 0; i < N; i++) {
-    const t = i / (N - 1);
-    app.figures.forEach((f, j) => f.setPose(lerpPose(A.figures[j], B.figures[j], t)));
+    applyStatesT(states, i / (N - 1));
     leader.clampToFloor();
     follower.clampToFloor();
     const rep = coupleReport(leader, follower);
@@ -743,6 +866,8 @@ const app = {
   scene, camera, renderer, orbit,
   leader, follower,
   embrace,
+  pins,
+  pinPending: null, // first spot of a pin being authored ({ figure, node, local })
   // Smallest surface clearance between the two dancers' body colliders
   // (negative = penetration) — for the dev verification scripts.
   bodyClearance: () => bodyClearance(leader, follower),
@@ -766,6 +891,12 @@ const app = {
   interpPlaying: false,
   interpT: 0,
   interpTick: null, // UI callback fed the current t while playing
+  seqStates: [], // movement-sequence keyframes (couple states, ≥2 to play)
+  seqPlaying: false,
+  seqT: 0,
+  seqTick: null, // UI callback fed the current t while the sequence plays
+  seqDone: null, // fired once when the sequence player reaches t = 1
+  recording: null, // { states, t, secs, rec } while a video capture plays
   ghosts: { A: null, B: null }, // translucent snapshot figures
   history: [], // undo stack of serialized couple states
   redoStack: [], // states walked back from, awaiting redo (cleared by any fresh edit)
@@ -811,7 +942,56 @@ const app = {
 
   setMode(mode) {
     this.mode = mode;
+    this.pinPending = null; // a half-authored pin dies with its mode
+    pinPendingMarker.visible = false;
     this.deselect();
+  },
+
+  // ------------------------------------------------------------ contact pins
+  // Pin-spots mode click: the first click stores a pending spot on that
+  // dancer (re-clicking the same dancer moves it); a click on the OTHER
+  // dancer completes the pin between the two spots. The spot lives in the
+  // local frame of the nearest joint node, so it rides that body part.
+  pinClick(figure, worldPoint) {
+    const node = nearestJointNode(figure, worldPoint);
+    if (!node) return;
+    const local = figure.nodes[node].worldToLocal(worldPoint.clone());
+    if (this.pinPending && this.pinPending.figure !== figure) {
+      const first = this.pinPending;
+      const second = { figure, node, local };
+      const forRole = (fig) => {
+        const e = first.figure === fig ? first : second;
+        return { node: e.node, local: e.local };
+      };
+      pins.add(forRole(leader), forRole(follower));
+      this.pinPending = null;
+      pinPendingMarker.visible = false;
+    } else {
+      this.pinPending = { figure, node, local };
+      pinPendingMarker.visible = true;
+    }
+    if (this.ui) this.ui.onPinsChanged();
+  },
+
+  // Scriptable pin (headless verification): each end { node, local: [x,y,z] }.
+  addPin(leaderEnd, followerEnd) {
+    pins.add(
+      { node: leaderEnd.node, local: new THREE.Vector3(...leaderEnd.local) },
+      { node: followerEnd.node, local: new THREE.Vector3(...followerEnd.local) },
+    );
+    if (this.ui) this.ui.onPinsChanged();
+  },
+
+  removePin(i) {
+    pins.remove(i);
+    if (this.ui) this.ui.onPinsChanged();
+  },
+
+  clearPins() {
+    pins.clear();
+    this.pinPending = null;
+    pinPendingMarker.visible = false;
+    if (this.ui) this.ui.onPinsChanged();
   },
 
   // Raise/lower the pelvis (hip-height slider). A rigid root compensation
@@ -1198,7 +1378,8 @@ const app = {
   // PNG snapshot of the current 3D view, gizmos and drag handles hidden.
   photoDataURL() {
     const hidden = [];
-    for (const o of [tcontrols, ikTarget, swivelTarget, caressTarget, hipsTarget]) {
+    for (const o of [tcontrols, ikTarget, swivelTarget, caressTarget, hipsTarget,
+      pins.group, pinPendingMarker]) {
       if (o.visible) { hidden.push(o); o.visible = false; }
     }
     renderer.render(scene, camera);
@@ -1297,6 +1478,7 @@ const app = {
 
   playInterp(onTick) {
     if (!this.interpStates) return;
+    this.seqPlaying = false; // one player at a time
     this.interpT = 0;
     this.interpPlaying = true;
     this.interpTick = onTick || null;
@@ -1304,6 +1486,117 @@ const app = {
 
   setPathVisible(visible) {
     trailGroup.visible = visible;
+  },
+
+  // -------------------------------------------------- movement sequence
+  // A timeline of couple-state keyframes — the A→B compare generalized to a
+  // whole figure (a giro is 4+ poses, not 2). The scrubber/player lerp each
+  // consecutive pair exactly like A→B; the COG trail covers all segments.
+
+  // The keyframe chain the COG floor trail traces: the sequence when it has
+  // one, else the A/B pair.
+  trailStates() {
+    if (this.seqStates.length >= 2) return this.seqStates;
+    return this.interpStates ? [this.interpStates.A, this.interpStates.B] : null;
+  },
+
+  onSeqChanged() {
+    if (this.seqStates.length < 2) this.seqPlaying = false;
+    updateCogTrail();
+    if (this.ui) this.ui.onSequenceChanged();
+  },
+
+  // Insert the current couple pose as a keyframe (appended by default).
+  seqAdd(index = this.seqStates.length) {
+    this.seqStates.splice(index, 0, this.getCoupleState(`Keyframe ${this.seqStates.length + 1}`));
+    this.onSeqChanged();
+  },
+
+  // Overwrite keyframe i with the current couple pose.
+  seqUpdate(i) {
+    if (!this.seqStates[i]) return;
+    this.seqStates[i] = this.getCoupleState(this.seqStates[i].name);
+    this.onSeqChanged();
+  },
+
+  seqDelete(i) {
+    this.seqStates.splice(i, 1);
+    this.onSeqChanged();
+  },
+
+  // Swap keyframe i with its neighbour at i + di (di = ±1).
+  seqMove(i, di) {
+    const j = i + di;
+    if (!this.seqStates[i] || !this.seqStates[j]) return;
+    [this.seqStates[i], this.seqStates[j]] = [this.seqStates[j], this.seqStates[i]];
+    this.onSeqChanged();
+  },
+
+  // Jump the couple to keyframe i.
+  seqApply(i) {
+    if (!this.seqStates[i]) return;
+    this.pushHistory();
+    this.applyCoupleState(this.seqStates[i]);
+  },
+
+  // Bulk replace (import / session restore).
+  setSeqStates(states) {
+    this.seqStates = Array.isArray(states) ? states : [];
+    this.onSeqChanged();
+  },
+
+  // Pose the couple at t ∈ [0, 1] across the whole sequence (the scrubber).
+  applySeqT(t) {
+    if (this.seqStates.length < 2) return;
+    if (this.selected || this.ikState) this.deselect();
+    this.seqT = t;
+    applyStatesT(this.seqStates, t);
+  },
+
+  playSeq(onTick, onDone = null) {
+    if (this.seqStates.length < 2) return;
+    this.interpPlaying = false; // one player at a time
+    this.seqT = 0;
+    this.seqPlaying = true;
+    this.seqTick = onTick || null;
+    this.seqDone = onDone;
+  },
+
+  // -------------------------------------------------- animation export
+  // Play a keyframe chain while recording the 3D canvas, then download the
+  // capture as a .webm — class material from the same view the teacher posed.
+  // `states` is any couple-state chain ([A, B] or the sequence). Returns false
+  // if a capture is already running or the chain can't play.
+  recordPlayback(states, name = 'tangle-movement') {
+    if (this.recording || !states || states.length < 2) return false;
+    if (typeof MediaRecorder === 'undefined' || !renderer.domElement.captureStream) {
+      console.warn('MediaRecorder is not available in this browser.');
+      return false;
+    }
+    this.deselect(); // also hides every gizmo/handle
+    this.interpPlaying = false;
+    this.seqPlaying = false;
+    const stream = renderer.domElement.captureStream(60);
+    const mime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']
+      .find((m) => MediaRecorder.isTypeSupported(m));
+    const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    const chunks = [];
+    rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+    rec.onstop = () => {
+      const blob = new Blob(chunks, { type: 'video/webm' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `${name}.webm`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      this.recording = null;
+      if (this.ui) this.ui.onRecordingChanged();
+    };
+    applyStatesT(states, 0); // first frames show the start pose, not the editor state
+    this.recording = { states, t: 0, secs: SEQ_SEG_SECONDS * (states.length - 1), rec };
+    rec.start();
+    if (this.ui) this.ui.onRecordingChanged();
+    return true;
   },
 
   // Show/replace/remove the translucent ghost couple for snapshot A or B.
@@ -1470,7 +1763,7 @@ renderer.domElement.addEventListener('pointermove', (e) => {
   pointerRay(e);
   const visible = app.visibleFigures();
 
-  if (app.mode === 'move' || app.mode === 'step' || app.mode === 'hips') {
+  if (app.mode === 'move' || app.mode === 'step' || app.mode === 'hips' || app.mode === 'pin') {
     clearHover();
     const hits = raycaster.intersectObjects(visible.map((f) => f.group), true);
     renderer.domElement.style.cursor = hits.some((h) => h.object.visible) ? 'pointer' : '';
@@ -1488,6 +1781,22 @@ function handleClick(e) {
   pointerRay(e);
 
   const visible = app.visibleFigures();
+  if (app.mode === 'pin') {
+    // Author a contact pin: a spot on one dancer, then a spot on the other.
+    // Pick spheres are invisible raycast targets — a pin wants the surface.
+    const hits = raycaster.intersectObjects(visible.map((f) => f.group), true);
+    const hit = hits.find((h) => h.object.visible && !h.object.userData.isPick);
+    if (hit) {
+      let o = hit.object;
+      while (o && !o.userData.figure) o = o.parent;
+      if (o) app.pinClick(o.userData.figure, hit.point);
+    } else {
+      app.pinPending = null;
+      pinPendingMarker.visible = false;
+      if (app.ui) app.ui.onPinsChanged();
+    }
+    return;
+  }
   if (app.mode === 'move' || app.mode === 'step' || app.mode === 'hips') {
     const hits = raycaster.intersectObjects(visible.map((f) => f.group), true);
     const hit = hits.find((h) => h.object.visible);
@@ -1557,13 +1866,15 @@ function editedArm(editing) {
 
 const clock = new THREE.Clock();
 let statsTimer = 0;
-let vizFlags = { cog: true, support: true, couple: true };
+let vizFlags = { cog: true, support: true, couple: true, dissoc: false };
 
 function applyVizVisibility() {
   const both = leader.group.visible && follower.group.visible;
   vizLeader.setVisible(vizFlags.cog && leader.group.visible, vizFlags.support && leader.group.visible);
   vizFollower.setVisible(vizFlags.cog && follower.group.visible, vizFlags.support && follower.group.visible);
   vizCouple.setVisible(vizFlags.couple && both, vizFlags.couple && vizFlags.support && both);
+  dissocLeader.setVisible(vizFlags.dissoc && leader.group.visible);
+  dissocFollower.setVisible(vizFlags.dissoc && follower.group.visible);
 }
 
 function animate() {
@@ -1572,10 +1883,39 @@ function animate() {
   orbit.update();
 
   if (app.interpPlaying) {
-    app.interpT = Math.min(1, app.interpT + dt / 2.4);
+    app.interpT = Math.min(1, app.interpT + dt / SEQ_SEG_SECONDS);
     app.applyInterp(app.interpT);
     if (app.interpTick) app.interpTick(app.interpT);
     if (app.interpT >= 1) app.interpPlaying = false;
+  }
+
+  // Advance the movement-sequence player (Play button in the Sequence panel).
+  if (app.seqPlaying) {
+    const segs = app.seqStates.length - 1;
+    if (segs < 1) app.seqPlaying = false;
+    else {
+      app.seqT = Math.min(1, app.seqT + dt / (SEQ_SEG_SECONDS * segs));
+      applyStatesT(app.seqStates, app.seqT);
+      if (app.seqTick) app.seqTick(app.seqT);
+      if (app.seqT >= 1) {
+        app.seqPlaying = false;
+        const done = app.seqDone;
+        app.seqDone = null;
+        if (done) done();
+      }
+    }
+  }
+
+  // Advance a video capture's playback; stop the recorder shortly after the
+  // final pose so the last frames make it into the file.
+  if (app.recording) {
+    const r = app.recording;
+    r.t = Math.min(1, r.t + dt / r.secs);
+    applyStatesT(r.states, r.t);
+    if (r.t >= 1 && !r.stopping) {
+      r.stopping = true;
+      setTimeout(() => r.rec.stop(), 150);
+    }
   }
 
   // Advance in-flight walking steps: roll the body over the support foot,
@@ -1597,6 +1937,11 @@ function animate() {
   const editing = embraceEditing();
   embrace.maintainTorso(editing?.figure ?? null);
 
+  // Contact pins, translation half: a pin whose adapting end rides the torso
+  // slides that dancer, so it runs with the torso pull — before collision and
+  // the floor clamp, which both get to push back.
+  pins.maintainBody(editing?.figure ?? null);
+
   // Body collision: the dancers may touch but never enter each other's
   // space — resolve any capsule penetration by sliding the partner of
   // whoever is being edited (see collision.js). The arm currently being posed
@@ -1611,6 +1956,17 @@ function animate() {
   follower.clampToFloor();
 
   embrace.maintainHands(editing);
+
+  // Contact pins, limb half: an adapting arm/leg re-solves so its pinned spot
+  // reaches the partner's. After the embrace hands so a pin on an embrace arm
+  // deliberately wins (the pin is the more specific intent).
+  pins.maintainLimbs(editing?.figure ?? null);
+  pins.updateVisuals();
+  if (app.pinPending) {
+    app.pinPending.figure.nodes[app.pinPending.node].localToWorld(
+      pinPendingMarker.position.copy(app.pinPending.local),
+    );
+  }
 
   // Pivot the skeletal limb bones about their anatomical joints (the embrace,
   // collision and IK above all move rig joints directly, so re-slave the atlas
@@ -1632,6 +1988,11 @@ function animate() {
   if (both) {
     couple = coupleReport(leader, follower);
     vizCouple.update(couple);
+  }
+
+  if (vizFlags.dissoc) {
+    if (leader.group.visible) dissocLeader.update(leader);
+    if (follower.group.visible) dissocFollower.update(follower);
   }
 
   statsTimer += dt;
