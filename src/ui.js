@@ -29,6 +29,7 @@ export function initUI(app) {
   const hipsPlantBox = $('hips-plant');
   const selectMode = (mode) => {
     setActive(modeButtons, (b) => b.dataset.mode === mode);
+    $('draw-tools').hidden = mode !== 'draw';
     app.setMode(mode);
     // The planted-feet choice only exists while moving the hips.
     hipsPlantBox.hidden = mode !== 'hips';
@@ -43,6 +44,25 @@ export function initUI(app) {
   const plantR = $('plant-R');
   plantL.addEventListener('change', () => { app.hipsPlant.L = plantL.checked; });
   plantR.addEventListener('change', () => { app.hipsPlant.R = plantR.checked; });
+
+  // Draw-mode sub-toolbar: which annotation the next floor clicks author.
+  const drawToolBtns = [...document.querySelectorAll('#draw-tools button[data-tool]')];
+  for (const btn of drawToolBtns) {
+    btn.addEventListener('click', () => {
+      setActive(drawToolBtns, (b) => b === btn);
+      app.setDrawTool(btn.dataset.tool);
+    });
+  }
+  const drawUndo = $('draw-undo');
+  const drawClear = $('draw-clear');
+  drawUndo.addEventListener('click', () => app.removeLastDrawing());
+  drawClear.addEventListener('click', () => app.clearDrawings());
+  const syncDrawButtons = () => {
+    const empty = app.drawings.length === 0;
+    drawUndo.disabled = empty;
+    drawClear.disabled = empty;
+  };
+  syncDrawButtons();
 
   // Collapsible sidebar sections: clicking a heading folds it away.
   for (const section of document.querySelectorAll('#sidebar section')) {
@@ -1284,6 +1304,8 @@ export function initUI(app) {
     onRecordingChanged() {
       syncRecordButtons();
     },
+    // A drawing was added, removed, or cleared.
+    onDrawingsChanged: syncDrawButtons,
     refreshJointValues,
     updateStats,
   };

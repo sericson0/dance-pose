@@ -46,6 +46,7 @@ body {
 .topbar-check:hover { background: var(--panel-2); }
 
 .btn-group { display: flex; border-radius: 8px; overflow: hidden; border: 1px solid var(--border); }
+.btn-group[hidden] { display: none; }
 .btn-group button {
   background: var(--panel); color: var(--text); border: none;
   padding: 7px 12px; cursor: pointer; font-size: 12.5px;
