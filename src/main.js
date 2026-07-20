@@ -9,6 +9,7 @@ import { PRESETS } from './presets.js';
 import { loadSkeletonBones, loadMuscleMeshes, loadBodyMesh } from './skeletonMesh.js';
 import { Embrace } from './embrace.js';
 import { resolveBodyCollision, bodyClearance } from './collision.js';
+import { Drawings } from './draw.js';
 import { initUI } from './ui.js';
 
 // ---------------------------------------------------------------- scene
@@ -162,11 +163,13 @@ class BalanceViz {
   constructor(colorHex) {
     this.group = new THREE.Group();
     this.color = new THREE.Color(colorHex);
+    this.front = false; // draw the COG indicator in front of the dancers
 
     this.cogBall = new THREE.Mesh(
       new THREE.SphereGeometry(0.022, 14, 10),
       new THREE.MeshBasicMaterial({ color: colorHex }),
     );
+    this.cogBall.userData.viz = this; // click routing (see handleClick)
     this.dropLine = new THREE.Line(
       new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
       new THREE.LineDashedMaterial({ color: colorHex, dashSize: 0.03, gapSize: 0.02, transparent: true, opacity: 0.8 }),
@@ -212,12 +215,36 @@ class BalanceViz {
     this.visibleHull = hullOn;
     if (!hullOn) this.hullLine.visible = false;
   }
+
+  // Draw the COG ball / drop line / floor marker through the dancers (depth
+  // test off + late render order), so the indicator can't hide inside or
+  // behind a body. Toggled by clicking the COG ball in the 3D view.
+  setFront(on) {
+    this.front = !!on;
+    for (const o of [this.cogBall, this.dropLine, this.marker]) {
+      o.material.depthTest = !this.front;
+      o.renderOrder = this.front ? 40 : 0;
+    }
+    // Late transparent-pass draw is what keeps it above the (transparent)
+    // ghosts and hover spheres; restore the plain opaque look when off.
+    this.cogBall.material.transparent = this.front;
+    this.marker.material.transparent = this.front;
+    this.cogBall.material.color.copy(this.color);
+    if (this.front) this.cogBall.material.color.lerp(new THREE.Color(0xffffff), 0.4);
+    this.cogBall.scale.setScalar(this.front ? 1.35 : 1);
+    this.marker.scale.setScalar(this.front ? 1.25 : 1);
+  }
 }
 
 const vizLeader = new BalanceViz(0x7fb3e8);
 const vizFollower = new BalanceViz(0xe89ab8);
 const vizCouple = new BalanceViz(0xffe08a);
 scene.add(vizLeader.group, vizFollower.group, vizCouple.group);
+
+// Floor annotations (Draw mode): lines / arrows / circles / text for teaching
+// diagrams — step directions, giro circles, labels. See draw.js.
+const drawings = new Drawings();
+scene.add(drawings.group, drawings.previewGroup);
 
 // ------------------------------------------------- pose interpolation (A→B)
 // Component-wise joint lerp is safe: both endpoints respect the joint limits,
@@ -352,6 +379,25 @@ function swivelChainFor(jointName) {
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 
+// Where the current pointer ray meets the dance floor (y = 0), or null.
+const _floorPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+function floorPointAtPointer(out = new THREE.Vector3()) {
+  return raycaster.ray.intersectPlane(_floorPlane, out);
+}
+
+// Accept {x,z} / {x,y,z} / Vector3 and pin it to the floor plane.
+function toFloorV3(p) {
+  return new THREE.Vector3(p.x ?? 0, 0, p.z ?? 0);
+}
+
+// Yaw that makes floor text at `pos` read right-way-up from the camera.
+function textYawFromCamera(pos) {
+  const d = new THREE.Vector3(pos.x - camera.position.x, 0, pos.z - camera.position.z);
+  if (d.lengthSq() < 1e-6) return 0;
+  d.normalize();
+  return Math.atan2(-d.x, -d.z);
+}
+
 // ---------------------------------------------------------- whole-figure helpers
 const _UP = new THREE.Vector3(0, 1, 0);
 
@@ -453,6 +499,11 @@ const app = {
   presets: PRESETS,
   mode: 'rotate',
   chainMode: 'open', // 'open' (move distal) | 'closed' (anchor foot, move proximal)
+  drawTool: 'line', // Draw-mode sub-tool: 'line' | 'arrow' | 'circle' | 'text'
+  drawPending: null, // first corner of a two-click shape, awaiting the second
+  draw: drawings, // the Drawings instance (verification introspects its group)
+  cogViz: { leader: vizLeader, follower: vizFollower, couple: vizCouple },
+  get drawings() { return drawings.list(); },
   selected: null, // { figure, jointName }
   activeFigure: null, // the figure driven by Move/Step (keyboard nudges act on it)
   ikState: null, // { figure, chain }
@@ -510,7 +561,71 @@ const app = {
 
   setMode(mode) {
     this.mode = mode;
+    this.cancelDraw();
     this.deselect();
+  },
+
+  // ------------------------------------------------------------ floor drawings
+  // Annotations are scene content, not pose state: they live outside the pose
+  // undo stack and are managed by the Draw toolbar's ⌫ Last / Clear.
+  setDrawTool(tool) {
+    this.drawTool = tool;
+    this.cancelDraw();
+  },
+
+  cancelDraw() {
+    this.drawPending = null;
+    drawings.clearPreview();
+  },
+
+  addDrawLine(a, b) {
+    const o = drawings.addLine(toFloorV3(a), toFloorV3(b));
+    this.ui?.onDrawingsChanged?.();
+    return o;
+  },
+
+  addDrawArrow(a, b) {
+    const o = drawings.addArrow(toFloorV3(a), toFloorV3(b));
+    this.ui?.onDrawingsChanged?.();
+    return o;
+  },
+
+  addDrawCircle(center, radius) {
+    const o = drawings.addCircle(toFloorV3(center), radius);
+    this.ui?.onDrawingsChanged?.();
+    return o;
+  },
+
+  // Text reads right-way-up from the current camera unless a yaw is given.
+  addDrawText(pos, text, yaw) {
+    const p = toFloorV3(pos);
+    const o = drawings.addText(p, String(text), yaw ?? textYawFromCamera(p));
+    this.ui?.onDrawingsChanged?.();
+    return o;
+  },
+
+  removeLastDrawing() {
+    drawings.removeLast();
+    this.ui?.onDrawingsChanged?.();
+  },
+
+  clearDrawings() {
+    this.cancelDraw();
+    drawings.clear();
+    this.ui?.onDrawingsChanged?.();
+  },
+
+  // ------------------------------------------------------------ COG highlight
+  // Draw a COG indicator through/in front of the dancers (it otherwise hides
+  // inside the body). `which` = 'leader' | 'follower' | 'couple', or omit for
+  // all three. Clicking a COG ball in the 3D view toggles the same state.
+  setCogHighlight(on, which = null) {
+    const targets = which ? [this.cogViz[which]].filter(Boolean) : Object.values(this.cogViz);
+    for (const v of targets) v.setFront(on);
+  },
+
+  cogHighlight() {
+    return { leader: vizLeader.front, follower: vizFollower.front, couple: vizCouple.front };
   },
 
   // Raise/lower the pelvis (hip-height slider). A rigid root compensation
@@ -1016,6 +1131,16 @@ renderer.domElement.addEventListener('pointermove', (e) => {
   raycaster.setFromCamera(pointer, camera);
   const visible = app.visibleFigures();
 
+  if (app.mode === 'draw') {
+    clearHover();
+    renderer.domElement.style.cursor = 'crosshair';
+    if (app.drawPending) {
+      const p = floorPointAtPointer();
+      if (p) drawings.showPreview(app.drawTool, app.drawPending, p);
+    }
+    return;
+  }
+
   if (app.mode === 'move' || app.mode === 'step') {
     clearHover();
     const hits = raycaster.intersectObjects(visible.map((f) => f.group), true);
@@ -1030,16 +1155,69 @@ renderer.domElement.addEventListener('pointermove', (e) => {
   else clearHover();
 });
 
+// Clicking a COG ball toggles drawing that COG indicator in front of the
+// dancers. A highlighted (in-front) ball wins the click outright — it is what
+// the user sees over everything else — otherwise the nearest of ball vs.
+// whatever the mode would pick wins, so joint/figure picking stays intact.
+function cogBallHit() {
+  const balls = [vizLeader, vizFollower, vizCouple].map((v) => v.cogBall).filter((b) => b.visible);
+  return raycaster.intersectObjects(balls, false)[0] ?? null;
+}
+
+function cogWinsClick(cogHit, otherHit) {
+  if (!cogHit) return false;
+  return cogHit.object.userData.viz.front || !otherHit || cogHit.distance <= otherHit.distance;
+}
+
+function toggleCogHit(hit) {
+  const viz = hit.object.userData.viz;
+  viz.setFront(!viz.front);
+}
+
+// Two-click authoring on the floor plane: the first click anchors the shape,
+// the second commits it (Text is a single click + prompt). A click that
+// misses the floor cancels the pending shape; so does Esc or a mode change.
+function handleDrawClick() {
+  const p = floorPointAtPointer();
+  if (!p) { app.cancelDraw(); return; }
+  if (app.drawTool === 'text') {
+    const text = window.prompt('Label to write on the floor:');
+    if (text && text.trim()) app.addDrawText(p, text.trim());
+    return;
+  }
+  if (!app.drawPending) {
+    app.drawPending = p.clone();
+    drawings.showPreview(app.drawTool, app.drawPending, p);
+    return;
+  }
+  const a = app.drawPending;
+  app.cancelDraw();
+  if (app.drawTool === 'line') app.addDrawLine(a, p);
+  else if (app.drawTool === 'arrow') app.addDrawArrow(a, p);
+  else if (app.drawTool === 'circle') app.addDrawCircle(a, a.distanceTo(p));
+}
+
 function handleClick(e) {
   const rect = renderer.domElement.getBoundingClientRect();
   pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
 
+  const cogHit = cogBallHit();
+
+  if (app.mode === 'draw') {
+    // Mid-shape, floor clicks always continue the drawing; otherwise the COG
+    // ball keeps its toggle even in Draw mode.
+    if (!app.drawPending && cogHit) { toggleCogHit(cogHit); return; }
+    handleDrawClick();
+    return;
+  }
+
   const visible = app.visibleFigures();
   if (app.mode === 'move' || app.mode === 'step') {
     const hits = raycaster.intersectObjects(visible.map((f) => f.group), true);
     const hit = hits.find((h) => h.object.visible);
+    if (cogWinsClick(cogHit, hit)) { toggleCogHit(cogHit); return; }
     if (hit) {
       let o = hit.object;
       while (o && !o.userData.figure) o = o.parent;
@@ -1055,6 +1233,7 @@ function handleClick(e) {
 
   const spheres = visible.flatMap((f) => f.pickSpheres);
   const hits = raycaster.intersectObjects(spheres, false);
+  if (cogWinsClick(cogHit, hits[0])) { toggleCogHit(cogHit); return; }
   if (hits.length === 0) {
     app.deselect();
     return;
@@ -1177,6 +1356,11 @@ app.setViz = (flags) => {
 };
 app.setVisibleFiguresRefresh = applyVizVisibility;
 app.setViz(vizFlags);
+
+// Esc abandons a half-authored floor drawing.
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') app.cancelDraw();
+});
 
 window.addEventListener('keydown', (e) => {
   if (!(e.ctrlKey || e.metaKey)) return;

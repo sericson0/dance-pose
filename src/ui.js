@@ -20,11 +20,31 @@ export function initUI(app) {
   const modeButtons = [...document.querySelectorAll('#mode-buttons button')];
   const selectMode = (mode) => {
     modeButtons.forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
+    $('draw-tools').hidden = mode !== 'draw';
     app.setMode(mode);
   };
   for (const btn of modeButtons) {
     btn.addEventListener('click', () => selectMode(btn.dataset.mode));
   }
+
+  // Draw-mode sub-toolbar: which annotation the next floor clicks author.
+  const drawToolBtns = [...document.querySelectorAll('#draw-tools button[data-tool]')];
+  for (const btn of drawToolBtns) {
+    btn.addEventListener('click', () => {
+      drawToolBtns.forEach((b) => b.classList.toggle('active', b === btn));
+      app.setDrawTool(btn.dataset.tool);
+    });
+  }
+  const drawUndo = $('draw-undo');
+  const drawClear = $('draw-clear');
+  drawUndo.addEventListener('click', () => app.removeLastDrawing());
+  drawClear.addEventListener('click', () => app.clearDrawings());
+  const syncDrawButtons = () => {
+    const empty = app.drawings.length === 0;
+    drawUndo.disabled = empty;
+    drawClear.disabled = empty;
+  };
+  syncDrawButtons();
 
   // Collapsible sidebar sections: clicking a heading folds it away.
   for (const section of document.querySelectorAll('#sidebar section')) {
@@ -607,6 +627,7 @@ export function initUI(app) {
       undoBtn.disabled = app.history.length === 0;
       redoBtn.disabled = app.redoStack.length === 0;
     },
+    onDrawingsChanged: syncDrawButtons,
     refreshJointValues,
     updateStats,
   };

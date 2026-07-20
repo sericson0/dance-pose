@@ -18,6 +18,15 @@
         <button data-mode="ik" title="Click a hand or foot to drag the whole limb; click an elbow or knee to swivel it while the hand/foot and shoulder/hip stay put">Drag limb</button>
         <button data-mode="move" title="Click a figure, then drag to slide it on the floor. Arrow keys nudge: ↑↓ forward/back, ←→ turn (pivoting on the support foot). Shift = coarser.">Move figure</button>
         <button data-mode="step" title="Click a dancer to take a walking step forward — keep clicking to walk. Arrow keys: ↑↓ step forward/back, ←→ turn. Turn on 'Move as couple' to walk the pair together.">Walk / step</button>
+        <button data-mode="draw" title="Draw teaching diagrams on the floor: pick Line / Arrow / Circle / Text, then click two points on the floor (Text: one click, then type the label). Esc cancels a half-drawn shape.">Draw</button>
+      </div>
+      <div id="draw-tools" class="btn-group" hidden>
+        <button data-tool="line" class="active" title="Two clicks: start and end">Line</button>
+        <button data-tool="arrow" title="Two clicks: tail, then tip">Arrow</button>
+        <button data-tool="circle" title="Two clicks: center, then a point on the rim">Circle</button>
+        <button data-tool="text" title="One click on the floor, then type the label">Text</button>
+        <button id="draw-undo" title="Remove the most recent drawing">⌫ Last</button>
+        <button id="draw-clear" title="Remove all drawings">Clear</button>
       </div>
       <div id="show-buttons" class="btn-group" title="Show one dancer or both">
         <button data-show="both" class="active">Both</button>
@@ -43,7 +52,7 @@
           <label><input type="checkbox" id="layer-muscle" /> Muscles</label>
         </div>
         <div class="check-row">
-          <label><input type="checkbox" id="show-cog" checked /> Center of gravity</label>
+          <label title="Show each dancer's center of gravity. Tip: click a COG ball in the 3D view to draw it in front of the dancers (it can otherwise hide inside the body)."><input type="checkbox" id="show-cog" checked /> Center of gravity</label>
           <label><input type="checkbox" id="show-support" checked /> Support base</label>
         </div>
         <div class="check-row">
