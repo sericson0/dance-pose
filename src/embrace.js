@@ -5,12 +5,15 @@ import { solveTwoBone } from './ik.js';
 // The tango embrace as a set of per-frame constraints (see main.js's loop),
 // modelled on the real embrace:
 //
-//  * Closed side — the leader's right arm passes UNDER the follower's left
-//    arm and around her, palm resting flat on her back below her left
-//    shoulder blade; the follower's left arm drapes OVER his right arm, palm
-//    on the outside of his right deltoid. The over/under layering comes from
-//    the authored embrace pose (presets.js) and survives because the
-//    two-bone solve preserves each arm's swivel.
+//  * Closed side — both hands rest on the partner's back. The leader's right
+//    arm passes UNDER the follower's left arm and around her, palm flat on
+//    her back below her left shoulder blade; the follower's left arm drapes
+//    OVER his right arm and around his shoulder, palm on his upper back
+//    behind his right shoulder blade. Hers slides out onto his shoulder as
+//    the couple opens toward salon distance, where reaching around him no
+//    longer fits her arm (CLOSED_TARGETS / FOLLOWER_OPEN_REST). The
+//    over/under layering comes from the authored embrace pose (presets.js)
+//    and survives because the two-bone solve preserves each arm's swivel.
 //  * Open side — the leader's LEFT hand holds the follower's RIGHT palm to
 //    palm: the palms meet along the ray from his chest through the clasp,
 //    his palm facing her, hers facing him, the palm surfaces in contact.
@@ -39,14 +42,50 @@ const ARMS = {
 };
 
 // Closed-side palm rest points in the PARTNER's chest frame, as fractions of
-// the partner's height: the leader's right palm on the follower's back below
-// her left shoulder blade (low enough that his forearm passes under her
-// armpit); the follower's left palm on the outside of the leader's right
-// deltoid, so her arm lies over his.
+// the partner's height. Both hands rest on the partner's BACK — that is what
+// the closed side of a tango embrace is: the leader's right palm on the
+// follower's back below her left shoulder blade (low enough that his forearm
+// passes under her armpit), and the follower's left palm high on his back
+// behind his right shoulder blade, her arm draped OVER his right arm and
+// around his shoulder.
+//
+// Hers used to sit on the OUTSIDE of his right deltoid (x -0.135, z +0.035).
+// The solve reached it faithfully (0.4 cm) but the result was not an embrace:
+// a point out beyond his arm, level with the top of his shoulder and slightly
+// in FRONT of it, can only be reached from underneath, so her elbow winged
+// forward and low (measured 20 cm in front of his chest, 12 cm below it) and
+// her hand stood up at his shoulder like a fist rather than lying on him.
+// Moving the point behind and inboard turns the whole arm over: the forearm
+// now crosses his shoulder from above and the elbow falls where a draped arm's
+// elbow belongs.
+//
+// But it is only reachable while the couple is actually close — going around
+// someone costs a lot more arm than resting on the near side of them, and her
+// arm is the shorter of the two. So her hand keeps BOTH homes and slides
+// between them with the embrace, which is what a real follower's arm does as
+// the couple opens from close embrace out to salon: around his back when the
+// chests are together, out onto his shoulder and upper arm as the space opens
+// up. Without the slide her rest point goes ~3 cm past her fingertips at salon
+// distance and the arm does not merely fall short — the shoulder ratchets into
+// its -170°/-30° limit corner and her arm ends up straight over her head (see
+// MAX_REACH).
 const CLOSED_TARGETS = {
   leaderClosed: new THREE.Vector3(0.085, 0.025, -0.075),
-  followerClosed: new THREE.Vector3(-0.135, 0.075, 0.035),
+  followerClosed: new THREE.Vector3(-0.055, 0.065, -0.085), // close: on his back
 };
+
+// Where her closed-side hand slides to as the embrace opens: the outside of
+// his right deltoid, her arm draped over his.
+const FOLLOWER_OPEN_REST = new THREE.Vector3(-0.135, 0.075, 0.035);
+
+// The chest gaps that slide spans, as multiples of the held contact distance:
+// on his back out to NEAR, fully out on his shoulder by FAR. NEAR sits above
+// the gap the shipped contact presets actually settle at (~1.4×, since the
+// bodies rest surface-on-surface a little wider than the held distance), so a
+// close embrace keeps the hand squarely on his back rather than part-way
+// through the slide.
+const CLOSED_SLIDE_NEAR = 1.5;
+const CLOSED_SLIDE_FAR = 2.2;
 
 // Chest-to-chest distance when the torsos touch, as a fraction of the two
 // heights combined (the chest node sits on the body axis, so this is the sum
@@ -71,9 +110,9 @@ export const CLASP_WRAP_DEG = 10;
 // palm contact carries the connection, so well short of a full fist curl.
 const CLASP_CURL = 0.65;
 
-// The closed-side hands rest ON the partner (his right on her back, her left on
-// his shoulder), so their fingers close softly onto the body instead of staying
-// splayed like the avatar's rest hand — a gentle curl, not the full clasp grip.
+// The closed-side hands rest ON the partner's back, so their fingers close
+// softly onto the body instead of staying splayed like the avatar's rest hand
+// — a gentle curl, not the full clasp grip.
 const CLOSED_CURL = 0.45;
 
 // A palm cannot fold in closer to its own shoulder than roughly this (fraction
@@ -81,6 +120,21 @@ const CLOSED_CURL = 0.45;
 // clamp a too-near clasp point makes the per-frame solve ratchet the arm
 // around its joint limits instead of settling.
 const MIN_REACH = 0.12;
+
+// ...and the far end of the same rule: a goal beyond this fraction of the
+// arm's own straight-out palm reach is pulled back onto it. An out-of-reach
+// goal is the more dangerous of the two, because the failure does not look
+// like a shortfall — it looks like a different pose entirely. solveTwoBone
+// straightens the arm and then swings the shoulder to aim at the target, and
+// once the target is outside the sphere the arm can cover, that aim plus the
+// per-frame re-solve ratchets the shoulder around into an overhead flail:
+// measured with the goal just 2.9 cm past her fingertips, the follower's
+// shoulder wound up at -170° with her palm 45 cm from the goal and half a
+// metre above it, arm straight up over her head. Clamped, the same geometry
+// leaves the arm reaching where it was pointed and simply short. 0.97 rather
+// than 1.0 keeps the elbow off full lock, where the swivel degenerates (the
+// elbow sits on the shoulder→wrist axis and has no circle to be chosen on).
+const MAX_REACH = 0.97;
 
 // Working pronation span the embrace arm solves within, in degrees — a shade
 // inside the elbow joint's own ±120° so the solve never parks the forearm at
@@ -257,32 +311,66 @@ export class Embrace {
     return PALM_GAP * (this.leader.height + this.follower.height) / 2;
   }
 
+  // How open the embrace is: 0 while the chests are together (close embrace),
+  // 1 once they have opened out to salon distance.
+  openness() {
+    const contact = this.contactDistance();
+    return THREE.MathUtils.clamp(
+      (this.chestGap() - CLOSED_SLIDE_NEAR * contact)
+        / ((CLOSED_SLIDE_FAR - CLOSED_SLIDE_NEAR) * contact), 0, 1,
+    );
+  }
+
   // World position a closed-side palm should rest at, on the partner's body.
+  // His stays put on her back — it reaches at every separation. Hers slides
+  // from his back out onto his shoulder as the embrace opens (see
+  // FOLLOWER_OPEN_REST).
   closedTargetWorld(armKey) {
     const p = this.partner(ARMS[armKey].role);
     p.group.updateMatrixWorld(true);
-    return p.nodes.chest.localToWorld(CLOSED_TARGETS[armKey].clone().multiplyScalar(p.height));
+    const local = CLOSED_TARGETS[armKey].clone();
+    if (armKey === 'followerClosed') local.lerp(FOLLOWER_OPEN_REST, this.openness());
+    return p.nodes.chest.localToWorld(local.multiplyScalar(p.height));
   }
 
-  // The rest point the arm actually solves to: the raw target pushed out to
-  // the palm's minimum fold-in radius. In close embrace the follower's rest
-  // point on the leader's deltoid sits nearer her own shoulder than a palm
-  // can fold, so her hand comes to rest on this clamped point instead.
+  // The rest point the arm actually solves to: the raw target pulled into the
+  // shell the palm can actually occupy around its own shoulder. In close
+  // embrace the follower's rest point can sit nearer her shoulder than a palm
+  // can fold; with the couple opened up it can sit past her fingertips. Either
+  // way her hand comes to rest on this clamped point, so it — not the raw
+  // target — is what an achieved-position check should measure against.
   closedGoalWorld(armKey) {
     const arm = ARMS[armKey];
-    return this.#minReachClamp(this.figure(arm.role), arm, this.closedTargetWorld(armKey));
+    return this.#reachClamp(this.figure(arm.role), arm, this.closedTargetWorld(armKey));
   }
 
-  // Keep an arm goal outside the palm's minimum fold-in radius around its
-  // own shoulder (see MIN_REACH).
-  #minReachClamp(f, arm, goal) {
+  // How far the VISIBLE palm can get from the shoulder with the arm straight:
+  // both bones end to end, plus however far the palm currently sits beyond the
+  // rig wrist (measured live, since that offset is pose-dependent).
+  #palmReach(f, arm) {
+    const at = (n) => f.nodes[n].getWorldPosition(new THREE.Vector3());
+    const shoulder = at(arm.shoulder);
+    const elbow = at(arm.elbow);
+    const wrist = at(arm.wrist);
+    return shoulder.distanceTo(elbow) + elbow.distanceTo(wrist)
+      + wrist.distanceTo(handCenter(f, arm.wrist.slice(-1)));
+  }
+
+  // Keep an arm goal inside the shell its palm can reach around its own
+  // shoulder — no nearer than the fold-in radius (MIN_REACH), no farther than
+  // the arm is long (MAX_REACH). Both ends exist for the same reason: a goal
+  // the arm cannot occupy makes the per-frame solve ratchet instead of settle.
+  #reachClamp(f, arm, goal) {
     const shoulder = f.nodes[arm.shoulder].getWorldPosition(new THREE.Vector3());
     const offset = goal.clone().sub(shoulder);
     const minR = MIN_REACH * f.height;
-    if (offset.lengthSq() >= minR * minR) return goal;
-    return offset.lengthSq() < 1e-8
-      ? shoulder.addScaledVector(new THREE.Vector3(0, -1, 0), minR)
-      : shoulder.addScaledVector(offset.normalize(), minR);
+    if (offset.lengthSq() < 1e-8) {
+      return shoulder.addScaledVector(new THREE.Vector3(0, -1, 0), minR);
+    }
+    const d = offset.length();
+    const maxR = MAX_REACH * this.#palmReach(f, arm);
+    if (d >= minR && d <= maxR) return goal;
+    return shoulder.addScaledVector(offset.divideScalar(d), THREE.MathUtils.clamp(d, minR, maxR));
   }
 
   // Close embrace: restore the contact distance by sliding the partner of the
@@ -378,9 +466,13 @@ export class Embrace {
     }
     if (edited !== 'followerClosed') {
       this.#solveArm('followerClosed', this.closedTargetWorld('followerClosed'));
-      const upperArm = this.leader.worldPos('shoulder_R')
-        .add(this.leader.worldPos('elbow_R')).multiplyScalar(0.5);
-      const dir = upperArm.sub(handCenter(this.follower, 'L'));
+      // Same rule as his: a palm resting on a back faces INTO the body, so aim
+      // it at the partner's chest node — the torso axis, which is square to
+      // the back surface wherever on it the hand has landed. Hers used to aim
+      // at the midpoint of his upper arm, which is roughly where her hand
+      // already was, so the direction was near-degenerate and left her palm
+      // 82° off the surface it was supposed to be lying on.
+      const dir = this.leader.worldPos('chest').sub(handCenter(this.follower, 'L'));
       if (dir.lengthSq() > 1e-8) this.#pronate(this.follower, ARMS.followerClosed, dir.normalize());
     }
   }
@@ -669,10 +761,11 @@ export class Embrace {
     const f = this.figure(arm.role);
     const chain = { root: arm.shoulder, mid: arm.elbow, effector: arm.wrist, hingeSign: -1 };
     if (!fingerDir) f.nodes[arm.wrist].rotation.set(0, 0, 0);
-    // Keep the goal outside the palm's minimum fold-in radius — without the
-    // clamp a too-near goal makes the per-frame solve ratchet the arm around
-    // its joint limits instead of settling.
-    goal = this.#minReachClamp(f, arm, goal);
+    // Keep the goal inside the shell the palm can reach around its own
+    // shoulder — without the clamp a goal that is too near, or past the
+    // fingertips, makes the per-frame solve ratchet the arm around its joint
+    // limits instead of settling.
+    goal = this.#reachClamp(f, arm, goal);
     // Closed-side arms keep whatever swivel the pose was authored with (see
     // presets.js: elbows down, the leader's right forearm layered under the
     // follower's left arm, hers above his) — the two-bone solve preserves

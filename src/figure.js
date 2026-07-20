@@ -479,10 +479,15 @@ export class Figure {
     // [seated base, parent base, parent is a rig node?]. Rest rotations are all
     // identity, so a parent's local axes equal the figure axes and the child's
     // local offset is a plain figure-local subtraction.
+    // LEGS ONLY. The arm chain used to be seated here too, but its rig joints
+    // now sit ON the anatomical centres (skeletonDef.js), so an arm atlas node
+    // would be a zero-offset duplicate of its rig node — #seatNode falls
+    // through to the rig node and the arm has ONE frame. That also collapses
+    // handMesh's old split, where the palm's ORIENTATION was measured in the
+    // rig wrist and its POSITION stored in the atlas wrist. The legs keep their
+    // atlas sub-tree because their rig joints are still Drillis–Contini, which
+    // the COG, the sole corners and the floor clamp all depend on.
     const chain = [
-      ['shoulder', 'scapula', true],
-      ['elbow', 'shoulder', false],
-      ['wrist', 'elbow', false],
       ['hip', 'pelvis', true],
       ['knee', 'hip', false],
       ['ankle', 'knee', false],
@@ -830,10 +835,33 @@ export class Figure {
       return c.multiplyScalar(1 / k);
     };
     const PARENT = { shoulder: 'chest', elbow: 'shoulder', wrist: 'elbow', hip: 'pelvis', knee: 'hip', ankle: 'knee', toes: 'ankle' };
+    // The two joints whose PARENT is a torso cluster, located from the child
+    // side instead. "Verts of this bone nearest the parent cluster's centroid"
+    // is a good rule while the parent is a limb bone — the humerus's centroid
+    // sits up the arm, so the nearest radius/ulna verts really are the elbow.
+    // It fails badly for the shoulder and the hip, whose parents are the whole
+    // chest and the whole pelvis: those centroids lie far away and medial, and
+    // they drag the estimate down and inward. Measured against the atlas's own
+    // bones, the error was 74 mm at the shoulder (estimated upper arm 259 mm
+    // against a real humerus of 333 mm) and 56 mm at the hip (thigh 418 mm
+    // against a femur of 474 mm) — and since this rest positions the atlas
+    // display tree AND drives the body retarget, every layer was pivoting the
+    // limb about a joint centre that far from the real head of the bone.
+    // Both are instead the far end of their OWN bone, away from the next joint
+    // down the chain: the head of the humerus, the head of the femur.
+    const FROM_CHILD = { shoulder: 'elbow', hip: 'knee' };
     for (const side of ['_L', '_R']) {
       for (const [base, parBase] of Object.entries(PARENT)) {
         const a = verts.get(`${base}${side}`);
         if (!a || !a.length) continue;
+        const childBase = FROM_CHILD[base];
+        if (childBase) {
+          const ch = verts.get(`${childBase}${side}`);
+          if (ch && ch.length) {
+            out.set(`${base}${side}`, extremeMean(a, centroid(ch), 0.10, true));
+            continue;
+          }
+        }
         const par = verts.get(LIMB_BASES.has(parBase) ? `${parBase}${side}` : parBase);
         out.set(`${base}${side}`, par && par.length ? extremeMean(a, centroid(par), 0.05, false) : centroid(a));
       }
@@ -1725,8 +1753,31 @@ export class Figure {
     this.group.updateMatrixWorld(true);
   }
 
+  // Rig joint centre, world. This is the ANTHROPOMETRIC skeleton (Drillis–
+  // Contini), and it is the right thing for BIOMECHANICS — computeCOG lerps de
+  // Leva segment masses between exactly these points, and the joint-angle and
+  // balance readouts are defined on them. It is the WRONG thing for anything
+  // about where the body physically is; see surfaceNode/surfacePos.
   worldPos(jointName, target = new THREE.Vector3()) {
     return this.nodes[jointName].getWorldPosition(target);
+  }
+
+  // The node the VISIBLE body is welded to: the atlas node on a seated limb
+  // joint, else the rig node (torso joints, where the two coincide).
+  //
+  // Use this for contact — collision volumes, pin spots, anything asking where
+  // the dancer physically IS. Measured across six poses, the difference is not
+  // subtle: the visible palm sits 165 mm from the rig wrist and wanders 107 mm
+  // inside it as the arm flexes, while in the ATLAS wrist it sits a steady
+  // 39 mm away and wanders 0.0 mm. The elbow is 97 mm / 111 mm versus 37 mm /
+  // 15 mm. A capsule or a pin built on the rig node is displaced from the limb
+  // it represents by more than that limb's own radius.
+  surfaceNode(jointName) {
+    return this.#seatNode(jointName);
+  }
+
+  surfacePos(jointName, target = new THREE.Vector3()) {
+    return this.#seatNode(jointName).getWorldPosition(target);
   }
 
   // Lowest sole corner of one foot ('L' | 'R'), world Y — how far this foot's

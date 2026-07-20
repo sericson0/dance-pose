@@ -27,15 +27,45 @@ export function initUI(app) {
   // ---------------------------------------------------------------- modes
   const modeButtons = [...document.querySelectorAll('#mode-buttons button')];
   const hipsPlantBox = $('hips-plant');
+  // Planted feet belong to the hips SLIDE; the twist turns the legs and feet
+  // round with the pelvis on purpose, so the choice does not apply there.
+  const syncHipsPlant = () => {
+    hipsPlantBox.hidden = app.mode !== 'hips' || app.hipsTool === 'twist';
+  };
   const selectMode = (mode) => {
     setActive(modeButtons, (b) => b.dataset.mode === mode);
     $('draw-tools').hidden = mode !== 'draw';
+    // Slide/Turn and the turn pivot only exist while moving a whole figure;
+    // Slide/Twist and the planted-feet choice only while moving the hips.
+    $('move-tools').hidden = mode !== 'move';
+    $('move-pivot-box').hidden = mode !== 'move';
+    $('hips-tools').hidden = mode !== 'hips';
     app.setMode(mode);
-    // The planted-feet choice only exists while moving the hips.
-    hipsPlantBox.hidden = mode !== 'hips';
+    syncHipsPlant();
   };
   for (const btn of modeButtons) {
     btn.addEventListener('click', () => selectMode(btn.dataset.mode));
+  }
+
+  // Move-figure sub-toolbar: slide across the floor vs. turn about a pivot.
+  const moveToolBtns = [...document.querySelectorAll('#move-tools button[data-move-tool]')];
+  for (const btn of moveToolBtns) {
+    btn.addEventListener('click', () => {
+      setActive(moveToolBtns, (b) => b === btn);
+      app.setMoveTool(btn.dataset.moveTool);
+    });
+  }
+  const movePivot = $('move-pivot');
+  movePivot.addEventListener('change', () => app.setMovePivot(movePivot.value));
+
+  // Move-hips sub-toolbar: translate the pelvis vs. twist it under a still chest.
+  const hipsToolBtns = [...document.querySelectorAll('#hips-tools button[data-hips-tool]')];
+  for (const btn of hipsToolBtns) {
+    btn.addEventListener('click', () => {
+      setActive(hipsToolBtns, (b) => b === btn);
+      app.setHipsTool(btn.dataset.hipsTool);
+      syncHipsPlant();
+    });
   }
 
   // Move-hips planted feet: auto-set from floor contact when a dancer is

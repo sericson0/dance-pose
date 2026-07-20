@@ -74,6 +74,24 @@ export const LANDMARKS = [
     body: { bones: /foot$/, pick: { ref: 'knee', far: false, frac: 0.06 } },
   },
 
+  // ---- arm joints: the audit targets. collision.js builds its arm capsules
+  // between rig joint NODES, and pins.js stores an arm spot in a rig node's
+  // local frame — both on limbs that flex deeply in the embrace, which is the
+  // exact condition under which a rig node stops representing the visible limb.
+  // These landmarks are here to measure that, not to look pretty: each is the
+  // skin the avatar actually shows at the joint, so the distance from the rig
+  // node to the landmark IS the error a capsule or a pin inherits.
+  {
+    id: 'elbow_skin', joint: 'elbow', sided: true,
+    skeleton: { bones: /^radius|^ulna/, pick: { ref: 'wrist', far: true, frac: 0.06 } },
+    body: { bones: /forearm/, pick: { ref: 'wrist', far: true, frac: 0.06 } },
+  },
+  {
+    id: 'shoulder_skin', joint: 'shoulder', sided: true,
+    skeleton: { bones: /humerus/, pick: { ref: 'elbow', far: true, frac: 0.06 } },
+    body: { bones: /upperarm/, pick: { ref: 'elbow', far: true, frac: 0.06 } },
+  },
+
   // ---- torso: palpable landmarks only (see the header note).
   {
     id: 'acromion', joint: 'scapula', sided: true,
@@ -522,6 +540,13 @@ export function measureLandmarks(figure) {
       body: b,
       gapMm: s && b ? s.distanceTo(b) * 1000 : null,
       rigLocal: node && ref ? node.worldToLocal(ref.clone()) : null,
+      // Same, but in the ATLAS node's frame where the joint is seated. The
+      // clothed limb is welded to the atlas node, so if this is small and
+      // steady where rigLocal is large and wandering, the fix for collision
+      // capsules and contact pins is simply to read the atlas node — no new
+      // machinery needed.
+      atlasLocal: figure.atlasNodes?.[joint] && ref
+        ? figure.atlasNodes[joint].worldToLocal(ref.clone()) : null,
     });
   }
   return out;

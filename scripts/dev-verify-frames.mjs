@@ -130,6 +130,7 @@ const report = await page.evaluate(async (POSES) => {
         marks: measureLandmarks(fig).map((m) => ({
           key: m.key, joint: m.joint, gapMm: m.gapMm,
           rigLocal: m.rigLocal ? m.rigLocal.toArray() : null,
+          atlasLocal: m.atlasLocal ? m.atlasLocal.toArray() : null,
         })),
         axes: measureAxes(fig),
         axisFitDeg: fig.calibration?.axisDeg || null,
@@ -191,7 +192,7 @@ for (const pose of report.poses) {
       if (m.gapMm == null) continue;
       const k = `${fig.name}|${m.key}`;
       if (!series.has(k)) series.set(k, []);
-      series.get(k).push({ pose: pose.name, mm: m.gapMm, rigLocal: m.rigLocal, joint: m.joint });
+      series.get(k).push({ pose: pose.name, mm: m.gapMm, rigLocal: m.rigLocal, atlasLocal: m.atlasLocal, joint: m.joint });
     }
   }
 }
@@ -220,11 +221,31 @@ for (const [k, pts] of series) {
     }
     rigDriftMm = worstPair * 1000;
   }
+  // Absolute offset from the rig node to the landmark it names, worst pose.
+  // rigDrift says the node MOVES relative to the geometry; this says how far
+  // from that geometry it sits at all — which is what a collision capsule or a
+  // contact pin anchored on that node is actually wrong by.
+  const offMm = locs.length
+    ? Math.max(...locs.map((l) => Math.hypot(l[0], l[1], l[2]) * 1000)) : null;
+  const aLocs = pts.filter((p) => p.atlasLocal).map((p) => p.atlasLocal);
+  let atlasDriftMm = null;
+  let atlasOffMm = null;
+  if (aLocs.length > 1) {
+    let w = 0;
+    for (let i = 0; i < aLocs.length; i++) {
+      for (let j = i + 1; j < aLocs.length; j++) {
+        const dd = Math.hypot(aLocs[i][0] - aLocs[j][0], aLocs[i][1] - aLocs[j][1], aLocs[i][2] - aLocs[j][2]);
+        if (dd > w) w = dd;
+      }
+    }
+    atlasDriftMm = w * 1000;
+    atlasOffMm = Math.max(...aLocs.map((l) => Math.hypot(l[0], l[1], l[2]) * 1000));
+  }
   if (rigDriftMm != null && rigDriftMm > RIG_DRIFT_TOL) {
     problems.push(`${figure}/${key}: WANDERS ${rigDriftMm.toFixed(0)}mm inside the `
       + `'${pts[0].joint}' rig node across poses — code aiming at that node aims at a phantom`);
   }
-  rows.push({ figure, key, hi, lo, spread, tol, rigDriftMm });
+  rows.push({ figure, key, hi, lo, spread, tol, rigDriftMm, offMm, atlasDriftMm, atlasOffMm });
   if (tol.abs != null && hi.mm > tol.abs) {
     problems.push(`${figure}/${key}: ${hi.mm.toFixed(0)}mm gap @ ${hi.pose} (abs tol ${tol.abs})`);
   }
@@ -238,14 +259,14 @@ for (const [k, pts] of series) {
 // steady gap is usually just bone-under-skin.
 rows.sort((a, b) => (b.rigDriftMm ?? 0) - (a.rigDriftMm ?? 0));
 console.log('\n=== per landmark: layer gap (worst / spread) and rig-node drift ===');
-console.log('  landmark                      gap  spread  rigDrift   (min → max across poses)');
+console.log('  landmark                    rigDrift nodeOff | atlasDrift atlasOff');
 for (const r of rows) {
   const flagA = r.tol.abs == null ? '~' : (r.hi.mm > r.tol.abs ? '!' : ' ');
   const flagS = r.spread > r.tol.spread ? '!' : ' ';
   const rd = r.rigDriftMm == null ? '    -  '
     : `${r.rigDriftMm.toFixed(1).padStart(6)}${r.rigDriftMm > RIG_DRIFT_TOL ? '!' : ' '}`;
-  console.log(`  ${(`${r.figure}/${r.key}`).padEnd(28)} ${r.hi.mm.toFixed(1).padStart(6)}${flagA}`
-    + `${r.spread.toFixed(1).padStart(6)}${flagS}${rd}  (${r.lo.mm.toFixed(0)}@${r.lo.pose} → ${r.hi.mm.toFixed(0)}@${r.hi.pose})`);
+  const f = (v) => (v == null ? '    -' : v.toFixed(0).padStart(5));
+  console.log(`  ${(`${r.figure}/${r.key}`).padEnd(28)}${f(r.rigDriftMm)}${f(r.offMm)}   |${f(r.atlasDriftMm)}${f(r.atlasOffMm)}`);
 }
 
 if (unresolved.length) {

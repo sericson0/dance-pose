@@ -64,21 +64,39 @@ const LEFT_AND_CENTER = [
     labels: { x: 'Tip back / forward', y: 'Protract / retract', z: 'Depress / elevate' },
   },
   {
-    name: 'shoulder_L', parent: 'scapula_L', offset: [0.095, 0.020, -0.030],
+    // ARM CHAIN SITS ON THE IMPORTED SKELETON'S OWN JOINT CENTRES (shoulder →
+    // hand), so the rig arm node and the anatomical arm node are the SAME point
+    // and the clothed arm, the bones and the muscles all pivot about it
+    // together. Before this the two sat up to 165 mm apart on a flexed arm,
+    // which is what let a constraint solve a flawless clasp on the rig while
+    // the rendered hands hung apart in mid-air.
+    //
+    // Two things follow that are easy to trip over. The rest pose here is NOT
+    // arms-straight-down: it carries ~9.1° of shoulder abduction and a 19.4°
+    // elbow bend, so joint zero means something different than it used to and
+    // authored arm angles are offset to compensate (see embraceArms). And the
+    // two segments are no longer collinear, which solveTwoBone's hinge
+    // convention assumed — see REST_BEND in ik.js.
+    //
+    // The LEGS deliberately stay on Drillis–Contini: they carry ~40% of body
+    // mass against the arms' ~10%, so they dominate the COG and balance
+    // readouts, and their sole corners / floor clamp / balance hull are all
+    // calibrated in the rig ankle's frame.
+    name: 'shoulder_L', parent: 'scapula_L', offset: [0.079941, 0.005116, -0.04744],
     limits: { x: [-170, 45], y: [-80, 80], z: [-30, 170] },
     labels: { x: 'Raise forward / lower back', y: 'Rotate in / out', z: 'Across body / out to side' },
   },
   {
-    name: 'elbow_L', parent: 'shoulder_L', offset: [0, -0.186, 0],
+    name: 'elbow_L', parent: 'shoulder_L', offset: [0.026848, -0.16736, -0.014101],
     limits: { x: [-150, 0], y: [-120, 120], z: [0, 0] },
     labels: { x: 'Bend / straighten', y: 'Palm turn (pronation)' },
   },
   {
-    name: 'wrist_L', parent: 'elbow_L', offset: [0, -0.146, 0],
+    name: 'wrist_L', parent: 'elbow_L', offset: [0.025282, -0.14906, 0.039738],
     limits: { x: [-65, 65], y: [0, 0], z: [-30, 30] },
     labels: { x: 'Flex / extend', z: 'Deviate out / in' },
   },
-  { name: 'hand_L', parent: 'wrist_L', offset: [0, -0.100, 0], endpoint: true },
+  { name: 'hand_L', parent: 'wrist_L', offset: [0.023216, -0.086128, 0.039964], endpoint: true },
 
   {
     // x<0 flexion (leg forward), x>0 extension (leg back). Hip extension

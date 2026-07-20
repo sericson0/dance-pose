@@ -82,8 +82,21 @@ function capsules(figure, armSide = null) {
   return COLLIDERS
     .filter((c) => c.group !== 'arm' || (armSide && c.from.endsWith(`_${armSide}`)))
     .map(({ from, to, r, group }) => ({
-      p: figure.worldPos(from),
-      q: figure.worldPos(to),
+      // Arm capsules resolve through surfaceNode (the atlas node the clothed
+      // arm is welded to), not the rig node. A collision volume has to sit on
+      // the limb the viewer sees, and on a deeply flexed arm the rig elbow is
+      // 97 mm from the visible elbow — more than the capsule's own radius, so
+      // the volume barely overlapped the arm it stood for. CLAUDE.md flagged
+      // arm capsules as unaudited on this point; they were wrong.
+      //
+      // The `core` group deliberately still reads worldPos. Its torso joints
+      // are unseated, so the two are identical there — but its LEG joints are
+      // seated and would move (knee 40 mm, ankle 28 mm), and the COLLIDERS
+      // radii are calibrated so the shipped contact presets rest at ~0
+      // clearance. Migrating the legs means re-tuning those radii and
+      // re-verifying the presets, so it is a separate change.
+      p: group === 'arm' ? figure.surfacePos(from) : figure.worldPos(from),
+      q: group === 'arm' ? figure.surfacePos(to) : figure.worldPos(to),
       r: r * H,
       group, from, to,
     }));

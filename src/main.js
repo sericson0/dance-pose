@@ -8,7 +8,7 @@ import { balanceReport, coupleReport, footContactsBySide } from './analysis.js';
 import { PRESETS } from './presets.js';
 import { loadSkeletonBones, loadMuscleMeshes, loadBodyMesh } from './skeletonMesh.js';
 import { Embrace } from './embrace.js';
-import { ContactPins, nearestJointNode } from './pins.js';
+import { ContactPins, nearestJointNode, spotNode } from './pins.js';
 import { resolveBodyCollision, bodyClearance, bodyContacts } from './collision.js';
 import { Drawings } from './draw.js';
 import { initUI } from './ui.js';
@@ -676,6 +676,26 @@ function figureForward(figure, out = new THREE.Vector3()) {
   return out.normalize();
 }
 
+// A figure's facing on the floor, in radians, read from its QUATERNION.
+// `group.rotation.y` is not the same number once anything writes the quaternion
+// directly — the rotate gizmo does — because the XYZ Euler decomposition then
+// comes back as [180°, 180° − yaw, 180°]: the same orientation, but `rotation.y`
+// reads a different angle AND runs backwards when incremented. Measured: a
+// gizmo turn to 103.6° reported 76.4°, and the missing 27° went straight into
+// the turn's pivot compensation as 111 mm of drift.
+function figureYaw(figure) {
+  const f = figureForward(figure);
+  return Math.atan2(f.x, f.z);
+}
+
+// Put a figure's rotation back in canonical [0, yaw, 0] form after something
+// has written its quaternion, so `rotation.y` is trustworthy again for every
+// consumer that reads it (arrow-key turns, preset placement, pose save/load).
+// Lossless: the figure's orientation is a pure yaw either way.
+function canonicalizeYaw(figure) {
+  figure.group.rotation.set(0, figureYaw(figure), 0);
+}
+
 // Orbit a figure around a world point by a yaw delta (couple pivot / calesita).
 function rotateAbout(figure, point, dYaw) {
   const p = figure.group.position;
@@ -1009,6 +1029,7 @@ const app = {
   animateSteps: true, // steps play through the roll/collection (false = snap)
   coupleDrag: null, // start transforms captured while dragging a linked couple
   figDragY: null, // root height captured when a figure drag starts
+  figTurn: null, // pivot + start transforms captured while turning a figure
   interpStates: null, // { A, B } couple states driving the A→B scrubber
   interpGroundFeet: true, // planted-at-both-ends feet stay on the floor while interpolating
   interpPlaying: false,
@@ -1088,7 +1109,10 @@ const app = {
   pinClick(figure, worldPoint) {
     const node = nearestJointNode(figure, worldPoint);
     if (!node) return;
-    const local = figure.nodes[node].worldToLocal(worldPoint.clone());
+    // Same frame nearestJointNode picked in, and the same one endWorld plays
+    // it back through (surfaceNode — the atlas node on a limb). All three have
+    // to agree or the spot does not stay where it was clicked.
+    const local = spotNode(figure, node).worldToLocal(worldPoint.clone());
     if (this.pinPending && this.pinPending.figure !== figure) {
       const first = this.pinPending;
       const second = { figure, node, local };
@@ -1252,6 +1276,65 @@ const app = {
     return dy;
   },
 
+  // Which handle the Move-hips gizmo offers: 'slide' translates the pelvis,
+  // 'twist' turns it under a still chest (see pivotHips).
+  hipsTool: 'slide',
+
+  setHipsTool(tool) {
+    this.hipsTool = tool;
+    const fig = this.hipsState?.figure;
+    if (this.mode === 'hips' && fig) this.selectFigure(fig);
+  },
+
+  // Twist the hips under a still upper body — the dissociation a follower's
+  // ocho pivot is made of. The pelvis yaws and THE WHOLE LOWER BODY GOES WITH
+  // IT: hips, legs and feet turn as one unit (they hang off the pelvis node, so
+  // this is free), which is what a dancer pivoting on the ball of the foot
+  // actually does. The spine twists to pay for it — the chest and lumbar joints
+  // counter-yaw by the same total, so the shoulders, the head and with them the
+  // embrace keep facing exactly where they were.
+  //
+  // The counter-twist budget is the chest's + spine's remaining range, and the
+  // pelvis yaw is CLAMPED to it: past that the trunk has nothing left to give,
+  // and turning further would silently saturate the chest and start carrying
+  // the shoulders round with the hips — the one thing this move is defined by
+  // not doing. It spends the chest's range first, thoracic rotation being where
+  // tango dissociation actually lives, the lumbar spine taking the remainder
+  // (±35° + ±8°, so ~43° from neutral — about a real dancer's range).
+  // Returns the yaw actually applied.
+  //
+  // The cancellation is additive (pelvis +d, chest/spine −d), the same
+  // yaw-sum-preserving idiom the walk's dissociation uses; it is exact for an
+  // upright trunk and drifts slightly when the pelvis carries a large tilt,
+  // since the two yaws are then applied in frames that are not quite parallel.
+  // Note the planted-feet checkboxes do NOT apply here — they belong to the
+  // hips SLIDE, and this move turns the feet on purpose.
+  pivotHips(figure, dYaw) {
+    figure.group.updateMatrixWorld(true);
+    // How much counter-twist each trunk joint has left in the cancelling
+    // direction (the pelvis yaws +d, so these must go −d).
+    const trunk = ['chest', 'spine'].map((name) => {
+      const [lo, hi] = JOINT_BY_NAME[name].limits.y;
+      const cur = figure.nodes[name].rotation.y;
+      return { name, node: figure.nodes[name], room: dYaw > 0 ? cur - lo * DEG : hi * DEG - cur };
+    });
+    const room = trunk.reduce((sum, b) => sum + Math.max(0, b.room), 0);
+    const d = Math.sign(dYaw) * Math.min(Math.abs(dYaw), room);
+    if (Math.abs(d) < 1e-9) return 0;
+
+    figure.nodes.pelvis.rotation.y += d;
+    let left = Math.abs(d);
+    for (const b of trunk) {
+      const take = Math.min(left, Math.max(0, b.room));
+      b.node.rotation.y -= Math.sign(d) * take;
+      figure.clampJoint(b.name);
+      left -= take;
+    }
+    figure.syncAtlasNodes();
+    figure.group.updateMatrixWorld(true);
+    return d;
+  },
+
   setChainMode(mode) {
     this.chainMode = mode;
   },
@@ -1320,6 +1403,37 @@ const app = {
     return figure.nodes[ankleName].localToWorld(target);
   },
 
+  // Which vertical axis a whole-figure turn spins about (Move mode's toolbar):
+  //   'foot' — the ball of the support foot: the tango pivot proper (ocho,
+  //            giro, calesita), where the turn is ground-referenced.
+  //   'cog'  — the axis through the center of gravity: how a dancer turns when
+  //            the turn is balance-referenced rather than floor-referenced, and
+  //            the only axis a turn on both feet (or in the air) can use. With
+  //            "Move as couple" this is the pair's SHARED COG — the axis a real
+  //            giro/calesita orbits, between the two dancers rather than under
+  //            either of them.
+  //   'root' — the figure's own origin on the floor.
+  movePivot: 'foot',
+
+  setMovePivot(which) {
+    this.movePivot = which;
+  },
+
+  // The world point `turnFigure` (and the Move-mode turn gizmo) rotates about.
+  turnPivot(figure, target = new THREE.Vector3()) {
+    figure.group.updateMatrixWorld(true);
+    if (this.movePivot === 'root') {
+      return target.set(figure.group.position.x, 0, figure.group.position.z);
+    }
+    if (this.movePivot === 'cog') {
+      const partner = this.linkCouple
+        ? this.figures.find((f) => f !== figure && f.group.visible) : null;
+      const cog = partner ? coupleReport(figure, partner).cog : balanceReport(figure).cog;
+      return target.set(cog.x, 0, cog.z);
+    }
+    return this.ballOfFoot(figure, this.supportAnkle(figure), target);
+  },
+
   // Rotate a figure about the ball of its support foot (ocho/calesita pivot).
   pivotFigure(figure, deltaYawRad) {
     const ankle = this.supportAnkle(figure);
@@ -1384,15 +1498,27 @@ const app = {
     }
   },
 
-  // Turn a figure by a yaw delta, pivoting on the ball of its support foot; when
-  // linked the partner orbits the same point, so the couple turns as one.
+  // Turn a figure by a yaw delta about the current `movePivot` axis (default the
+  // ball of the support foot); when linked the partner orbits the same point, so
+  // the couple turns as one. The pivot is a point rigidly attached to the
+  // dancer, so orbiting the root about it and adding the yaw leaves it fixed.
   turnFigure(figure, dYaw) {
-    const pivotPt = this.ballOfFoot(figure, this.supportAnkle(figure));
-    this.pivotFigure(figure, dYaw);
+    const pivotPt = this.turnPivot(figure);
+    rotateAbout(figure, pivotPt, dYaw);
     if (this.linkCouple) {
       const partner = this.figures.find((f) => f !== figure);
       if (partner) rotateAbout(partner, pivotPt, dYaw);
     }
+  },
+
+  // Which handle the Move-figure gizmo offers: 'slide' drags across the floor,
+  // 'turn' spins about the `movePivot` axis.
+  moveTool: 'slide',
+
+  setMoveTool(tool) {
+    this.moveTool = tool;
+    const fig = this.activeFigure;
+    if (this.mode === 'move' && fig) this.selectFigure(fig);
   },
 
   // Edit a joint honouring the current chain mode. `mutate` changes rotations.
@@ -1456,6 +1582,7 @@ const app = {
     this.swivelState = null;
     this.caressState = null;
     this.hipsState = null;
+    this.figTurn = null;
     ikTarget.visible = false;
     swivelTarget.visible = false;
     caressTarget.visible = false;
@@ -1587,14 +1714,22 @@ const app = {
   selectFigure(figure) {
     this.deselect();
     this.activeFigure = figure;
-    // Move mode drags the figure on the floor; turning is the arrow keys (they
-    // pivot on the support foot). Step mode has no drag gizmo — clicking steps,
-    // and the arrows step/turn — so the figure is only recorded as active.
+    // Move mode drags the figure on the floor, or (Turn) spins it about the
+    // chosen pivot; the arrow keys turn either way. Step mode has no drag gizmo
+    // — clicking steps, and the arrows step/turn — so the figure is only
+    // recorded as active.
     if (this.mode === 'move') {
       tcontrols.attach(figure.group);
-      tcontrols.setMode('translate');
-      tcontrols.showX = tcontrols.showZ = true;
-      tcontrols.showY = false;
+      if (this.moveTool === 'turn') {
+        // Yaw only: dancers turn about the vertical, never tip over.
+        tcontrols.setMode('rotate');
+        tcontrols.showY = true;
+        tcontrols.showX = tcontrols.showZ = false;
+      } else {
+        tcontrols.setMode('translate');
+        tcontrols.showX = tcontrols.showZ = true;
+        tcontrols.showY = false;
+      }
     } else if (this.mode === 'hips') {
       // Move-hips: a handle at the pelvis, draggable on all three axes. The
       // planted-feet checkboxes default to whichever feet touch the floor.
@@ -1602,12 +1737,19 @@ const app = {
       const contacts = footContactsBySide(figure);
       this.hipsPlant = { L: contacts.L.length > 0, R: contacts.R.length > 0 };
       figure.worldPos('pelvis', hipsTarget.position);
+      hipsTarget.rotation.set(0, 0, 0);
       hipsTarget.userData.figure = figure;
       hipsTarget.visible = true;
-      this.hipsState = { figure, last: hipsTarget.position.clone() };
+      this.hipsState = { figure, last: hipsTarget.position.clone(), lastYaw: 0 };
       tcontrols.attach(hipsTarget);
-      tcontrols.setMode('translate');
-      tcontrols.showX = tcontrols.showY = tcontrols.showZ = true;
+      if (this.hipsTool === 'twist') {
+        tcontrols.setMode('rotate');
+        tcontrols.showY = true;
+        tcontrols.showX = tcontrols.showZ = false;
+      } else {
+        tcontrols.setMode('translate');
+        tcontrols.showX = tcontrols.showY = tcontrols.showZ = true;
+      }
       if (this.ui) this.ui.onHipsPlantChanged();
     }
   },
@@ -1815,16 +1957,40 @@ app.muscles = muscleMeshes
 // we can pin it back each frame, and capture start transforms for a linked
 // couple drag.
 tcontrols.addEventListener('dragging-changed', (e) => {
-  if (!e.value) { app.ckc = null; app.coupleDrag = null; app.figDragY = null; return; }
+  if (!e.value) {
+    app.ckc = null; app.coupleDrag = null; app.figDragY = null; app.figTurn = null;
+    return;
+  }
   app.pushHistory();
   if (app.hipsState && tcontrols.object === hipsTarget) {
     // Hips drag: deltas accumulate from here (see the objectChange handler);
     // the figure-drag captures below must not see the handle as a figure.
     app.hipsState.last.copy(hipsTarget.position);
+    app.hipsState.lastYaw = hipsTarget.rotation.y;
     return;
   }
   if (!app.selected && tcontrols.object?.userData.figure) {
     app.figDragY = tcontrols.object.position.y;
+  }
+  // Move-mode turn: capture the pivot and the start transforms once, so every
+  // frame is re-derived from them (absolute, so a long drag can't drift) and
+  // the pivot point itself stays put under the spin.
+  if (!app.selected && app.mode === 'move' && app.moveTool === 'turn'
+      && tcontrols.object?.userData.figure) {
+    const figure = tcontrols.object.userData.figure;
+    const partner = app.linkCouple
+      ? app.figures.find((f) => f !== figure && f.group.visible) : null;
+    canonicalizeYaw(figure);
+    if (partner) canonicalizeYaw(partner);
+    app.figTurn = {
+      figure,
+      partner,
+      pivot: app.turnPivot(figure).clone(),
+      yaw0: figure.group.rotation.y,
+      pos0: figure.group.position.clone(),
+      partnerYaw0: partner ? partner.group.rotation.y : 0,
+      partnerPos0: partner ? partner.group.position.clone() : null,
+    };
   }
   if (app.selected && !app.ikState && app.chainMode === 'closed' && CHAIN_JOINTS.has(app.selected.jointName)) {
     const node = app.anchorNode(app.selected.figure, app.selected.jointName);
@@ -1867,15 +2033,24 @@ function applyHandleChange() {
     caressToe(app.caressState.figure, app.caressState.side, caressTarget.position);
     if (app.ui) app.ui.refreshJointValues();
   } else if (app.hipsState && tcontrols.object === hipsTarget) {
-    // Hips drag: apply the handle's delta; planted feet stay put via leg IK.
-    // The vertical axis clamps at the crouch range — track the applied height
-    // so a clamped drag can't accumulate.
     const { figure, last } = app.hipsState;
-    const delta = hipsTarget.position.clone().sub(last);
-    const dy = app.moveHips(figure, delta, app.hipsPlant);
-    last.copy(hipsTarget.position);
-    last.y += dy - delta.y;
-    hipsTarget.position.y = last.y;
+    if (app.hipsTool === 'twist') {
+      // Hips twist: the ring's delta yaws the pelvis under a still chest. The
+      // trunk's counter-twist range clamps it, so wind the handle back to what
+      // was actually applied or the ring runs away from the body.
+      const applied = app.pivotHips(figure, hipsTarget.rotation.y - app.hipsState.lastYaw);
+      app.hipsState.lastYaw += applied;
+      hipsTarget.rotation.y = app.hipsState.lastYaw;
+    } else {
+      // Hips drag: apply the handle's delta; planted feet stay put via leg IK.
+      // The vertical axis clamps at the crouch range — track the applied height
+      // so a clamped drag can't accumulate.
+      const delta = hipsTarget.position.clone().sub(last);
+      const dy = app.moveHips(figure, delta, app.hipsPlant);
+      last.copy(hipsTarget.position);
+      last.y += dy - delta.y;
+      hipsTarget.position.y = last.y;
+    }
     if (app.ui) app.ui.refreshJointValues();
   } else {
     return false;
@@ -1890,6 +2065,26 @@ tcontrols.addEventListener('objectChange', () => {
     app.selected.figure.clampJoint(app.selected.jointName);
     if (app.ckc) pinAnchor(app.ckc.figure, app.ckc.node, app.ckc.matrix);
     if (app.ui) app.ui.refreshJointValues();
+  } else if (app.figTurn) {
+    // Move-mode turn: the gizmo spins the figure about its own origin, so slide
+    // the root back around the chosen pivot (support foot / COG / root) to
+    // leave that point exactly where it was. A linked partner orbits the SAME
+    // point, so the couple turns as one unit about one shared axis.
+    const { figure, partner, pivot, yaw0, pos0, partnerYaw0, partnerPos0 } = app.figTurn;
+    // The gizmo wrote the quaternion, so re-canonicalise before reading a yaw
+    // off `rotation.y` (see figureYaw). Wrapped, so dragging past half a turn
+    // reads as a short rotation the other way rather than jumping 360°.
+    canonicalizeYaw(figure);
+    const raw = figure.group.rotation.y - yaw0;
+    const dYaw = Math.atan2(Math.sin(raw), Math.cos(raw));
+    const place = (f, p0, y0) => {
+      const rel = new THREE.Vector3(p0.x - pivot.x, 0, p0.z - pivot.z).applyAxisAngle(_UP, dYaw);
+      f.group.position.set(pivot.x + rel.x, p0.y, pivot.z + rel.z);
+      f.group.rotation.y = y0 + dYaw;
+      f.group.updateMatrixWorld(true);
+    };
+    place(figure, pos0, yaw0);
+    if (partner) place(partner, partnerPos0, partnerYaw0);
   } else if (tcontrols.object) {
     // Figures stay at their drag-start height (usually the floor).
     if (app.figDragY !== null) tcontrols.object.position.y = app.figDragY;
@@ -2336,7 +2531,10 @@ window.addEventListener('keydown', (e) => {
 // and holding a key moves continuously (the OS key-repeat re-fires keydown);
 // Shift makes any nudge coarser. What the keys drive depends on what's active:
 //   Move / Step modes (the active figure): arrows slide/turn or step/turn,
-//     pivoting on the support foot. "Move as couple" drives the pair.
+//     pivoting on whichever axis the Move toolbar picks (support foot by
+//     default, or the COG). "Move as couple" drives the pair about one
+//     shared axis.
+//   Move hips, Twist: ←/→ turn the pelvis under a still chest.
 //   A selected joint (Rotate joints): ↑/↓ drive its X axis (↑ = hip/shoulder
 //     forward, ankle toes-up, knee straighten), ←/→ its Z — the side-to-side
 //     axis (Y where there is no Z), PageUp/PageDown its Y twist.
@@ -2414,6 +2612,17 @@ window.addEventListener('keydown', (e) => {
   if (handle) {
     e.preventDefault();
     nudgeHistory();
+    // Hips-twist: ←/→ turn the pelvis under the still chest instead of sliding
+    // the handle; the other keys still slide/raise it.
+    if (handle === hipsTarget && app.hipsTool === 'twist'
+        && (k === 'ArrowLeft' || k === 'ArrowRight')) {
+      const applied = app.pivotHips(app.hipsState.figure,
+        (k === 'ArrowLeft' ? 1 : -1) * NUDGE_TURN * coarse);
+      app.hipsState.lastYaw += applied;
+      hipsTarget.rotation.y = app.hipsState.lastYaw;
+      if (app.ui) app.ui.refreshJointValues();
+      return;
+    }
     handle.position.addScaledVector(nudgeDirection(k, _nudgeDir), HANDLE_NUDGE * coarse);
     applyHandleChange();
     return;

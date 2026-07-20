@@ -34,16 +34,26 @@ import { feetToFloor } from './ik.js';
 // to her — his hips angle in under an unmoved embrace frame, a small
 // authored dissociation. Walk/apilado deliberately re-override neck x
 // afterwards (their heads stay up over the body lean) but keep the nod.
+// The arm chain sits on the ANATOMICAL joint centres (skeletonDef.js), whose
+// rest already carries ~9.1° of shoulder abduction and a 19.4° elbow bend — so
+// these angles are offset to compensate (elbow flexion +19.4°, abduction 9.1°
+// toward zero) and reproduce roughly the intended world pose.
+//
+// KNOWN: this does NOT fix the embrace, which regressed with the collapse and
+// is pending rework. Re-authoring here was measured to move the closed-side
+// palm error only 17.8 → 17.6 cm, because the closed-side arms are IK-SOLVED
+// and these angles merely seed the swivel — the real gap is #solveArm against
+// the shoulder's new position. Fix that, not these numbers.
 function embraceArms(leader, follower) {
   leader.setJointDegrees({
-    shoulder_L: { x: -30, y: 30, z: 15 }, elbow_L: { x: -120, y: -30 }, wrist_L: { x: -15 },
-    shoulder_R: { x: -55, z: -18, y: 20 }, elbow_R: { x: -70 },
+    shoulder_L: { x: -30, y: 30, z: 6 }, elbow_L: { x: -101, y: -30 }, wrist_L: { x: -15 },
+    shoulder_R: { x: -55, z: -9, y: 20 }, elbow_R: { x: -51 },
     spine: { x: 4 }, chest: { x: 4, y: 10 }, pelvis: { y: -10 },
     neck: { x: -5, y: 12, z: 8 }, head: { x: 15 },
   });
   follower.setJointDegrees({
-    shoulder_R: { x: -30, y: -30, z: -15 }, elbow_R: { x: -120, y: 30 }, wrist_R: { x: -15 },
-    shoulder_L: { x: -65, z: 22 }, elbow_L: { x: -50 },
+    shoulder_R: { x: -30, y: -30, z: -6 }, elbow_R: { x: -101, y: 30 }, wrist_R: { x: -15 },
+    shoulder_L: { x: -65, z: 13 }, elbow_L: { x: -31 },
     spine: { x: 4 }, chest: { x: 4 }, neck: { x: -5, y: 12, z: 8 }, head: { x: 15 },
   });
 }
