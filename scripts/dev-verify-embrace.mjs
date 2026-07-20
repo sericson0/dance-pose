@@ -22,39 +22,79 @@ await new Promise((r) => setTimeout(r, 2000));
 
 const problems = [];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Filled from the first measurement; every later pose must keep the same
+// hand→wrist-node distance (see the weld check in `check`).
+const weldBaseline = {};
 
+// Everything here reads MESH TRUTH — the palm centers, finger aims and palm
+// normals of the avatars' actual hands (Figure.palmPosWorld / fingerDirWorld /
+// palmDirWorld), never the rig wrist/hand nodes. That distinction is the whole
+// point of this file: the clothed hand is welded to the ATLAS wrist node,
+// which shares the rig wrist's rotation but drifts up to ~18 cm from it as the
+// arm flexes. A suite built on rig nodes reported a flawless 2.2 cm palm-to-
+// palm clasp while the rendered hands hung 15 cm apart in mid-air — it could
+// not see the bug in principle, because it never measured anything the viewer
+// sees. See the visible-clasp and weld checks below.
 const measure = () => page.evaluate(async () => {
   const { handCenter } = await import('/src/embrace.js');
   const app = window.__app;
   const e = app.embrace;
   // Open-side hands point their fingers along the clasp's tilted-vertical
   // finger direction (degrees off target; joint limits allow some shortfall).
-  const fingerDev = (f, wristName, handName, armKey) => {
+  const fingerDev = (f, side, armKey) => {
     const target = e.claspFingerTarget(armKey);
     if (!target) return 999;
-    const dir = f.worldPos(handName).sub(f.worldPos(wristName)).normalize();
+    const dir = f.fingerDirWorld(side).normalize();
     return Math.acos(Math.min(1, Math.max(-1, dir.dot(target)))) * 180 / Math.PI;
   };
   // The joined hands stack along the couple axis: the leader's palm on his
   // side of the clasp, the follower's beyond it, each palm facing the
   // partner (his along the axis, hers back along it).
-  const pL = handCenter(app.leader, 'wrist_L', 'hand_L');
-  const pF = handCenter(app.follower, 'wrist_R', 'hand_R');
+  const pL = handCenter(app.leader, 'L');
+  const pF = handCenter(app.follower, 'R');
   const axis = app.follower.worldPos('chest').sub(app.leader.worldPos('chest'));
   axis.y = 0;
   const outside = axis.lengthSq() > 1e-6 ? pF.clone().sub(pL).dot(axis.normalize()) : 0;
-  const palmDev = (f, wristName, sign) => {
-    const el = f.nodes[wristName].matrixWorld.elements;
-    const len = Math.hypot(el[8], el[9], el[10]);
-    const dot = (el[8] * axis.x + el[9] * axis.y + el[10] * axis.z) * sign / len;
+  // Mesh-truth palm facing (Figure.palmDirWorld): the direction the VISIBLE
+  // palm faces — the avatar's hand skin rides the wrist rolled from the rig's
+  // canonical +Z, so the node axis is not what the viewer sees.
+  const palmDev = (f, side, sign) => {
+    const d = f.palmDirWorld(side);
+    const dot = (d.x * axis.x + d.y * axis.y + d.z * axis.z) * sign;
     return Math.acos(Math.min(1, Math.max(-1, dot))) * 180 / Math.PI;
   };
   // Closed-side palms vs their (reach-clamped) rest points on the partner.
-  const closedL = handCenter(app.leader, 'wrist_R', 'hand_R')
+  const closedL = handCenter(app.leader, 'R')
     .distanceTo(e.closedGoalWorld('leaderClosed'));
-  const closedF = handCenter(app.follower, 'wrist_L', 'hand_L')
+  const closedF = handCenter(app.follower, 'L')
     .distanceTo(e.closedGoalWorld('followerClosed'));
+  // The check a rig-node suite can never make: how far apart are the two
+  // avatars' OWN hand bones? Closest fingertip pair between the clasped
+  // hands, straight off the skinned skeleton.
+  const tipsOf = (f, side) => {
+    const by = {};
+    for (const b of f.fingerBones[side]) (by[b.digit] ||= []).push(b);
+    return Object.values(by).map((bs) => {
+      bs.sort((a, b) => a.seg - b.seg);
+      return bs[bs.length - 1].bone.getWorldPosition(new (pL.constructor)());
+    });
+  };
+  let tipGap = 1e9;
+  for (const a of tipsOf(app.leader, 'L')) {
+    for (const b of tipsOf(app.follower, 'R')) tipGap = Math.min(tipGap, a.distanceTo(b));
+  }
+  // Weld tripwire: the clothed hand rides the atlas wrist rigidly, so the
+  // distance from that node to its own knuckles is a constant of the model.
+  // If this moves, the hand has come off its node and every hand position
+  // in the app is suspect.
+  const weld = (f, side) => {
+    const k = f.fingerBones[side].find((b) => b.digit === 2 && b.seg === 0);
+    const node = f.atlasNodes[`wrist_${side}`] || f.nodes[`wrist_${side}`];
+    return k.bone.getWorldPosition(new (pL.constructor)())
+      .distanceTo(node.getWorldPosition(new (pL.constructor)()));
+  };
   return {
+    tipGap, weldL: weld(app.leader, 'L'), weldF: weld(app.follower, 'R'),
     handGap: e.handGap(),
     palmGap: e.palmGap(),
     outside,
@@ -62,10 +102,10 @@ const measure = () => page.evaluate(async () => {
     contact: e.contactDistance(),
     clearance: app.bodyClearance(),
     closedL, closedF,
-    fingerDevL: fingerDev(app.leader, 'wrist_L', 'hand_L', 'leaderOpen'),
-    fingerDevF: fingerDev(app.follower, 'wrist_R', 'hand_R', 'followerOpen'),
-    palmDevL: palmDev(app.leader, 'wrist_L', 1),
-    palmDevF: palmDev(app.follower, 'wrist_R', -1),
+    fingerDevL: fingerDev(app.leader, 'L', 'leaderOpen'),
+    fingerDevF: fingerDev(app.follower, 'R', 'followerOpen'),
+    palmDevL: palmDev(app.leader, 'L', 1),
+    palmDevF: palmDev(app.follower, 'R', -1),
     liftL: app.leader.group.position.y,
     liftF: app.follower.group.position.y,
   };
@@ -100,9 +140,25 @@ function check(label, m, { hands = true, close = false, closedArms = null, strai
   // catch the turned-back-on-the-partner failure (~90°).
   const palmsMax = moved ? 70 : 40;
   console.log(`--- ${label}: handGap ${(m.handGap * 100).toFixed(2)} cm (palms ${(m.palmGap * 100).toFixed(1)}, follower beyond ${(m.outside * 100).toFixed(1)}), `
+    + `tipGap ${(m.tipGap * 100).toFixed(1)} cm, `
     + `chestGap ${(m.chestGap * 100).toFixed(1)} cm (contact ${(m.contact * 100).toFixed(1)}, body clearance ${(m.clearance * 100).toFixed(2)}), `
     + `closed L ${(m.closedL * 100).toFixed(1)} F ${(m.closedF * 100).toFixed(1)} cm, `
     + `finger dev L ${m.fingerDevL.toFixed(1)}° F ${m.fingerDevF.toFixed(1)}°, palm dev L ${m.palmDevL.toFixed(1)}° F ${m.palmDevF.toFixed(1)}°`);
+  // The hand must stay rigidly welded to the node it hangs off, in every
+  // pose — this is what makes any hand measurement meaningful at all.
+  for (const [who, w] of [['leader', m.weldL], ['follower', m.weldF]]) {
+    if (weldBaseline[who] === undefined) weldBaseline[who] = w;
+    else if (Math.abs(w - weldBaseline[who]) > 0.005) {
+      problems.push(`${label}: ${who}'s hand came off its wrist node `
+        + `(knuckle→node ${(w * 100).toFixed(1)} cm, baseline ${(weldBaseline[who] * 100).toFixed(1)})`);
+    }
+  }
+  // The clasp the VIEWER sees: the two avatars' own fingertips. Curled
+  // clasping fingers put the tips a few cm apart around the joined palms,
+  // so this only needs to catch hands that are not in contact at all.
+  if (hands && !strainedClasp && m.tipGap > 0.12) {
+    problems.push(`${label}: the rendered hands are not touching (closest fingertips ${(m.tipGap * 100).toFixed(1)} cm apart)`);
+  }
   if (hands && Math.abs(m.handGap - m.palmGap) > (strainedClasp ? 0.03 : 0.015)) {
     problems.push(`${label}: clasp gap ${(m.handGap * 100).toFixed(1)} cm (want ${(m.palmGap * 100).toFixed(1)})`);
   }
@@ -171,7 +227,7 @@ const tiltTest = await page.evaluate(async () => {
     s.dispatchEvent(new Event('input', { bubbles: true }));
   };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const dir = () => app.leader.worldPos('hand_L').sub(app.leader.worldPos('wrist_L')).normalize();
+  const dir = () => app.leader.fingerDirWorld('L').normalize(); // mesh truth, not the rig segment
   setHeight(8); // raised salon frame, hands up by the faces
   await sleep(300);
   setTilt(0);

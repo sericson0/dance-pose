@@ -15,19 +15,36 @@ import { feetToFloor } from './ik.js';
 // the swivel authored here is what keeps that layering when the constraints
 // re-solve the arms every frame. Heads: the V placement (presets put her
 // slightly toward his closed side) passes her head by his right cheek, so
-// both heads turn a little the same way — his gaze out over the open side,
-// her face nestled toward his right cheek — and tip a few degrees toward
-// each other (temple to temple), chins lifted off the forward body curve.
+// both heads turn the same way — his gaze out over the open side, her face
+// nestled toward his right cheek — tilt toward each other (temple to
+// temple), and drop 15° as a NOD at the `head` joint (upper cervical), not
+// a deeper neck pitch: the quiet, inward close-embrace gaze. Nodding at the
+// head node pivots the face down where a neck pitch would translate the
+// whole head capsule ~6 cm toward the partner — dropped at the neck, the
+// two head colliders clash in the V and hold the couple 4+ cm out of torso
+// contact. Even as a nod the capsules tip a little forward, so the temple
+// tilt deepens (z 4° → 8°) to let the dropped heads pass cheek by cheek:
+// measured at z4, close embrace stuck 13 cm short of chest contact; at z8
+// it reaches the exact held distance again, and the y12/z8 pair is the one
+// combination that also keeps the turned/pivoted transients settling where
+// the closed-side palms still reach (a y18 yaw fixed the straight default
+// but deflected the follower's collide-and-slide in the turned states).
+// Hips: the leader's pelvis turns 10° toward the couple's midline
+// (her offset side, his right) with the chest counter-twisted to stay square
+// to her — his hips angle in under an unmoved embrace frame, a small
+// authored dissociation. Walk/apilado deliberately re-override neck x
+// afterwards (their heads stay up over the body lean) but keep the nod.
 function embraceArms(leader, follower) {
   leader.setJointDegrees({
     shoulder_L: { x: -30, y: 30, z: 15 }, elbow_L: { x: -120, y: -30 }, wrist_L: { x: -15 },
     shoulder_R: { x: -55, z: -18, y: 20 }, elbow_R: { x: -70 },
-    spine: { x: 4 }, chest: { x: 4 }, neck: { x: -5, y: 12, z: 4 },
+    spine: { x: 4 }, chest: { x: 4, y: 10 }, pelvis: { y: -10 },
+    neck: { x: -5, y: 12, z: 8 }, head: { x: 15 },
   });
   follower.setJointDegrees({
     shoulder_R: { x: -30, y: -30, z: -15 }, elbow_R: { x: -120, y: 30 }, wrist_R: { x: -15 },
     shoulder_L: { x: -65, z: 22 }, elbow_L: { x: -50 },
-    spine: { x: 4 }, chest: { x: 4 }, neck: { x: -5, y: 12, z: 4 },
+    spine: { x: 4 }, chest: { x: 4 }, neck: { x: -5, y: 12, z: 8 }, head: { x: 15 },
   });
 }
 
@@ -78,17 +95,24 @@ export const PRESETS = [
       // Walking adds a whole-body lean (pelvis x) on top of the embrace's
       // forward lean; keep both heads upright over it (real walkers look
       // ahead, not down into the partner) so the heads meet the body-contact
-      // colliders (skeletonDef.js) at a graze, not a clash.
+      // colliders (skeletonDef.js) at a graze, not a clash — that includes
+      // zeroing the standing frame's 15° head nod (embraceArms): nodded, the
+      // head capsules clash at walking contact and the collision/torso-pull
+      // tug-of-war holds the clasp open. The leader's standing hip-in twist
+      // (pelvis y -10 / chest y +10) is zeroed the same way: mid-stride the
+      // trunk yaw belongs to the step's own dissociation, and the static
+      // twist swings his open-side shoulder back far enough that the clasp
+      // can no longer close.
       leader.setJointDegrees({
         hip_L: { x: -28 }, knee_L: { x: 8 }, ankle_L: { x: -12 },
         hip_R: { x: 15 }, knee_R: { x: 36 }, ankle_R: { x: 33 },
-        pelvis: { x: 3 }, neck: { x: -4 },
+        pelvis: { x: 3, y: 0 }, chest: { y: 0 }, neck: { x: -4 }, head: { x: 0 },
       });
       leader.nodes.pelvis.position.y = 0.515 * leader.height;
       follower.setJointDegrees({
         hip_R: { x: 15 }, knee_R: { x: 36 }, ankle_R: { x: 33 },
         hip_L: { x: -8 }, knee_L: { x: 12 }, ankle_L: { x: -7 },
-        pelvis: { x: 3 }, neck: { x: -10 },
+        pelvis: { x: 3 }, neck: { x: -10 }, head: { x: 0 },
       });
       follower.nodes.pelvis.position.y = 0.527 * follower.height;
       leader.group.updateMatrixWorld(true);

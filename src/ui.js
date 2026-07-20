@@ -82,7 +82,7 @@ export function initUI(app) {
     hands: embraceHands.checked,
     close: embraceClose.checked,
   });
-  // The clasp tilt/height/elbow sliders only matter with the arm frame held.
+  // The clasp tilt/height sliders only matter with the arm frame held.
   const syncEmbraceControls = () => { embraceControls.hidden = !embraceHands.checked; };
   embraceHands.addEventListener('change', () => {
     if (!embraceHands.checked) embraceClose.checked = false;
@@ -108,17 +108,6 @@ export function initUI(app) {
     embraceHeightVal.textContent = embraceHeight.value;
     app.setClaspHeight(Number(embraceHeight.value) / 100);
   });
-  // Open-side elbow swivel per dancer (alternative embrace model): swings the
-  // elbow between the joined hands without moving either hand.
-  for (const role of ['leader', 'follower']) {
-    const slider = $(`embrace-elbow-${role}`);
-    const val = $(`embrace-elbow-${role}-val`);
-    slider.addEventListener('input', () => {
-      val.textContent = `${slider.value}°`;
-      app.setOpenElbow(role, Number(slider.value));
-    });
-  }
-
   const showButtons = [...document.querySelectorAll('#show-buttons button')];
   for (const btn of showButtons) {
     btn.addEventListener('click', () => {

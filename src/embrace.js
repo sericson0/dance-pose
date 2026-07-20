@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { JOINT_BY_NAME, DEG, clampAngle } from './skeletonDef.js';
-import { solveTwoBone, swivelLimb } from './ik.js';
+import { solveTwoBone } from './ik.js';
 
 // The tango embrace as a set of per-frame constraints (see main.js's loop),
 // modelled on the real embrace:
@@ -53,9 +53,6 @@ const CLOSED_TARGETS = {
 // of the two half-depths of the ribcage plus a little soft tissue).
 const CONTACT_FRACTION = 0.062;
 
-// The palm center sits about half the hand length beyond the wrist.
-const HAND_HALF = 0.050;
-
 const UP = new THREE.Vector3(0, 1, 0);
 
 // Open-side clasp: distance between the two palm centers (fraction of mean
@@ -85,31 +82,46 @@ const CLOSED_CURL = 0.45;
 // around its joint limits instead of settling.
 const MIN_REACH = 0.12;
 
-// Working pronation span the embrace arm solves within, in degrees. The elbow
-// joint itself allows a wider palm turn (±120°) for free posing, but the clasp
-// branch-ranking (#demandBranches / #poseError) and the closed-side #pronate
-// were tuned to the forearm's natural ±85° range: letting the solve reach past
-// it lets it pick a strained pronation branch that leaves the joined hands
-// gapping after a pivot. So the embrace caps pronation to this range while the
-// joint limit still governs the UI slider and gizmo.
-const CLASP_PRONATION_DEG = 85;
+// Working pronation span the embrace arm solves within, in degrees — a shade
+// inside the elbow joint's own ±120° so the solve never parks the forearm at
+// the hard stop. It used to sit at the forearm's natural ±85°, but that
+// starves the clasp in twisted couple geometries: mid-pivot the follower's
+// cross-body reach needs ~110° of pronation to keep her palm on the partner,
+// and with the cap at 85° her hand turned its back instead. Ranking
+// candidates by the ACHIEVED post-clamp orientation (#poseError) is what
+// makes the wide range safe — a strained branch that clamps into a bad palm
+// loses the ranking on its result, so it can't win the way it could when
+// branches were ranked by raw limit violation.
+const CLASP_PRONATION_DEG = 110;
 const claspPronationRange = (arm) => {
   const [lo, hi] = JOINT_BY_NAME[arm.elbow].limits.y;
   return [Math.max(lo, -CLASP_PRONATION_DEG), Math.min(hi, CLASP_PRONATION_DEG)];
 };
 
-// Center of the palm: halfway from the wrist to the hand endpoint.
-export function handCenter(figure, wristName, handName, target = new THREE.Vector3()) {
+// Center of the VISIBLE palm (`side` is 'L' or 'R'). This must be mesh truth
+// (Figure.palmPosWorld), never the rig wrist→hand midpoint: the clothed hand
+// is welded to the ATLAS wrist node, which shares the rig wrist's rotation but
+// not its position, and the two drift apart as the arm flexes — ~18 cm at the
+// embrace's own -120° elbow. Solving the clasp on the rig nodes joined two
+// phantom hands perfectly while the rendered hands hung ~15 cm apart, and no
+// amount of tuning inside the solve could see it. Everything here that
+// positions a hand goes through this one function.
+// syncAtlasNodes() before reading is not optional here, and is the same kind
+// of bring-derived-transforms-up-to-date step as the updateMatrixWorld beside
+// it. The atlas nodes carry the rig joints' rotations, but only as of the last
+// sync — and the IK inside #solveArm writes rig rotations directly, without
+// one. Read without syncing and the palm comes back for the PREVIOUS
+// iteration's pose, which turns the solve's fixed-point correction into a
+// feedback loop chasing a stale target (measured: the joined hands flew 122 cm
+// apart instead of 1.4).
+export function handCenter(figure, side, target = new THREE.Vector3()) {
+  figure.syncAtlasNodes();
   figure.group.updateMatrixWorld(true);
-  target.setFromMatrixPosition(figure.nodes[wristName].matrixWorld);
-  const tip = new THREE.Vector3().setFromMatrixPosition(figure.nodes[handName].matrixWorld);
-  return target.add(tip).multiplyScalar(0.5);
+  return figure.palmPosWorld(side, target);
 }
 
 export function openSideHandGap(leader, follower) {
-  const a = handCenter(leader, 'wrist_L', 'hand_L');
-  const b = handCenter(follower, 'wrist_R', 'hand_R');
-  return a.distanceTo(b);
+  return handCenter(leader, 'L').distanceTo(handCenter(follower, 'R'));
 }
 
 export class Embrace {
@@ -130,12 +142,6 @@ export class Embrace {
     // The clasp point stored in each dancer's chest frame; the live target is
     // the midpoint of the two, so it follows both torsos as they move.
     this.claspLocal = { leader: null, follower: null };
-    // ALTERNATIVE OPEN-SIDE MODEL: each dancer's open-side elbow swivel, in
-    // degrees around the shoulder→wrist axis (0 = elbow hanging straight
-    // down). Set by hand from the UI (Embrace panel); the clasp holds the
-    // wrists, this only swings the elbow between them (see #maintainOpenSide
-    // / #setElbowSwivel). Replaces the old auto-searched swivel (#swivelForPalm).
-    this.openElbow = { leader: 0, follower: 0 };
   }
 
   figure(role) {
@@ -164,13 +170,6 @@ export class Embrace {
   // Finger tilt of the joined hands, degrees from vertical (0 = fingers up).
   setTilt(deg) {
     this.tiltDeg = deg;
-  }
-
-  // ALTERNATIVE OPEN-SIDE MODEL: swing one dancer's open-side elbow to `deg`
-  // around its shoulder→wrist axis (0 = elbow hanging down). The joined hands
-  // stay pinned, so moving the elbow never disturbs the partner's hand.
-  setOpenElbow(role, deg) {
-    this.openElbow[role] = deg;
   }
 
   // Height of the joined open-side hands, as a fraction of mean stature above
@@ -327,13 +326,6 @@ export class Embrace {
     const edited = this.#editedArm(editing);
     const t = this.palmGap() / 2;
 
-    // Open side (ALTERNATIVE MODEL): the joined hands are held in palm
-    // contact and turned to face each other, and each dancer's open-side
-    // elbow is swung by hand (UI) rather than auto-solved — see
-    // #maintainOpenSide. The original auto-solved clasp orientation is kept
-    // below, commented out, for a side-by-side comparison.
-    this.#maintainOpenSide(edited, t);
-    /* --- original open-side clasp (superseded by #maintainOpenSide) -------
     // Open side: palms joined around the shared clasp point — the leader's
     // half a gap on his side of it, the follower's half a gap beyond — with
     // both hands' fingers aimed up the clasp's tilted vertical and the palm
@@ -341,7 +333,7 @@ export class Embrace {
     // him).
     if (edited === 'leaderOpen' || edited === 'followerOpen') {
       const arm = ARMS[edited];
-      const palm = handCenter(this.figure(arm.role), arm.wrist, arm.hand);
+      const palm = handCenter(this.figure(arm.role), arm.wrist.slice(-1));
       const out = this.#claspOutward();
       // Store the midpoint between the palms as the clasp.
       const clasp = palm.clone().addScaledVector(out, edited === 'leaderOpen' ? t : -t);
@@ -363,8 +355,8 @@ export class Embrace {
       // re-target both palms around the midpoint of where they landed. The
       // signed check also catches palms that met at the right distance but
       // stacked in the wrong order along the axis.
-      const a = handCenter(this.leader, 'wrist_L', 'hand_L');
-      const b = handCenter(this.follower, 'wrist_R', 'hand_R');
+      const a = handCenter(this.leader, 'L');
+      const b = handCenter(this.follower, 'R');
       const signed = b.clone().sub(a).dot(out);
       if (Math.abs(signed - 2 * t) > 0.004 || Math.abs(a.distanceTo(b) - 2 * t) > 0.004) {
         const mid = a.add(b).multiplyScalar(0.5);
@@ -372,7 +364,6 @@ export class Embrace {
         this.#solveArm('followerOpen', mid.clone().addScaledVector(out, t), dirF, palmF);
       }
     }
-    --- end original open-side clasp ------------------------------------- */
 
     // Closed side: each palm to its rest point on the partner, turned to lie
     // against the surface it rests on. Only while the couple roughly face
@@ -382,131 +373,16 @@ export class Embrace {
     if (edited !== 'leaderClosed') {
       this.#solveArm('leaderClosed', this.closedTargetWorld('leaderClosed'));
       const dir = this.follower.worldPos('chest')
-        .sub(handCenter(this.leader, 'wrist_R', 'hand_R'));
+        .sub(handCenter(this.leader, 'R'));
       if (dir.lengthSq() > 1e-8) this.#pronate(this.leader, ARMS.leaderClosed, dir.normalize());
     }
     if (edited !== 'followerClosed') {
       this.#solveArm('followerClosed', this.closedTargetWorld('followerClosed'));
       const upperArm = this.leader.worldPos('shoulder_R')
         .add(this.leader.worldPos('elbow_R')).multiplyScalar(0.5);
-      const dir = upperArm.sub(handCenter(this.follower, 'wrist_L', 'hand_L'));
+      const dir = upperArm.sub(handCenter(this.follower, 'L'));
       if (dir.lengthSq() > 1e-8) this.#pronate(this.follower, ARMS.followerClosed, dir.normalize());
     }
-  }
-
-  // ALTERNATIVE OPEN-SIDE MODEL ------------------------------------------
-  //
-  // Two rules replace the old auto-solved clasp:
-  //   1. Palm contact + facing. The two open-side hands are held around a
-  //      shared clasp point (the midpoint between them, stored in both chest
-  //      frames so it rides the couple) no farther apart than PALM_GAP, each
-  //      palm turned to face the other along the couple axis.
-  //   2. Manual elbow. Each dancer's open-side elbow swivel is set from the
-  //      UI (openElbow), not searched. Swivelling rotates the arm about the
-  //      shoulder→wrist line, which leaves the pinned wrist — and so the
-  //      partner's clasped hand — exactly where it is.
-  #maintainOpenSide(edited, t) {
-    const out = this.#claspOutward();
-    const fingerDir = this.#simpleFingerDir(out);
-    // The user is posing one open hand: re-anchor the clasp on it and solve
-    // only the partner to meet it (the edited hand is left alone).
-    if (edited === 'leaderOpen' || edited === 'followerOpen') {
-      const arm = ARMS[edited];
-      const palm = handCenter(this.figure(arm.role), arm.wrist, arm.hand);
-      const clasp = palm.clone().addScaledVector(out, edited === 'leaderOpen' ? t : -t);
-      this.captureClasp(clasp);
-      const other = edited === 'leaderOpen' ? 'followerOpen' : 'leaderOpen';
-      const palmDir = out.clone().multiplyScalar(other === 'leaderOpen' ? 1 : -1);
-      const goal = clasp.clone().addScaledVector(out, other === 'leaderOpen' ? -t : t);
-      this.#solveOpenArm(other, goal, fingerDir, palmDir, this.openElbow[ARMS[other].role]);
-      return;
-    }
-    const clasp = this.claspWorld();
-    if (!clasp) return;
-    const palmF = out.clone().negate();
-    this.#solveOpenArm('leaderOpen', clasp.clone().addScaledVector(out, -t), fingerDir, out, this.openElbow.leader);
-    this.#solveOpenArm('followerOpen', clasp.clone().addScaledVector(out, t), fingerDir, palmF, this.openElbow.follower);
-    // Rule 1's distance cap: if joint limits left the palms more than a hair
-    // apart (or stacked in the wrong order along the axis), meet halfway.
-    const a = handCenter(this.leader, 'wrist_L', 'hand_L');
-    const b = handCenter(this.follower, 'wrist_R', 'hand_R');
-    const signed = b.clone().sub(a).dot(out);
-    if (Math.abs(signed - 2 * t) > 0.004 || Math.abs(a.distanceTo(b) - 2 * t) > 0.004) {
-      const mid = a.add(b).multiplyScalar(0.5);
-      this.#solveOpenArm('leaderOpen', mid.clone().addScaledVector(out, -t), fingerDir, out, this.openElbow.leader);
-      this.#solveOpenArm('followerOpen', mid.clone().addScaledVector(out, t), fingerDir, palmF, this.openElbow.follower);
-    }
-  }
-
-  // Finger direction for the joined hands: up (a vertical handshake), leaned
-  // `tiltDeg` from vertical toward the couple's midline. Shared by both hands
-  // so they read as facing each other. (The old per-hand wrap is dropped in
-  // this model — see #claspFingerDir for the original.)
-  #simpleFingerDir(out) {
-    const tangent = out.clone().cross(UP);
-    if (tangent.lengthSq() < 1e-8) return UP.clone();
-    tangent.normalize();
-    const clasp = this.claspWorld();
-    if (clasp) {
-      const toMid = this.leader.worldPos('chest')
-        .add(this.follower.worldPos('chest')).multiplyScalar(0.5).sub(clasp);
-      toMid.y = 0;
-      if (tangent.dot(toMid) < 0) tangent.negate(); // lean in over the couple
-    }
-    const tilt = this.tiltDeg * DEG;
-    return UP.clone().multiplyScalar(Math.cos(tilt)).addScaledVector(tangent, Math.sin(tilt)).normalize();
-  }
-
-  // Reach an open-side palm to `goal` and hold it there, palm facing
-  // `palmDir`, fingers along `fingerDir`, with the elbow parked at the user's
-  // swivel angle `elbowDeg`. Mirrors #solveArm's iterate-and-correct loop but
-  // sets the elbow from the manual control (#setElbowSwivel) instead of
-  // searching it (#swivelForPalm). #orientHand still turns the palm to face
-  // the partner through elbow pronation + wrist flex/deviation.
-  #solveOpenArm(armKey, goal, fingerDir, palmDir, elbowDeg) {
-    const arm = ARMS[armKey];
-    const f = this.figure(arm.role);
-    const chain = { root: arm.shoulder, mid: arm.elbow, effector: arm.wrist, hingeSign: -1 };
-    goal = this.#minReachClamp(f, arm, goal);
-    const target = goal.clone().addScaledVector(fingerDir, -HAND_HALF * f.height);
-    for (let i = 0; i < 6; i++) {
-      solveTwoBone(f, chain, target); // preserves the arm's current swivel
-      this.#setElbowSwivel(f, arm, elbowDeg); // park the elbow, wrist pinned
-      this.#orientHand(f, arm, fingerDir, palmDir);
-      const palm = handCenter(f, arm.wrist, arm.hand);
-      if (palm.distanceTo(goal) < 0.002) break;
-      const handVec = palm.sub(f.nodes[arm.wrist].getWorldPosition(new THREE.Vector3()));
-      target.copy(goal).sub(handVec);
-    }
-  }
-
-  // Swing an arm's elbow to swivel angle `deg` around the shoulder→wrist
-  // axis (0 = elbow hanging straight down), keeping the shoulder and the
-  // wrist pinned so the clasp — and the partner's hand — never move. We
-  // build the target elbow point on that circle and hand the actual roll to
-  // swivelLimb, which walks the roll only as far as the shoulder limits allow
-  // (bisecting for feasibility) so the endpoints stay put even when `deg`
-  // asks for more than the joint can give. The circle reference (world-down,
-  // or the figure's forward when the axis is vertical) is the manual
-  // counterpart of the old #swivelForPalm search, so `deg` reads the same.
-  #setElbowSwivel(f, arm, deg) {
-    const shoulder = f.nodes[arm.shoulder].getWorldPosition(new THREE.Vector3());
-    const wrist = f.nodes[arm.wrist].getWorldPosition(new THREE.Vector3());
-    const elbowPos = f.nodes[arm.elbow].getWorldPosition(new THREE.Vector3());
-    const axis = wrist.clone().sub(shoulder);
-    if (axis.lengthSq() < 1e-8) return;
-    axis.normalize();
-    const center = shoulder.clone().addScaledVector(axis, elbowPos.clone().sub(shoulder).dot(axis));
-    const u0 = new THREE.Vector3(0, -1, 0).addScaledVector(axis, axis.y);
-    if (u0.lengthSq() < 1e-4) {
-      u0.set(0, 0, 1).applyQuaternion(f.group.quaternion).addScaledVector(axis, -axis.dot(u0));
-    }
-    if (u0.lengthSq() < 1e-8) return;
-    u0.normalize();
-    const v0 = new THREE.Vector3().crossVectors(axis, u0);
-    const theta = deg * DEG;
-    const des = u0.multiplyScalar(Math.cos(theta)).addScaledVector(v0, Math.sin(theta));
-    swivelLimb(f, { root: arm.shoulder, mid: arm.elbow, effector: arm.wrist }, center.add(des));
   }
 
   // Where the clasp says an open-side hand's fingers should point right now
@@ -536,23 +412,31 @@ export class Embrace {
     return d.multiplyScalar(Math.cos(wrap)).addScaledVector(out, facing * Math.sin(wrap)).normalize();
   }
 
-  // The hand's full target orientation: at rest the fingers run along local
-  // -Y and the palm normal is local +Z (anatomical position, palms
-  // forward), so a finger direction plus a palm facing pin the whole frame
-  // (the palm component is made perpendicular to the fingers — the finger
-  // wrap tilts the palm with it). Returns { q, palmAxis } (the world palm
-  // normal, the axis an in-palm-plane finger lean rotates about), or null
-  // if degenerate.
-  #handTarget(fingerDir, palmDir) {
+  // The hand's full target orientation: a finger direction plus a palm
+  // facing pin the whole frame (the palm component is made perpendicular to
+  // the fingers — the finger wrap tilts the palm with it). The frame is
+  // built in the rig's canonical hand convention (fingers along wrist-local
+  // -Y, palm along +Z: anatomical position, palms forward) and then
+  // conjugated by the figure's measured mesh offset (Figure.handMesh): the
+  // clothed avatar's hand skin rides the wrist rolled ~110° about the
+  // forearm from that convention (the Biped bind hangs palms toward the
+  // thighs, and the retarget keeps the roll), so a target aimed with the
+  // canonical +Z turns the VISIBLE back of the hand to the partner — the
+  // original leader clasp flip. Returns { q, palmAxis } (q = the wrist
+  // node's demanded world orientation; palmAxis = the world palm normal,
+  // the axis an in-palm-plane finger lean rotates about), or null if
+  // degenerate.
+  #handTarget(f, arm, fingerDir, palmDir) {
     const y = fingerDir.clone().negate().normalize();
     const z = palmDir.clone().addScaledVector(y, -y.dot(palmDir));
     if (z.lengthSq() < 1e-8) return null; // palm target parallel to the fingers
     z.normalize();
     const x = new THREE.Vector3().crossVectors(y, z);
-    return {
-      q: new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, z)),
-      palmAxis: z,
-    };
+    const q = new THREE.Quaternion()
+      .setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, z));
+    const mesh = f.handMesh[arm.wrist.slice(-1)];
+    if (mesh) q.multiply(mesh.offsetInv); // aim the visible palm, not the rig's +Z
+    return { q, palmAxis: z };
   }
 
   // When the geometry is strained, the ideal clasp orientation can sit
@@ -574,15 +458,18 @@ export class Embrace {
   // weighs double — palm-to-palm facing is the truth of the clasp; finger
   // error is the visible lean). This is what candidate swivels and leans
   // are ranked by: ranking by raw limit violation instead lets a candidate
-  // "win" while its clamped remainder lands entirely on the palm.
+  // "win" while its clamped remainder lands entirely on the palm. The
+  // achieved directions are the MESH's (Figure.handMesh) — what the viewer
+  // sees — not the rig's canonical axes.
   #poseError(f, arm, d, preRot, fingerDir, palmAxis) {
     const elbow = f.nodes[arm.elbow];
     const q = elbow.parent.getWorldQuaternion(new THREE.Quaternion())
       .multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), elbow.rotation.x));
     if (preRot) q.premultiply(preRot);
     q.multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(d.x, d.y, d.z, 'YXZ')));
-    const palm = new THREE.Vector3(0, 0, 1).applyQuaternion(q);
-    const fingers = new THREE.Vector3(0, -1, 0).applyQuaternion(q);
+    const mesh = f.handMesh[arm.wrist.slice(-1)];
+    const palm = (mesh ? mesh.palm.clone() : new THREE.Vector3(0, 0, 1)).applyQuaternion(q);
+    const fingers = (mesh ? mesh.fingers.clone() : new THREE.Vector3(0, -1, 0)).applyQuaternion(q);
     const palmErr = palm.angleTo(palmAxis);
     const fingerErr = fingers.angleTo(fingerDir);
     return 2 * palmErr + fingerErr;
@@ -650,7 +537,7 @@ export class Embrace {
   // neutral wrist gets undone the moment the wrist bends to point the
   // fingers (that ordering left the follower's palm ~90° off).
   #orientHand(f, arm, fingerDir, palmDir) {
-    const target = this.#handTarget(fingerDir, palmDir);
+    const target = this.#handTarget(f, arm, fingerDir, palmDir);
     if (!target) return;
     const best = this.#bestHandPose(f, arm, target, fingerDir);
     f.nodes[arm.elbow].rotation.y = best.d.y;
@@ -671,7 +558,7 @@ export class Embrace {
   // Rotating about the shoulder→wrist axis leaves the wrist — the clasp —
   // in place.
   #swivelForPalm(f, arm, fingerDir, palmDir) {
-    const target = this.#handTarget(fingerDir, palmDir);
+    const target = this.#handTarget(f, arm, fingerDir, palmDir);
     if (!target) return;
     // Settled pose already delivering the clasp (≲11° combined error):
     // keep the current swivel and skip the search — this is the steady
@@ -794,18 +681,21 @@ export class Embrace {
     // arms instead set their swivel deterministically each pass
     // (#swivelForPalm): the elbow position from which the demanded palm
     // facing actually fits the pronation and wrist limits.
-    // First pass aims the wrist half a hand short of the goal along the
-    // finger direction (or the current forearm when there is none); later
-    // passes re-aim it a measured wrist→palm vector short of the goal. (The
-    // correction is recomputed from the goal each pass, never accumulated,
-    // so an unreachable goal cannot make the target run away — the arm just
-    // settles as close as its limits allow.)
-    const target = goal.clone();
-    const fore = fingerDir ? fingerDir.clone()
-      : f.nodes[arm.wrist].getWorldPosition(new THREE.Vector3())
-        .sub(f.nodes[arm.elbow].getWorldPosition(new THREE.Vector3()));
-    if (fore.lengthSq() > 1e-10) target.addScaledVector(fore.normalize(), -HAND_HALF * f.height);
-    for (let i = 0; i < 6; i++) {
+    // The IK effector is the RIG wrist but the goal is for the VISIBLE palm,
+    // and the vector between them is neither small nor along the forearm —
+    // the clothed hand rides the atlas chain, so on a deeply flexed embrace
+    // arm the rig wrist sits ~18 cm from the palm, in a pose-dependent
+    // direction (see handCenter). So every pass, including the first, aims
+    // the wrist target at `goal` minus the CURRENTLY MEASURED rig-wrist→palm
+    // offset. Seeding from the live pose this way (rather than the old guess
+    // of half a hand length back along the fingers, which was ~3× short and
+    // pointed the wrong way) starts the iteration already close, so it
+    // converges in a pass or two. The correction is recomputed from the goal
+    // each pass, never accumulated, so an unreachable goal cannot make the
+    // target run away — the arm just settles as close as its limits allow.
+    const wristWorld = () => f.nodes[arm.wrist].getWorldPosition(new THREE.Vector3());
+    const target = goal.clone().sub(handCenter(f, arm.wrist.slice(-1)).sub(wristWorld()));
+    for (let i = 0; i < 8; i++) {
       solveTwoBone(f, chain, target);
       if (fingerDir) {
         // Swivel once per solve — it changes little between passes, and
@@ -813,18 +703,19 @@ export class Embrace {
         if (i === 0) this.#swivelForPalm(f, arm, fingerDir, palmDir);
         this.#orientHand(f, arm, fingerDir, palmDir);
       }
-      const palm = handCenter(f, arm.wrist, arm.hand);
+      const palm = handCenter(f, arm.wrist.slice(-1));
       if (palm.distanceTo(goal) < 0.002) break;
-      const handVec = palm.sub(f.nodes[arm.wrist].getWorldPosition(new THREE.Vector3()));
-      target.copy(goal).sub(handVec);
+      target.copy(goal).sub(palm.sub(wristWorld()));
     }
   }
 
   // Set elbow twist so the palm normal (with a neutral wrist) points as close
-  // to `dirWorld` as the pronation range allows. The palm normal is +Z in the
-  // hand's frame at rest (anatomical position, palms forward); with XYZ Euler
-  // order it becomes Rx(flex)·Ry(θ)·(0,0,1) in the elbow's parent frame, so
-  // θ comes from `dirWorld` expressed in the post-flexion frame.
+  // to `dirWorld` as the pronation range allows. The VISIBLE palm normal with
+  // a neutral wrist is the figure's measured mesh palm direction (see
+  // Figure.handMesh; the rig-canonical +Z when no avatar is loaded); with XYZ
+  // Euler order it becomes Rx(flex)·Ry(θ)·palm in the elbow's parent frame,
+  // so θ is the angle from the palm's own XZ heading to `dirWorld`'s,
+  // expressed in the post-flexion frame.
   #pronate(figure, arm, dirWorld) {
     const elbow = figure.nodes[arm.elbow];
     const parentQ = elbow.parent.getWorldQuaternion(new THREE.Quaternion());
@@ -833,7 +724,11 @@ export class Embrace {
       new THREE.Vector3(1, 0, 0), -elbow.rotation.x,
     ));
     if (Math.hypot(local.x, local.z) < 1e-4) return; // clasp along the forearm axis
-    const theta = Math.atan2(local.x, local.z);
+    const palm = figure.handMesh[arm.wrist.slice(-1)]?.palm;
+    const palmHeading = palm && Math.hypot(palm.x, palm.z) > 1e-4
+      ? Math.atan2(palm.x, palm.z) : 0;
+    const wrap = (a) => THREE.MathUtils.euclideanModulo(a + Math.PI, 2 * Math.PI) - Math.PI;
+    const theta = wrap(Math.atan2(local.x, local.z) - palmHeading);
     elbow.rotation.y = clampAngle(theta, claspPronationRange(arm));
   }
 }

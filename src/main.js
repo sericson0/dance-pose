@@ -1280,12 +1280,6 @@ const app = {
     this.embrace.setClaspHeight(frac);
   },
 
-  // Swing a dancer's open-side elbow (role 'leader'/'follower') around its
-  // shoulder→wrist axis without moving the joined hands (0 = elbow down).
-  setOpenElbow(role, deg) {
-    this.embrace.setOpenElbow(role, deg);
-  },
-
   // Highlight body parts (Set of BODY_PARTS ids, empty/null clears).
   setHighlight(parts) {
     this.highlightParts = parts;
