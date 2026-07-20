@@ -525,11 +525,15 @@ export class Figure {
         const insNode = m.insert ? this.#seatNode(resolve(m.insert, side)) : null;
         if (insNode) {
           // Skinned: bake into figure-local space and let updateMuscleSkin blend
-          // each vertex between the two joints every frame.
+          // each vertex between the two joints every frame. The highlight group
+          // rides `m.ride` when a belly names one (the abdominal wall spans
+          // pelvis→chest but belongs to the Torso part, not the Pelvis), else its
+          // own node.
           const g = m.geometry.clone();
           g.applyMatrix4(T);
           if (mirror) reverseWinding(g);
-          this.#addSkinnedMuscle(g, node, insNode, material, m.label, nodeName);
+          const rideName = m.ride ? resolve(m.ride, side) : nodeName;
+          this.#addSkinnedMuscle(g, node, insNode, material, m.label, rideName, m.spread);
         } else {
           // Rigid: bake into the node's local frame and hang it there.
           const g = m.geometry.clone();
@@ -561,54 +565,85 @@ export class Figure {
   // mesh hangs off `group` (not a joint node) so its own frame never moves — all
   // motion comes through the two joints, keeping the skin correct even as the
   // whole dancer translates or turns.
-  #addSkinnedMuscle(g, nodeA, nodeB, material, label, originNode) {
+  #addSkinnedMuscle(g, nodeA, nodeB, material, label, originNode, spread = false) {
     const pos = g.attributes.position;
     const nrm = g.attributes.normal;
     const count = pos.count;
     const gInv = _gInv.copy(this.group.matrixWorld).invert();
     const a = new THREE.Vector3().setFromMatrixPosition(nodeA.matrixWorld).applyMatrix4(gInv);
     const b = new THREE.Vector3().setFromMatrixPosition(nodeB.matrixWorld).applyMatrix4(gInv);
-    // The muscle spans the deeper (child) of its two joints. Pick the crossed
-    // joint pivot, the home-bone axis to measure along, and how the distal-side
-    // weight maps onto "blend toward nodeB".
-    const child = this.#deeperJointNode(nodeA, nodeB);
-    let cross, home, distalIsB;
-    if (child === nodeB) {
-      cross = b;                                     // belly on nodeA's bone (a→b)
-      home = new THREE.Vector3().subVectors(b, a);
-      distalIsB = true;                              // past the joint → nodeB
-    } else {
-      cross = a;                                     // belly on nodeA's own bone
-      home = this.#distalBoneDir(nodeA, gInv) || new THREE.Vector3().subVectors(a, b);
-      distalIsB = false;                             // past the joint → nodeA
-    }
-    const boneLen = Math.max(home.length(), 1e-6);
-    home.multiplyScalar(1 / boneLen);
-    // Pass 1: signed distance of each vertex from the crossed joint along the
-    // home-bone axis (s > 0 on the distal / child-bone side), and how far the
-    // muscle reaches on each side.
-    const sArr = new Float32Array(count);
-    let sMin = Infinity, sMax = -Infinity;
-    const v = new THREE.Vector3();
-    for (let i = 0; i < count; i++) {
-      const s = v.fromBufferAttribute(pos, i).sub(cross).dot(home);
-      sArr[i] = s;
-      if (s < sMin) sMin = s;
-      if (s > sMax) sMax = s;
-    }
-    // Transition half-width: a fraction of the bone, but never wider than the
-    // shorter side reaches, so the short tendon side saturates to full weight
-    // (otherwise it never fully commits to its bone and tears away at the joint).
-    let band = 0.16 * boneLen;
-    if (sMax > 1e-5) band = Math.min(band, 0.85 * sMax);
-    if (sMin < -1e-5) band = Math.min(band, -0.85 * sMin);
-    band = Math.max(band, 1e-4);
-    // Pass 2: smoothstep across the joint, mapped to "blend toward nodeB".
     const weight = new Float32Array(count);
-    for (let i = 0; i < count; i++) {
-      const t = THREE.MathUtils.clamp((sArr[i] + band) / (2 * band), 0, 1);
-      const distal = t * t * (3 - 2 * t);
-      weight[i] = distalIsB ? distal : 1 - distal;
+    const v = new THREE.Vector3();
+    if (spread) {
+      // Broad trunk sheet (the abdominal wall) that spans BOTH joints rather than
+      // lying on one bone and crossing at a tendon: shear the whole belly
+      // progressively from the proximal joint (nodeA, the pelvis) to the distal
+      // (nodeB, the chest). Trunk axial rotation — tango dissociation — accrues
+      // across the whole lumbar span, so a full-length weight ramp is what makes
+      // the obliques stretch on one side and shorten on the other as the chest
+      // turns over the pelvis. The localized joint-split band below leaves this
+      // sheet almost rigid (nearly every vertex sits below the crossed joint, so
+      // it follows the near bone and the twisting joint above it barely reaches
+      // the flesh). Weight runs 0 at the belly's nodeA end → 1 at its nodeB end,
+      // measured along the joint-to-joint axis and normalized over the belly's
+      // own extent, so its two attachments anchor to their bones and the middle
+      // shears.
+      const axis = new THREE.Vector3().subVectors(b, a);
+      axis.multiplyScalar(1 / Math.max(axis.length(), 1e-6));
+      const sArr = new Float32Array(count);
+      let pMin = Infinity, pMax = -Infinity;
+      for (let i = 0; i < count; i++) {
+        const p = v.fromBufferAttribute(pos, i).sub(a).dot(axis);
+        sArr[i] = p;
+        if (p < pMin) pMin = p;
+        if (p > pMax) pMax = p;
+      }
+      const span = Math.max(pMax - pMin, 1e-6);
+      for (let i = 0; i < count; i++) {
+        const t = THREE.MathUtils.clamp((sArr[i] - pMin) / span, 0, 1);
+        weight[i] = t * t * (3 - 2 * t); // smoothstep, 0 at nodeA end → 1 at nodeB
+      }
+    } else {
+      // The muscle spans the deeper (child) of its two joints. Pick the crossed
+      // joint pivot, the home-bone axis to measure along, and how the distal-side
+      // weight maps onto "blend toward nodeB".
+      const child = this.#deeperJointNode(nodeA, nodeB);
+      let cross, home, distalIsB;
+      if (child === nodeB) {
+        cross = b;                                     // belly on nodeA's bone (a→b)
+        home = new THREE.Vector3().subVectors(b, a);
+        distalIsB = true;                              // past the joint → nodeB
+      } else {
+        cross = a;                                     // belly on nodeA's own bone
+        home = this.#distalBoneDir(nodeA, gInv) || new THREE.Vector3().subVectors(a, b);
+        distalIsB = false;                             // past the joint → nodeA
+      }
+      const boneLen = Math.max(home.length(), 1e-6);
+      home.multiplyScalar(1 / boneLen);
+      // Pass 1: signed distance of each vertex from the crossed joint along the
+      // home-bone axis (s > 0 on the distal / child-bone side), and how far the
+      // muscle reaches on each side.
+      const sArr = new Float32Array(count);
+      let sMin = Infinity, sMax = -Infinity;
+      for (let i = 0; i < count; i++) {
+        const s = v.fromBufferAttribute(pos, i).sub(cross).dot(home);
+        sArr[i] = s;
+        if (s < sMin) sMin = s;
+        if (s > sMax) sMax = s;
+      }
+      // Transition half-width: a fraction of the bone, but never wider than the
+      // shorter side reaches, so the short tendon side saturates to full weight
+      // (otherwise it never fully commits to its bone and tears away at the joint).
+      let band = 0.16 * boneLen;
+      if (sMax > 1e-5) band = Math.min(band, 0.85 * sMax);
+      if (sMin < -1e-5) band = Math.min(band, -0.85 * sMin);
+      band = Math.max(band, 1e-4);
+      // Pass 2: smoothstep across the joint, mapped to "blend toward nodeB".
+      for (let i = 0; i < count; i++) {
+        const t = THREE.MathUtils.clamp((sArr[i] + band) / (2 * band), 0, 1);
+        const distal = t * t * (3 - 2 * t);
+        weight[i] = distalIsB ? distal : 1 - distal;
+      }
     }
     const bindPos = new Float32Array(pos.array);
     const bindNrm = new Float32Array(nrm.array);
@@ -1539,6 +1574,10 @@ export class Figure {
     for (const s of this.pickSpheres) {
       s.material.opacity = skeleton ? 0.22 : 0;
       s.material.depthWrite = false;
+      // Restore the resting depth state: hover (main.js) draws the spheres
+      // through the opaque avatar, and a layer switch must not strand them there.
+      s.material.depthTest = true;
+      s.renderOrder = 0;
     }
   }
 

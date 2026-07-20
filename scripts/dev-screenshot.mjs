@@ -17,13 +17,14 @@ await page.goto('http://localhost:5173', { waitUntil: 'networkidle0', timeout: 2
 await new Promise((r) => setTimeout(r, 2500));
 await page.screenshot({ path: `${outDir}/a-body.png` });
 
-const setLayers = (sk, bo, mu) => page.evaluate((s, b, m) => {
-  document.getElementById('layer-skeleton').checked = s;
-  document.getElementById('layer-body').checked = b;
-  document.getElementById('layer-muscle').checked = m;
-  for (const id of ['layer-skeleton', 'layer-body', 'layer-muscle'])
-    document.getElementById(id).dispatchEvent(new Event('change'));
-}, sk, bo, mu);
+// The three layers are one dropdown: body | skeleton | muscle (muscle shows the
+// skeleton behind it). Kept as an (sk, bo, mu) helper so the call sites read the
+// same as before.
+const setLayers = (sk, bo, mu) => page.evaluate((mode) => {
+  const sel = document.getElementById('layer-mode');
+  sel.value = mode;
+  sel.dispatchEvent(new Event('change'));
+}, mu ? 'muscle' : (sk ? 'skeleton' : 'body'));
 
 // Skeleton only, zoomed on one dancer.
 await setLayers(true, false, false);

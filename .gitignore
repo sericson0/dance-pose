@@ -3,3 +3,4 @@ dist/
 .DS_Store
 Skeleton and Muscle Models/*
 shots-*/
+.claude/worktrees/

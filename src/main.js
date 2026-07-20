@@ -353,6 +353,68 @@ function lerpPose(a, b, t) {
   };
 }
 
+// ------------------------------------------ interpolation foot grounding
+// Joint-space lerping doesn't preserve world foot positions: halfway between
+// two standing keyframes the support foot drifts off its spot and floats.
+// The rule: a foot on the floor at BOTH ends of a segment stays connected to
+// it throughout — the standing leg holds its ground, and a foot that moves
+// between two grounded spots glides along the floor instead of arcing through
+// the air (with both feet planted in both keyframes, both stay connected).
+// The leg's hip/knee/ankle re-solve to accommodate, starting from the lerped
+// pose so the leg's swivel stays continuous. A foot airborne at either end
+// lerps freely — feet stay free, a boleo still flies.
+const _stateFeetCache = new WeakMap(); // couple state → per-figure foot anchors
+
+// Each figure's foot anchors in `state`: planted flag + ankle world transform.
+// Measuring applies the state's poses to the figures — callers apply their own
+// pose right after, so nothing is saved or restored here.
+function stateFeet(state) {
+  let info = _stateFeetCache.get(state);
+  if (info) return info;
+  info = state.figures.map((pose, i) => {
+    const f = app.figures[i];
+    f.setPose(pose);
+    const feet = {};
+    for (const side of ['L', 'R']) {
+      const ankle = f.nodes[`ankle_${side}`];
+      feet[side] = {
+        planted: f.footLowY(side) < 0.01,
+        pos: ankle.getWorldPosition(new THREE.Vector3()),
+        quat: ankle.getWorldQuaternion(new THREE.Quaternion()),
+      };
+    }
+    return feet;
+  });
+  _stateFeetCache.set(state, info);
+  return info;
+}
+
+const _gfPos = new THREE.Vector3();
+const _gfQuat = new THREE.Quaternion();
+const _gfParentQ = new THREE.Quaternion();
+
+// Re-plant the figure's both-ends-planted feet on the lerped pose at t: the
+// ankle back to the lerped world spot (leg IK), the sole back to the slerped
+// world orientation (through the ankle joint, limits still enforced).
+function groundInterpFeet(figure, fa, fb, t) {
+  for (const side of ['L', 'R']) {
+    const a = fa[side];
+    const b = fb[side];
+    if (!a.planted || !b.planted) continue;
+    _gfPos.copy(a.pos).lerp(b.pos, t);
+    _gfQuat.copy(a.quat).slerp(b.quat, t);
+    solveTwoBone(figure, {
+      root: `hip_${side}`, mid: `knee_${side}`, effector: `ankle_${side}`, hingeSign: 1,
+    }, _gfPos);
+    const ankle = figure.nodes[`ankle_${side}`];
+    ankle.parent.getWorldQuaternion(_gfParentQ);
+    ankle.quaternion.copy(_gfParentQ.invert().multiply(_gfQuat));
+    figure.clampJoint(`ankle_${side}`);
+  }
+  figure.syncAtlasNodes();
+  figure.group.updateMatrixWorld(true);
+}
+
 // Pose the couple at t ∈ [0, 1] along a chain of couple states — the A→B
 // lerp generalized to any number of keyframes (equal time per segment). The
 // scrubber/player of both the A/B compare and the movement sequence land here.
@@ -360,7 +422,16 @@ function applyStatesT(states, t) {
   const segs = states.length - 1;
   const u = THREE.MathUtils.clamp(t, 0, 1) * segs;
   const i = Math.min(Math.floor(u), segs - 1);
-  app.figures.forEach((f, j) => f.setPose(lerpPose(states[i].figures[j], states[i + 1].figures[j], u - i)));
+  const sA = states[i];
+  const sB = states[i + 1];
+  // Foot anchors first: measuring applies the endpoint poses, which the
+  // lerped pose below overwrites.
+  const feetA = app.interpGroundFeet ? stateFeet(sA) : null;
+  const feetB = app.interpGroundFeet ? stateFeet(sB) : null;
+  app.figures.forEach((f, j) => {
+    f.setPose(lerpPose(sA.figures[j], sB.figures[j], u - i));
+    if (feetA && feetB) groundInterpFeet(f, feetA[j], feetB[j], u - i);
+  });
 }
 
 // Tempo shared by the A→B player and the sequence player (seconds per segment).
@@ -888,6 +959,7 @@ const app = {
   coupleDrag: null, // start transforms captured while dragging a linked couple
   figDragY: null, // root height captured when a figure drag starts
   interpStates: null, // { A, B } couple states driving the A→B scrubber
+  interpGroundFeet: true, // planted-at-both-ends feet stay on the floor while interpolating
   interpPlaying: false,
   interpT: 0,
   interpTick: null, // UI callback fed the current t while playing
@@ -941,10 +1013,19 @@ const app = {
   },
 
   setMode(mode) {
+    // The dancer the user last touched, before deselect forgets it.
+    const prev = this.selected?.figure ?? this.hipsState?.figure ?? this.activeFigure;
     this.mode = mode;
     this.pinPending = null; // a half-authored pin dies with its mode
     pinPendingMarker.visible = false;
     this.deselect();
+    // Move hips needs no click: the handle appears right away on the
+    // last-touched (else the first visible) dancer; clicking the other
+    // dancer still moves it there.
+    if (mode === 'hips') {
+      const fig = (prev?.group.visible ? prev : null) ?? this.visibleFigures()[0];
+      if (fig) this.selectFigure(fig);
+    }
   },
 
   // ------------------------------------------------------------ contact pins
@@ -1205,17 +1286,6 @@ const app = {
     }
   },
 
-  // Default chain mode for a leg/pelvis joint: closed when its foot is planted
-  // (bend the knee and the body sinks over the standing foot), else open.
-  autoChain(figure, jointName) {
-    figure.group.updateMatrixWorld(true);
-    const contacts = footContactsBySide(figure);
-    const planted = (side) => contacts[side] && contacts[side].length > 0;
-    if (jointName === 'pelvis') return planted('L') || planted('R') ? 'closed' : 'open';
-    const side = jointName.endsWith('_L') ? 'L' : 'R';
-    return planted(side) ? 'closed' : 'open';
-  },
-
   // Edit a joint honouring the current chain mode. `mutate` changes rotations.
   // Closed chain only applies to the legs/pelvis (arms/spine are always open).
   editJoint(figure, jointName, mutate) {
@@ -1253,6 +1323,12 @@ const app = {
     leader.group.visible = which === 'both' || which === 'leader';
     follower.group.visible = which === 'both' || which === 'follower';
     if (this.selected && !this.selected.figure.group.visible) this.deselect();
+    if (this.hipsState && !this.hipsState.figure.group.visible) this.deselect();
+    // Move hips always offers a handle: re-seat it on a shown dancer.
+    if (this.mode === 'hips' && !this.hipsState) {
+      const fig = this.visibleFigures()[0];
+      if (fig) this.selectFigure(fig);
+    }
     this.setVisibleFiguresRefresh?.();
   },
 
@@ -1284,8 +1360,10 @@ const app = {
     const def = JOINT_BY_NAME[jointName];
     if (def.endpoint) jointName = def.parent;
     this.selected = { figure, jointName };
-    // Chain mode is a legs-only choice; default it from whether the foot is planted.
-    this.chainMode = CHAIN_JOINTS.has(jointName) ? this.autoChain(figure, jointName) : 'open';
+    // Always start open chain (ordinary FK — rotate everything below the joint).
+    // Closed chain stays a deliberate opt-in on the legs/pelvis: it moves the
+    // BODY rather than the limb, which surprises you if you didn't ask for it.
+    this.chainMode = 'open';
     const sphere = figure.jointSphereByName[jointName];
     if (sphere) sphere.material.emissive.set(0x3b6ea5);
 
@@ -1431,6 +1509,8 @@ const app = {
     this.pushHistory();
     this.deselect();
     preset.apply(leader, follower);
+    // Move hips keeps offering its handle across pose changes.
+    if (this.mode === 'hips') this.setMode('hips');
     if (this.ui) this.ui.onPoseChanged();
   },
 
@@ -1472,8 +1552,7 @@ const app = {
   applyInterp(t) {
     if (!this.interpStates) return;
     if (this.selected || this.ikState) this.deselect();
-    const { A, B } = this.interpStates;
-    this.figures.forEach((f, i) => f.setPose(lerpPose(A.figures[i], B.figures[i], t)));
+    applyStatesT([this.interpStates.A, this.interpStates.B], t);
   },
 
   playInterp(onTick) {
@@ -1658,7 +1737,11 @@ tcontrols.addEventListener('dragging-changed', (e) => {
   }
 });
 
-tcontrols.addEventListener('objectChange', () => {
+// Re-solve whatever the active drag handle (IK target / swivel pole / caress
+// ring / hips handle) drives, from the handle's current position. Shared by
+// the gizmo's objectChange and the keyboard nudges; returns false when no
+// handle is active.
+function applyHandleChange() {
   if (app.ikState) {
     // Keep the IK target where the limb can reach without going underground.
     const H = app.ikState.figure.height;
@@ -1685,6 +1768,15 @@ tcontrols.addEventListener('objectChange', () => {
     last.y += dy - delta.y;
     hipsTarget.position.y = last.y;
     if (app.ui) app.ui.refreshJointValues();
+  } else {
+    return false;
+  }
+  return true;
+}
+
+tcontrols.addEventListener('objectChange', () => {
+  if (applyHandleChange()) {
+    // an active drag handle consumed the change
   } else if (app.selected) {
     app.selected.figure.clampJoint(app.selected.jointName);
     if (app.ckc) pinAnchor(app.ckc.figure, app.ckc.node, app.ckc.matrix);
@@ -1719,10 +1811,20 @@ renderer.domElement.addEventListener('pointerup', (e) => {
 });
 
 // Hover feedback: glow the joint under the cursor (rotate / drag modes) or show
-// a pointer over a draggable dancer (move / walk modes). The joint pick spheres
-// are invisible click targets in body view, so without this they're undiscoverable.
+// a pointer over a draggable dancer (move / walk modes).
+//
+// In body view the pick spheres are invisible AND buried inside the opaque
+// avatar, so a glow alone never reaches the screen — you can't pick what you
+// can't see. Hovering a dancer there ghosts that dancer's whole joint set
+// through the skin and lights the one under the cursor. `depthTest` off is what
+// draws them through the body; `renderOrder` keeps them above the skin they
+// punch through. Skeleton view already shows the spheres over visible bones, so
+// it keeps its flat 0.22 look and normal depth sorting.
 const HOVER_EMISSIVE = 0xf5b942;
+const SELECT_EMISSIVE = 0x3b6ea5;
+const GHOST_OPACITY = 0.3; // the hovered dancer's other joints
 let hoverSphere = null;
+let hoverFigure = null;
 
 // The pick sphere's opacity when not hovered: faintly shown in skeleton view,
 // invisible (but still clickable) otherwise — mirrors Figure.setLayers.
@@ -1730,24 +1832,41 @@ function restingOpacity(figure) {
   return figure.layers && figure.layers.skeleton ? 0.22 : 0;
 }
 
+function styleSphere(sphere, figure, { ghost = false, lit = false } = {}) {
+  const { jointName } = sphere.userData;
+  const isSel = app.selected && app.selected.figure === figure && app.selected.jointName === jointName;
+  // Only body view needs the see-through treatment; skeleton view would just
+  // make the spheres float over their own bones.
+  const showThrough = (ghost || lit) && !(figure.layers && figure.layers.skeleton);
+  sphere.material.emissive.set(lit ? HOVER_EMISSIVE : (isSel ? SELECT_EMISSIVE : 0x000000));
+  sphere.material.opacity = lit ? 0.85 : (ghost ? GHOST_OPACITY : restingOpacity(figure));
+  sphere.material.depthTest = !showThrough;
+  sphere.renderOrder = showThrough ? 3 : 0;
+}
+
 function clearHover() {
-  if (hoverSphere) {
-    const { figure, jointName } = hoverSphere.userData;
-    const isSel = app.selected && app.selected.figure === figure && app.selected.jointName === jointName;
-    hoverSphere.material.emissive.set(isSel ? 0x3b6ea5 : 0x000000);
-    hoverSphere.material.opacity = restingOpacity(figure);
-    hoverSphere = null;
+  if (hoverFigure) {
+    for (const s of hoverFigure.pickSpheres) styleSphere(s, hoverFigure);
+    hoverFigure = null;
   }
+  hoverSphere = null;
   renderer.domElement.style.cursor = '';
 }
 
-function setHoverSphere(sphere) {
-  if (sphere === hoverSphere) return;
-  clearHover();
-  hoverSphere = sphere;
-  sphere.material.emissive.set(HOVER_EMISSIVE);
-  sphere.material.opacity = Math.max(sphere.material.opacity, 0.6);
-  renderer.domElement.style.cursor = 'pointer';
+// `figure` is the dancer under the cursor, `sphere` the joint under it (may be
+// null — over the body but not over a joint).
+function setHover(figure, sphere) {
+  if (figure !== hoverFigure) {
+    clearHover();
+    hoverFigure = figure;
+    for (const s of figure.pickSpheres) styleSphere(s, figure, { ghost: true });
+  }
+  if (sphere !== hoverSphere) {
+    if (hoverSphere) styleSphere(hoverSphere, figure, { ghost: true });
+    if (sphere) styleSphere(sphere, figure, { ghost: true, lit: true });
+    hoverSphere = sphere;
+  }
+  renderer.domElement.style.cursor = sphere ? 'pointer' : '';
 }
 
 // A joint is actionable in drag mode only if it starts an IK chain (hand/foot)
@@ -1773,7 +1892,18 @@ renderer.domElement.addEventListener('pointermove', (e) => {
   const spheres = visible.flatMap((f) => f.pickSpheres);
   const hit = raycaster.intersectObjects(spheres, false)
     .find((h) => jointActionable(h.object.userData.jointName));
-  if (hit) setHoverSphere(hit.object);
+  // Ghost in the joints of whichever dancer the cursor is over, not just when
+  // it happens to land on a joint — the spheres are small and, in body view,
+  // invisible until then.
+  let figure = hit ? hit.object.userData.figure : null;
+  if (!figure) {
+    const bodyHit = raycaster.intersectObjects(visible.map((f) => f.group), true)
+      .find((h) => h.object.visible && !h.object.userData.isPick);
+    for (let n = bodyHit && bodyHit.object; n && !figure; n = n.parent) {
+      figure = visible.find((f) => f.group === n) || null;
+    }
+  }
+  if (figure) setHover(figure, hit ? hit.object : null);
   else clearHover();
 });
 
@@ -1809,7 +1939,7 @@ function handleClick(e) {
         // clicking to walk. The arrow keys step/turn the same dancer.
         if (app.mode === 'step') app.stepFigure(o.userData.figure, 1);
       }
-    } else app.deselect();
+    } else if (app.mode !== 'hips') app.deselect(); // hips keeps its auto handle
     return;
   }
 
@@ -2024,36 +2154,117 @@ window.addEventListener('keydown', (e) => {
   else app.undo();
 });
 
-// Keyboard nudges for the active figure (Move / Step modes). Move: arrows slide
-// forward/back and turn (pivoting on the support foot). Step: arrows step
-// forward/back and turn. Shift makes a Move nudge coarser. Hold "Move as couple"
-// to drive the pair together.
-const NUDGE_DIST = 0.03;                  // metres per press when sliding
+// Keyboard nudges — one small change per key event, so a tap nudges a little
+// and holding a key moves continuously (the OS key-repeat re-fires keydown);
+// Shift makes any nudge coarser. What the keys drive depends on what's active:
+//   Move / Step modes (the active figure): arrows slide/turn or step/turn,
+//     pivoting on the support foot. "Move as couple" drives the pair.
+//   A selected joint (Rotate joints): ↑/↓ drive its X axis (↑ = hip/shoulder
+//     forward, ankle toes-up, knee straighten), ←/→ its Z — the side-to-side
+//     axis (Y where there is no Z), PageUp/PageDown its Y twist.
+//   A drag handle (hand/foot IK target, elbow/knee swivel pole, toe-caress
+//     ring, hips handle): arrows move it across the floor relative to the
+//     camera (↑ = away from the camera), PageUp/PageDown raise/lower it.
+const NUDGE_DIST = 0.03;                  // metres per press when sliding a figure
 const NUDGE_TURN = 4 * Math.PI / 180;     // radians per press when turning
 const STEP_TURN = 8 * Math.PI / 180;      // radians per press when turning in Step mode
+const ROT_NUDGE = 2 * DEG;                // radians per press on a selected joint
+const HANDLE_NUDGE = 0.012;               // metres per press on a drag handle
+const NUDGE_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'PageUp', 'PageDown']);
+const _nudgeDir = new THREE.Vector3();
 let lastNudge = 0;
+
+// One undo entry per burst of nudges.
+function nudgeHistory() {
+  const now = performance.now();
+  if (now - lastNudge > 500) app.pushHistory();
+  lastNudge = now;
+}
+
+// Where a handle nudge moves in world space: arrows in the floor plane
+// relative to the camera (↑ away from it), PageUp/PageDown straight up/down.
+function nudgeDirection(key, out) {
+  if (key === 'PageUp') return out.set(0, 1, 0);
+  if (key === 'PageDown') return out.set(0, -1, 0);
+  camera.getWorldDirection(out);
+  out.y = 0;
+  if (out.lengthSq() < 1e-6) {
+    // Top view: the view direction has no floor component — pan along screen-up.
+    out.set(0, 1, 0).applyQuaternion(camera.quaternion);
+    out.y = 0;
+  }
+  if (out.lengthSq() < 1e-6) out.set(0, 0, -1);
+  out.normalize();
+  if (key === 'ArrowDown') return out.negate();
+  if (key === 'ArrowRight') return out.set(-out.z, 0, out.x);
+  if (key === 'ArrowLeft') return out.set(out.z, 0, -out.x);
+  return out; // ArrowUp
+}
+
 window.addEventListener('keydown', (e) => {
-  if (!e.key.startsWith('Arrow')) return;
+  if (!NUDGE_KEYS.has(e.key)) return;
   const t = e.target;
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA') && t.type !== 'range') return;
-  const fig = app.activeFigure;
-  if (!fig || !fig.group.visible || (app.mode !== 'move' && app.mode !== 'step')) return;
-  e.preventDefault();
-  const now = performance.now();
-  if (now - lastNudge > 500) app.pushHistory(); // one undo entry per burst of nudges
-  lastNudge = now;
+  if (tcontrols.dragging) return; // don't fight a live mouse drag
   const k = e.key;
-  if (app.mode === 'step') {
-    if (k === 'ArrowUp') app.stepFigure(fig, 1);
-    else if (k === 'ArrowDown') app.stepFigure(fig, -1);
-    else if (k === 'ArrowLeft') app.turnFigure(fig, STEP_TURN);
-    else if (k === 'ArrowRight') app.turnFigure(fig, -STEP_TURN);
-  } else {
-    const coarse = e.shiftKey ? 3 : 1;
-    if (k === 'ArrowUp') app.slideFigure(fig, NUDGE_DIST * coarse);
+  const coarse = e.shiftKey ? 3 : 1;
+
+  // Move / Step: drive the active figure (arrows only).
+  if (app.mode === 'move' || app.mode === 'step') {
+    const fig = app.activeFigure;
+    if (!fig || !fig.group.visible || !k.startsWith('Arrow')) return;
+    e.preventDefault();
+    nudgeHistory();
+    if (app.mode === 'step') {
+      if (k === 'ArrowUp') app.stepFigure(fig, 1);
+      else if (k === 'ArrowDown') app.stepFigure(fig, -1);
+      else if (k === 'ArrowLeft') app.turnFigure(fig, STEP_TURN);
+      else if (k === 'ArrowRight') app.turnFigure(fig, -STEP_TURN);
+    } else if (k === 'ArrowUp') app.slideFigure(fig, NUDGE_DIST * coarse);
     else if (k === 'ArrowDown') app.slideFigure(fig, -NUDGE_DIST * coarse);
     else if (k === 'ArrowLeft') app.turnFigure(fig, NUDGE_TURN * coarse);
     else if (k === 'ArrowRight') app.turnFigure(fig, -NUDGE_TURN * coarse);
+    return;
+  }
+
+  // A drag handle up (limb IK / swivel / toe caress / hips): nudge it and
+  // re-solve, exactly as if the gizmo had moved it.
+  const handle = app.ikState ? ikTarget
+    : app.swivelState ? swivelTarget
+      : app.caressState ? caressTarget
+        : app.hipsState ? hipsTarget : null;
+  if (handle) {
+    e.preventDefault();
+    nudgeHistory();
+    handle.position.addScaledVector(nudgeDirection(k, _nudgeDir), HANDLE_NUDGE * coarse);
+    applyHandleChange();
+    return;
+  }
+
+  // A selected joint (Rotate joints mode): drive its free axes.
+  if (app.selected) {
+    const { figure, jointName } = app.selected;
+    const limits = JOINT_BY_NAME[jointName].limits;
+    const free = (ax) => limits[ax][0] !== limits[ax][1];
+    let axis;
+    let sign;
+    if (k === 'ArrowUp' || k === 'ArrowDown') {
+      axis = 'x';
+      sign = k === 'ArrowUp' ? -1 : 1; // ↑ lifts: hip/shoulder forward, toes up, knee straight
+    } else if (k === 'ArrowLeft' || k === 'ArrowRight') {
+      axis = free('z') ? 'z' : 'y';
+      sign = k === 'ArrowRight' ? 1 : -1;
+    } else {
+      axis = 'y';
+      sign = k === 'PageUp' ? 1 : -1;
+    }
+    if (!free(axis)) return;
+    e.preventDefault();
+    nudgeHistory();
+    app.editJoint(figure, jointName, () => {
+      figure.nodes[jointName].rotation[axis] += sign * ROT_NUDGE * coarse;
+    });
+    if (app.ui) app.ui.refreshJointValues();
   }
 });
 

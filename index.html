@@ -14,9 +14,9 @@
     <header id="topbar">
       <h1>TAngle</h1>
       <div id="mode-buttons" class="btn-group">
-        <button data-mode="rotate" class="active" title="Click a joint, then drag the rings to rotate it (within anatomical limits)">Rotate joints</button>
-        <button data-mode="ik" title="Click a hand or foot to drag the whole limb; click the toes to caress the floor (the big toe stays down while the leg reaches); click an elbow or knee to swivel it while the hand/foot and shoulder/hip stay put">Drag limb</button>
-        <button data-mode="hips" title="Click a dancer, then drag the handle at the hips: the whole upper body moves with them (posture unchanged) while the planted feet keep their spot — those legs bend to accommodate. Pick which feet are planted with the toolbar checkboxes.">Move hips</button>
+        <button data-mode="rotate" class="active" title="Click a joint, then drag the rings to rotate it (within anatomical limits). Keys: ↑↓ flex/extend, ←→ side-to-side, PageUp/PageDown twist — tap to nudge, hold to move. Shift = coarser.">Rotate joints</button>
+        <button data-mode="ik" title="Click a hand or foot to drag the whole limb; click the toes to caress the floor (the big toe stays down while the leg reaches); click an elbow or knee to swivel it while the hand/foot and shoulder/hip stay put. Keys: arrows move the handle across the floor (↑ = away from the camera), PageUp/PageDown raise/lower it — tap to nudge, hold to move.">Drag limb</button>
+        <button data-mode="hips" title="Drag the handle at the hips (it appears on its own — click the other dancer to move it there): the whole upper body moves with them (posture unchanged) while the planted feet keep their spot — those legs bend to accommodate. Pick which feet are planted with the toolbar checkboxes. Keys: arrows slide the hips across the floor, PageUp/PageDown crouch/rise.">Move hips</button>
         <button data-mode="move" title="Click a figure, then drag to slide it on the floor. Arrow keys nudge: ↑↓ forward/back, ←→ turn (pivoting on the support foot). Shift = coarser.">Move figure</button>
         <button data-mode="step" title="Click a dancer to take a walking step forward — keep clicking to walk. Arrow keys: ↑↓ step forward/back, ←→ turn. Turn on 'Move as couple' to walk the pair together.">Walk / step</button>
         <button data-mode="pin" title="Pin a spot on one dancer to a spot on the other: click the first spot, then the matching spot on the partner. Pinned spots stay together through moves, steps and turns — author a custom hold, or a parada's foot contact. Manage pins in the sidebar.">Pin spots</button>
@@ -45,9 +45,12 @@
       <section>
         <h2>View</h2>
         <div class="check-row">
-          <label><input type="checkbox" id="layer-skeleton" /> Skeleton</label>
-          <label><input type="checkbox" id="layer-body" checked /> Body</label>
-          <label><input type="checkbox" id="layer-muscle" /> Muscles</label>
+          <label for="layer-mode">Layer</label>
+          <select id="layer-mode" title="Body: the clothed avatar. Skeleton: bones only. Muscles: the main movers over the skeleton.">
+            <option value="body" selected>Body</option>
+            <option value="skeleton">Skeleton</option>
+            <option value="muscle">Muscles</option>
+          </select>
         </div>
         <div class="check-row">
           <label><input type="checkbox" id="show-cog" checked /> Center of gravity</label>
@@ -241,7 +244,7 @@
       </section>
     </aside>
 
-    <div id="hint">Click a joint to pose · Drag limb: the toes caress the floor · Move hips slides the body over planted feet · Move/Walk: arrows (↑↓ move/step · ←→ turn) · right-drag to orbit · scroll to zoom</div>
+    <div id="hint">Click a joint to pose · Drag limb: the toes caress the floor · Move hips slides the body over planted feet · Arrow keys nudge whatever is selected (hold to move · PageUp/Down = twist or up/down) · right-drag to orbit · scroll to zoom</div>
   </div>
   <script type="module" src="/src/main.js"></script>
 </body>

@@ -120,15 +120,20 @@ export function initUI(app) {
   $('photo-btn').addEventListener('click', () => app.capturePhoto());
 
   // ---------------------------------------------------------------- layers
+  // One dropdown, three mutually exclusive views. Muscles ride the skeleton
+  // (they need the bones behind them to read as anatomy), so that mode shows
+  // both; the clothed body is opaque, so it never combines with either.
+  const LAYER_MODES = {
+    body: { skeleton: false, body: true, muscle: false },
+    skeleton: { skeleton: true, body: false, muscle: false },
+    muscle: { skeleton: true, body: false, muscle: true },
+  };
+  const layerMode = () => $('layer-mode').value;
   const syncLayers = () => {
-    const layers = {
-      skeleton: $('layer-skeleton').checked,
-      body: $('layer-body').checked,
-      muscle: $('layer-muscle').checked,
-    };
+    const layers = LAYER_MODES[layerMode()] ?? LAYER_MODES.body;
     app.figures.forEach((f) => f.setLayers(layers));
   };
-  ['layer-skeleton', 'layer-body', 'layer-muscle'].forEach((id) => $(id).addEventListener('change', syncLayers));
+  $('layer-mode').addEventListener('change', syncLayers);
 
   const syncViz = () => app.setViz({
     cog: $('show-cog').checked,
@@ -286,10 +291,10 @@ export function initUI(app) {
   });
 
   // The panel only shows through the Muscles layer — nudge the user to enable it.
-  const syncMuscleNote = () => { muscleLayerNote.hidden = $('layer-muscle').checked; };
-  $('layer-muscle').addEventListener('change', syncMuscleNote);
+  const syncMuscleNote = () => { muscleLayerNote.hidden = layerMode() === 'muscle'; };
+  $('layer-mode').addEventListener('change', syncMuscleNote);
   $('muscle-enable-layer').addEventListener('click', () => {
-    $('layer-muscle').checked = true;
+    $('layer-mode').value = 'muscle';
     syncLayers();
     syncMuscleNote();
   });
@@ -383,8 +388,8 @@ export function initUI(app) {
       <span class="fig-tag" style="background:${tagColor}">${figure.name}</span>`;
     jointPanel.appendChild(title);
 
-    // Legs/pelvis get the open/closed chain choice (defaulted by app.selectJoint
-    // from whether the foot is planted); everything else is always open chain.
+    // Legs/pelvis get the open/closed chain choice (selection always starts
+    // open — see app.selectJoint); everything else is always open chain.
     if (CHAIN_JOINTS.has(jointName)) {
       const caption = document.createElement('div');
       caption.className = 'chain-caption';
@@ -552,6 +557,11 @@ export function initUI(app) {
 
   const _fmV = new THREE.Vector3();
   const _fmW = new THREE.Vector3();
+  const _fmT = new THREE.Vector3();
+  // A sole corner counts as resting on the floor within this height — the same
+  // threshold footContactsBySide uses, so the print's contact patch and the 3D
+  // support outline agree.
+  const FLOOR_CONTACT = 0.035;
 
   function renderFootMap(reps) {
     const dpr = window.devicePixelRatio || 1;
@@ -587,38 +597,76 @@ export function initUI(app) {
     const tc = figure.toeCorners[`_${side}`];
     const ankleNode = figure.nodes[`ankle_${side}`];
     const toesNode = figure.nodes[`toes_${side}`];
-    const corner = (node, [x, y, z]) => {
-      const p = node.localToWorld(_fmV.set(x * H, y * H, z * H));
-      return { x: p.x, z: p.z };
-    };
-    const pts = [
+    const corner = (node, [x, y, z]) => node.localToWorld(new THREE.Vector3(x * H, y * H, z * H));
+    const pts3 = [
       corner(ankleNode, fc[0]), corner(ankleNode, fc[1]), corner(ankleNode, fc[2]),
       corner(toesNode, tc[0]), corner(toesNode, tc[1]), corner(ankleNode, fc[3]),
     ];
+    // The balance verdict stays a FLOOR question — hull and margin come from the
+    // corners' floor projection, the same base of support the 3D view outlines.
+    // Only the drawing below moves into the sole's plane.
+    const pts = pts3.map((p) => ({ x: p.x, z: p.z }));
     const cog = { x: rep.cog.x, z: rep.cog.z };
     const margin = stabilityMargin(cog, convexHull2D(pts));
+    // Which corners actually rest on the floor (same threshold as
+    // footContactsBySide) — a heel-up or pointed foot only touches on the ball
+    // and toes, and the print marks that region so it matches the 3D outline.
+    const contact = pts3.map((p) => p.y <= FLOOR_CONTACT);
+    const grounded = contact.filter(Boolean).length;
 
-    // 2D frame: v runs heel→toe (drawn upward), u lateral. Falls back to the
-    // figure's facing when the foot points straight down.
+    // 2D frame: the print is drawn in the SOLE'S OWN PLANE — the foot seen
+    // perpendicular to its sole — NOT projected flat onto the floor. Flattening
+    // foreshortens a pitched foot into a blob (a pointed foot's ~28 cm cage
+    // collapses to under 6 cm), which is what stopped the print resembling the
+    // foot on screen and threw off where the COG read against it. When the foot
+    // is flat the sole normal IS +Y, so this reduces exactly to the old floor
+    // projection and a standing figure draws unchanged.
     const A = figure.worldPos(`ankle_${side}`, _fmV.clone());
     const T = figure.worldPos(`toe_${side}`, _fmW.clone());
-    let fx = T.x - A.x;
-    let fz = T.z - A.z;
-    const fLen = Math.hypot(fx, fz);
-    if (fLen < 0.05 * H) {
-      const f = _fmW.set(0, 0, 1).applyQuaternion(figure.group.quaternion);
-      fx = f.x; fz = f.z;
+    const centre = new THREE.Vector3();
+    for (const p of pts3) centre.add(p);
+    centre.multiplyScalar(1 / pts3.length);
+    // Best-fit sole normal (Newell): the corners are only near-coplanar once the
+    // toes bend, so fit the plane rather than trusting any three of them.
+    const normal = new THREE.Vector3();
+    for (let i = 0; i < pts3.length; i++) {
+      const a = pts3[i];
+      const b = pts3[(i + 1) % pts3.length];
+      normal.x += (a.y - b.y) * (a.z + b.z);
+      normal.y += (a.z - b.z) * (a.x + b.x);
+      normal.z += (a.x - b.x) * (a.y + b.y);
     }
-    const fn = Math.hypot(fx, fz) || 1;
-    fx /= fn; fz /= fn;
-    const cx = pts.reduce((s, p) => s + p.x, 0) / pts.length;
-    const cz = pts.reduce((s, p) => s + p.z, 0) / pts.length;
-    const toUV = (p) => ({
-      u: (p.x - cx) * fz - (p.z - cz) * fx,
-      v: (p.x - cx) * fx + (p.z - cz) * fz,
-    });
-    const uvPts = pts.map(toUV);
-    const uvCog = toUV(cog);
+    if (normal.lengthSq() < 1e-12) normal.set(0, 1, 0);
+    normal.normalize();
+    if (normal.y < 0) normal.negate(); // out of the sole, not into it
+    // v runs heel→toe, flattened into the sole plane.
+    const fwd = new THREE.Vector3().addVectors(pts3[3], pts3[4]).multiplyScalar(0.5)
+      .sub(_fmT.addVectors(pts3[0], pts3[1]).multiplyScalar(0.5));
+    fwd.addScaledVector(normal, -fwd.dot(normal));
+    if (fwd.lengthSq() < 1e-10) { // degenerate — fall back to the figure's facing
+      fwd.set(0, 0, 1).applyQuaternion(figure.group.quaternion);
+      fwd.addScaledVector(normal, -fwd.dot(normal));
+    }
+    fwd.normalize();
+    // latAxis is the foot's own lateral axis. `fwd × normal` reproduces the previous
+    // (-fz, fx) floor axis exactly when the sole is flat, so the handedness — and
+    // with it every orientation guarantee below — is preserved.
+    const latAxis = new THREE.Vector3().crossVectors(fwd, normal).normalize();
+    // The print is a footprint seen from above with the foot pointing away
+    // (toes up), so it is ANATOMICALLY FIXED per foot: because the medial ("in")
+    // corners of the two feet lie on opposite sides of the foot axis, this one
+    // projection already draws a RIGHT foot with its big toe/arch on the canvas
+    // LEFT and a LEFT foot's on the right — each reading as the correct foot
+    // regardless of camera or which way the dancer faces.
+    // Do NOT tie u to the camera: mirroring to match the view turns a right
+    // foot's print into a left foot's. The COG dot shares this projection, so
+    // it always lands on that foot's true medial/lateral side.
+    const toUV = (p) => {
+      _fmT.set(p.x, p.y ?? 0, p.z).sub(centre);
+      return { u: _fmT.dot(latAxis), v: _fmT.dot(fwd) };
+    };
+    const uvPts = pts3.map(toUV);
+    const uvCog = toUV(rep.cog); // the 3D COG, dropped along the sole normal
 
     // Fit foot + COG in view; the foot never smaller than half the canvas.
     let minU = Infinity; let maxU = -Infinity; let minV = Infinity; let maxV = -Infinity;
@@ -626,7 +674,7 @@ export function initUI(app) {
       minU = Math.min(minU, p.u); maxU = Math.max(maxU, p.u);
       minV = Math.min(minV, p.v); maxV = Math.max(maxV, p.v);
     }
-    const pad = 22;
+    const pad = 30; // room for the print's heel bulge, toe pads and labels
     const scale = Math.min(
       (cssW - 2 * pad) / Math.max(maxU - minU, 1e-6),
       (cssH - 2 * pad) / Math.max(maxV - minV, 1e-6),
@@ -639,39 +687,197 @@ export function initUI(app) {
       y: cssH / 2 - (p.v - midV) * scale,
     });
 
-    // Foot outline: smooth closed curve through the corners (midpoint quads).
+    // Foot outline: a stylized sole print hung on the six projected corners
+    // (heel-in, heel-out, ball-out, toe-out, toe-in, ball-in), so it still
+    // stretches, turns and foreshortens with the real foot. The corners are a
+    // cage; the anchors derived from them add what makes a print read as a
+    // foot — a rounded heel, the arch dented into the medial ("in") side, a
+    // sole ending at the toe knuckles, and five separate toe pads.
     const col = fmFig === 'leader' ? '#7fb3e8' : '#e89ab8';
     const P = uvPts.map(px);
-    ctx.beginPath();
+    const [HI, HO, BO, TO, TI, BI] = P;
     const mid = (a2, b2) => ({ x: (a2.x + b2.x) / 2, y: (a2.y + b2.y) / 2 });
-    let m0 = mid(P[P.length - 1], P[0]);
-    ctx.moveTo(m0.x, m0.y);
-    for (let i = 0; i < P.length; i++) {
-      const m1 = mid(P[i], P[(i + 1) % P.length]);
-      ctx.quadraticCurveTo(P[i].x, P[i].y, m1.x, m1.y);
+    const lerp2 = (a2, b2, s) => ({ x: a2.x + (b2.x - a2.x) * s, y: a2.y + (b2.y - a2.y) * s });
+    const off = (p, d, s) => ({ x: p.x + d.x * s, y: p.y + d.y * s });
+    const dir = (a2, b2) => {
+      const dx = b2.x - a2.x;
+      const dy = b2.y - a2.y;
+      const l = Math.hypot(dx, dy);
+      return l > 1e-6 ? { x: dx / l, y: dy / l } : { x: 0, y: 0 };
+    };
+    const heelMid = mid(HI, HO);
+    const ballMid = mid(BO, BI);
+    const toeMid = mid(TO, TI);
+    const lat = dir(HI, HO);             // medial → lateral across the heel
+    const back = dir(ballMid, heelMid);  // out the rear of the foot
+    const toeFwd = dir(ballMid, toeMid); // past the ball (follows toe flexion)
+    const heelW = Math.hypot(HO.x - HI.x, HO.y - HI.y);
+    const ballW = Math.hypot(BO.x - BI.x, BO.y - BI.y);
+    // Front of the sole. The toe crease sits only just ahead of the
+    // metatarsal heads — the toes own nearly the whole toe region (a hallux
+    // is ~14% of foot length against a ~16% toe region), and the cage's toe
+    // region is barely half the ball width, so a crease pushed further
+    // forward eats the space the toe pads need and they collide with the
+    // sole. The metatarsal break is also OBLIQUE — the 1st MTP head sits
+    // forward of the 5th — and each ball corner bevels into the crease: the
+    // chamfer anchor rides the straight chord from the MTP head to the
+    // crease, which is what keeps the corner flat instead of rounding off
+    // under the Catmull-Rom smoothing.
+    const mtp1 = off(off(BI, lat, -0.04 * ballW), toeFwd, 0.04 * ballW);
+    const mtp5 = off(off(BO, lat, 0.04 * ballW), toeFwd, -0.06 * ballW);
+    const crease = off(lerp2(ballMid, toeMid, 0.10), toeFwd, 0.01 * ballW);
+    // Main sole: the classic ink-print hourglass — broad beveled forefoot,
+    // deep arch waist on the medial side, rounded slightly-narrower heel.
+    const anchors = [
+      mtp1,                                                    // 1st MTP head, forward
+      off(lerp2(BI, HI, 0.48), lat, 0.26 * ballW),             // arch — the deep waist
+      off(HI, lat, 0.10 * heelW),                              // medial heel, narrowed
+      off(heelMid, back, 0.45 * heelW),                        // rounded heel back
+      off(HO, lat, -0.10 * heelW),                             // lateral heel, narrowed
+      off(lerp2(HO, BO, 0.55), lat, 0.02 * ballW),             // lateral border, near straight
+      mtp5,                                                    // 5th MTP head, set back
+      lerp2(mtp5, crease, 0.50),                               // bevel, lateral
+      crease,                                                  // toe crease, mid
+      lerp2(mtp1, crease, 0.50),                               // bevel, medial
+    ];
+    // Smooth closed Catmull-Rom curve through the anchors, kept as a Path2D
+    // so the zone separator dashes below can clip to the print.
+    const n = anchors.length;
+    const sole = new Path2D();
+    sole.moveTo(anchors[0].x, anchors[0].y);
+    for (let i = 0; i < n; i++) {
+      const p0 = anchors[(i + n - 1) % n];
+      const p1 = anchors[i];
+      const p2 = anchors[(i + 1) % n];
+      const p3 = anchors[(i + 2) % n];
+      sole.bezierCurveTo(
+        p1.x + (p2.x - p0.x) / 6, p1.y + (p2.y - p0.y) / 6,
+        p2.x - (p3.x - p1.x) / 6, p2.y - (p3.y - p1.y) / 6,
+        p2.x, p2.y,
+      );
     }
-    ctx.closePath();
+    sole.closePath();
     ctx.fillStyle = `${col}2e`;
     ctx.strokeStyle = col;
     ctx.lineWidth = 1.5;
-    ctx.fill();
-    ctx.stroke();
+    ctx.fill(sole);
+    ctx.stroke(sole);
 
-    // Ball line (where the toes flex) and heel/toe labels.
-    ctx.strokeStyle = `${col}88`;
-    ctx.setLineDash([3, 3]);
-    ctx.beginPath();
-    ctx.moveTo(P[2].x, P[2].y);
-    ctx.lineTo(P[5].x, P[5].y);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.fillStyle = '#9aa3b2';
-    ctx.font = '9px "Segoe UI", system-ui, sans-serif';
-    ctx.textAlign = 'center';
-    const heelMid = mid(P[0], P[1]);
-    const toeMid = mid(P[3], P[4]);
-    ctx.fillText('heel', heelMid.x, Math.min(heelMid.y + 12, cssH - 4));
-    ctx.fillText('toe', toeMid.x, Math.max(toeMid.y - 6, 9));
+    // Toe pads: five tilted ovals ahead of the sole with the classic
+    // ink-print gap, spaced anatomically. A real toe row spans the FULL
+    // forefoot breadth (foot breadth is measured across the toes' own
+    // knuckles, MTP1→MTP5), so each toe sits at a fixed cross-station of the
+    // ball width (`c`, fraction medial→lateral: hallux centered ~17% in from
+    // the medial edge … little toe ~88%) — NOT packed along the corner
+    // cage's tapered shoe tip, which bunches them. Tips follow the toe arc
+    // (`tip`, toe-region units, 1 = the tip line): the big toe reaches the
+    // tip line and the others retreat laterally (from anthropometric toe
+    // lengths — hallux tip 100% of foot length down to ~82% for the little
+    // toe); the pad center hangs back from its tip by the pad's own length.
+    // Sizes are in ball-width units (no foreshortening when the foot points).
+    // Long axes radiate like real toes: the big toe lies near-parallel to
+    // the foot axis (aimed at the heel), lateral toes tilt increasingly
+    // toward the midline (`aimBack`, each toe's aim point on the ball→heel
+    // segment).
+    const ballAcross = dir(BI, BO); // medial → lateral along the ball line
+    const toeLen = Math.hypot(toeMid.x - ballMid.x, toeMid.y - ballMid.y);
+    const toePads = [
+      { c: 0.160, tip: 1.04, rl: 0.200, rs: 0.140, aimBack: 1.00 }, // big toe
+      { c: 0.405, tip: 0.96, rl: 0.128, rs: 0.090, aimBack: 0.70 },
+      { c: 0.595, tip: 0.85, rl: 0.116, rs: 0.082, aimBack: 0.50 },
+      { c: 0.765, tip: 0.71, rl: 0.103, rs: 0.075, aimBack: 0.35 },
+      { c: 0.920, tip: 0.56, rl: 0.088, rs: 0.068, aimBack: 0.25 }, // little toe
+    ];
+    // Keep the row clear of the sole's front edge by construction. The cage's
+    // toe region is barely half the ball width, and a stubbier shoe (the
+    // follower's) or a foreshortened pointed foot squeezes it further, so
+    // pads placed purely off their tips sink into the sole. The sole front is
+    // modelled across the foot by its three front anchors (1st MTP forward,
+    // crease mid, 5th MTP set back); the whole row then shifts forward by ONE
+    // shared amount, so the retreating arc keeps its shape instead of the
+    // crowded toes bunching up against the uncrowded ones.
+    const fwdOf = (p) => (p.x - ballMid.x) * toeFwd.x + (p.y - ballMid.y) * toeFwd.y;
+    const [front1, frontC, front5] = [mtp1, crease, mtp5].map(fwdOf);
+    const soleFrontAt = (c) => (c <= 0.5
+      ? front1 + (frontC - front1) * (c / 0.5)
+      : frontC + (front5 - frontC) * ((c - 0.5) / 0.5));
+    const baseFwd = (tp) => tp.tip * toeLen - 0.80 * tp.rl * ballW;
+    const rowShift = Math.max(0, ...toePads.map(
+      (tp) => soleFrontAt(tp.c) + (0.035 + tp.rl) * ballW - baseFwd(tp),
+    ));
+    ctx.lineWidth = 1.25;
+    for (const tp of toePads) {
+      const c = off(off(ballMid, ballAcross, (tp.c - 0.5) * 1.06 * ballW),
+        toeFwd, baseFwd(tp) + rowShift);
+      const aim = dir(c, lerp2(ballMid, heelMid, tp.aimBack));
+      ctx.beginPath();
+      ctx.ellipse(c.x, c.y, tp.rl * ballW, tp.rs * ballW,
+        Math.atan2(aim.y, aim.x), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+
+    // Zone separators (clipped to the print): heel|arch where the heel pad
+    // ends, arch|ball just behind the metatarsal heads. The sole ahead of
+    // that line IS the ball; the toes are their own pads past the print gap.
+    // Both they and the section labels fade out when the print is too small
+    // to hold them (a pointed foot foreshortens to a blob, or the COG sits
+    // far away and the fit zooms out).
+    const printLen = Math.hypot(toeMid.x - heelMid.x, toeMid.y - heelMid.y);
+    if (printLen > 45) {
+      ctx.save();
+      ctx.clip(sole);
+      ctx.strokeStyle = `${col}77`;
+      ctx.setLineDash([3, 3]);
+      ctx.lineWidth = 1;
+      for (const t of [0.34, 0.78]) {
+        const m = lerp2(HI, BI, t);
+        const l = lerp2(HO, BO, t);
+        ctx.beginPath();
+        ctx.moveTo(m.x - (l.x - m.x), m.y - (l.y - m.y));
+        ctx.lineTo(l.x + (l.x - m.x), l.y + (l.y - m.y));
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
+
+    // Section labels, each on its own zone along the print's axis (the
+    // print may be rotated on the canvas); "toes" past the tips, clamped to
+    // the canvas.
+    if (printLen > 70) {
+      ctx.fillStyle = '#9aa3b2';
+      ctx.font = '9px "Segoe UI", system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      const lab = (text, p) => ctx.fillText(text, p.x, Math.min(Math.max(p.y + 3, 9), cssH - 4));
+      lab('heel', off(heelMid, back, 0.10 * heelW));
+      // The arch waist is dented into the MEDIAL side, so the print's centre
+      // there sits lateral of the corner cage's centreline — offset the label
+      // by half the dent or it hangs out over the medial edge.
+      lab('arch', off(lerp2(heelMid, ballMid, 0.58), lat, 0.13 * ballW));
+      lab('ball', lerp2(heelMid, ballMid, 0.93));
+      lab('toes', off(toeMid, toeFwd, 0.10 * toeLen + 0.30 * ballW));
+    }
+
+    // Contact patch: the part of the sole actually on the floor. With the heel
+    // up (or on a pointed foot) only the ball and toes carry weight, and this is
+    // the same region the 3D view outlines as the base of support — drawing it
+    // here is what makes the two pictures agree. Corner order already traces the
+    // perimeter, so the grounded run closes into a polygon directly.
+    if (grounded >= 3 && grounded < pts3.length) {
+      const on = P.filter((_, i) => contact[i]);
+      ctx.save();
+      ctx.beginPath();
+      on.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+      ctx.closePath();
+      ctx.fillStyle = '#5fce7f26';
+      ctx.strokeStyle = '#5fce7f99';
+      ctx.lineWidth = 1.25;
+      ctx.setLineDash([4, 3]);
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+    }
 
     // COG drop point: ring + dot, green over the foot, red off it.
     const g = px(uvCog);
@@ -695,10 +901,14 @@ export function initUI(app) {
       const t = ((cog.x - A.x) * fAx + (cog.z - A.z) * fAz) / fSq;
       zone = t < 0.35 ? 'over the heel' : (t > 0.7 ? 'over the ball' : 'over the mid-foot');
     }
+    // Say so when only part of the sole is down: the dashed patch is then the
+    // real base of support, and the COG is judged against that, not the outline.
+    const lift = grounded === 0 ? ' · foot off the floor'
+      : (grounded < pts3.length ? ' · heel up, weight on the dashed patch' : '');
     const cm = margin === null ? null : Math.abs(margin * 100).toFixed(1);
     fmNote.textContent = margin === null
-      ? `${figure.name} · ${side === 'L' ? 'left' : 'right'} foot`
-      : `${figure.name} · ${side === 'L' ? 'left' : 'right'} foot — COG ${cm} cm ${ok ? `inside, ${zone}` : 'outside the foot'}`;
+      ? `${figure.name} · ${side === 'L' ? 'left' : 'right'} foot${lift}`
+      : `${figure.name} · ${side === 'L' ? 'left' : 'right'} foot — COG ${cm} cm ${ok ? `inside, ${zone}` : 'outside the foot'}${lift}`;
   }
 
   // ---------------------------------------------------------------- compare

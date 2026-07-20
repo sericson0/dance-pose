@@ -113,14 +113,29 @@ const MUSCLE_NODE = new Map(Object.entries({
     'Supraspinatus muscle.r', 'Infraspinatus muscle.r',
     'Teres major muscle.r', 'Teres minor muscle.r', 'Subscapularis muscle.r',
   ],
-  // Abdominal wall (from muscles-thorax-abdomen.glb, same atlas) → the lumbar
-  // spine node; they skin up to the chest so they flex with the trunk. Each
-  // ".r" belly is a right half (split at the linea alba) and mirrors to the left.
-  spine: [
+  // Abdominal wall (from muscles-thorax-abdomen.glb, same atlas) → the PELVIS
+  // node, their caudal attachment (iliac crest / pubis). They skin up to the
+  // chest (their rib attachment) and shear along the whole lumbar span, so a
+  // chest-vs-pelvis twist (tango dissociation) stretches them — see
+  // TRUNK_SHEETS + the `spread` skinning path in figure.js. Each ".r" belly is a
+  // right half (split at the linea alba) and mirrors to the left.
+  pelvis: [
     'Rectus abdominal muscle.r', 'External abdominal oblique muscle.r',
     'Internal abdominal oblique muscle.r',
   ],
 }).flatMap(([node, names]) => names.map((name) => [norm(name), node])));
+
+// Broad trunk sheets: the abdominal wall bellies span the whole lumbar region
+// (pelvis → chest) instead of lying on one bone and crossing at a tendon, so
+// they get the full-length `spread` skin in figure.js (progressive shear top to
+// bottom) rather than the limb muscles' single-joint split. Trunk axial rotation
+// happens almost entirely at the thoracic (chest) joint, so anchoring the caudal
+// end to the pelvis is what lets a dissociation twist actually stretch them.
+// They still highlight with the Torso part (`ride: 'spine'`), not the pelvis.
+const TRUNK_SHEETS = new Set([
+  'Rectus abdominal muscle.r', 'External abdominal oblique muscle.r',
+  'Internal abdominal oblique muscle.r',
+].map(norm));
 
 // A muscle crosses one (or two) joints, so it deforms as those joints move:
 // vertices near the primary (`node`) attachment follow that bone, vertices near
@@ -164,8 +179,9 @@ const MUSCLE_INSERT = new Map(Object.entries({
   ],
   // Girdle-anchored arm muscles that ride the shoulder (deltoid, coracobrachialis)
   // → their proximal end follows the chest/scapula. Plus the abdominal wall,
-  // whose upper (rib) end follows the chest so the belly stretches as the torso
-  // flexes over the pelvis (the lumbar spine node it rides is the near end).
+  // whose upper (rib) end follows the chest so the belly stretches/shears as the
+  // torso flexes or twists over the pelvis (the pelvis node it rides is the near
+  // end; the twist itself lives at the chest joint).
   chest: [
     'Deltoid muscle.r', 'Coracobrachialis muscle.r',
     'Rectus abdominal muscle.r', 'External abdominal oblique muscle.r',
@@ -193,6 +209,9 @@ export function classifyMuscle(rawName) {
   const node = MUSCLE_NODE.get(n);
   if (!node) return null;
   const insert = MUSCLE_INSERT.get(n);
+  // Trunk sheets get the full-length spread skin and highlight with the Torso
+  // part even though they ride the pelvis node.
+  if (TRUNK_SHEETS.has(n)) return { node, insert, spread: true, ride: 'spine' };
   return insert ? { node, insert } : { node };
 }
 
@@ -248,7 +267,8 @@ export async function loadMuscleMeshes(url) {
     const g = bakeToWorld(o);
     muscles.push({
       name: o.name, label: muscleLabel(o.name),
-      node: cls.node, insert: cls.insert, geometry: g,
+      node: cls.node, insert: cls.insert, spread: cls.spread, ride: cls.ride,
+      geometry: g,
     });
   });
   gltf.scene.traverse((o) => { if (o.isMesh) o.geometry.dispose(); });
