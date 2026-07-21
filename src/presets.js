@@ -81,6 +81,76 @@ function place(fig, x, z, facingDeg) {
   fig.group.rotation.y = (facingDeg * Math.PI) / 180;
 }
 
+// The default "Close embrace" pose, captured whole from the app. It was built
+// BY HAND with the constraints off (the Anchor / "place arms by hand" mode)
+// and exported, so it is a settled artistic pose rather than a solve output:
+// the follower is nestled into the leader's right side and turned ~31° in to
+// meet his chest (facing ≈149°, not a square 180°), cheek to cheek; his right
+// arm wraps her back and hers drapes over his right shoulder; the open-side
+// clasp is drawn in high and tucked between the bodies. Baked as raw joint
+// rotations (radians) + placement + hand curl and applied with setPose, so it
+// reproduces byte-for-byte what was authored — DO NOT hand-edit the numbers;
+// re-author in Anchor mode, export, and regenerate this block instead.
+//
+// NOTE this pose is authored for the constraints-OFF view (how the app opens).
+// Unlike the couple's canonical embrace frame (embraceArms), it is NOT the
+// embrace solver's fixed point: ticking "Hold embrace (arms)" will re-solve
+// all four arms toward the solver's targets and shift them from these exact
+// angles (the solver's clasp/back targets still assume the older square
+// geometry — see the embrace rework notes in CLAUDE.md). The default look is
+// faithful; the constrained look is the solver's, as before.
+const CLOSE_EMBRACE_LEADER = {
+  position: [0.16234, 0, -0.36315],
+  quaternion: [0, 0, 0, 1],
+  pelvisY: 0.53,
+  handCurl: { L: 0.77, R: 0.21 },
+  joints: {
+    pelvis: [0.05236, -0.17453, 0],
+    spine: [0.06981, 0, 0],
+    chest: [0.06981, 0.17453, 0],
+    neck: [-0.08727, 0.40143, 0],
+    head: [0.2618, 0, 0],
+    shoulder_L: [-0.33022, 0.25681, 0.19094],
+    elbow_L: [-2.09991, 0.13963, 0],
+    wrist_L: [-0.01745, 0, 0],
+    hip_L: [-0.01521, 0, 0],
+    knee_L: [0.03026, 0, 0],
+    ankle_L: [-0.0666, 0, 0],
+    shoulder_R: [0.68068, 1.23918, -1.52543],
+    elbow_R: [-1.39626, -0.94248, 0],
+    wrist_R: [0, 0, 0.27925],
+    hip_R: [-0.0154, 0, 0],
+    knee_R: [0.03026, 0, 0],
+    ankle_R: [-0.06641, 0, 0],
+  },
+};
+
+const CLOSE_EMBRACE_FOLLOWER = {
+  position: [0.13027, 0, -0.07856],
+  quaternion: [0, 0.963941, 0, 0.266116],
+  pelvisY: 0.52921,
+  handCurl: { L: 0.23, R: 0.34 },
+  joints: {
+    pelvis: [0.05236, 0, 0],
+    spine: [0.05236, 0, 0],
+    chest: [-0.10472, 0.1098, -0.01357],
+    neck: [-0.08727, 0.59341, 0],
+    head: [0.2618, 0.15708, 0],
+    scapula_L: [0, 0, 0.08727],
+    shoulder_L: [0.50867, -0.92453, 2.47551],
+    elbow_L: [-1.78024, 1.53589, 0],
+    wrist_L: [0.05236, 0, 0.10472],
+    hip_L: [0.033, -0.00244, -0.01044],
+    knee_L: [0.03182, 0, 0],
+    ankle_L: [-0.13342, 0, 0.01226],
+    shoulder_R: [-0.89813, -0.4999, -0.39344],
+    elbow_R: [-2.01065, 1.53589, 0],
+    hip_R: [0.033, -0.00244, -0.01044],
+    knee_R: [0.03182, 0, 0],
+    ankle_R: [-0.11861, 0, 0.01226],
+  },
+};
+
 export const PRESETS = [
   {
     name: 'Standing (reset)',
@@ -95,49 +165,15 @@ export const PRESETS = [
   },
   {
     name: 'Close embrace',
+    // The app's opening pose: a hand-authored close embrace captured whole
+    // (CLOSE_EMBRACE_LEADER / _FOLLOWER above). setPose replays the exact
+    // placement, joint angles and hand curls, so the default is byte-for-byte
+    // what was built in Anchor mode. See the constant's comment for why this
+    // is authored for the constraints-off view and shifts when the embrace
+    // constraints are engaged.
     apply(leader, follower) {
-      leader.resetPose();
-      follower.resetPose();
-      // Authored ALREADY AT the embrace's own contact distance (chest gap
-      // 21.3 cm) and with the real tango OFFSET: the follower stands ~14 cm
-      // to the leader's RIGHT, sternum against his right chest, so the two
-      // heads pass cheek to cheek instead of meeting nose to nose.
-      //
-      // Both numbers matter, and the old ones (z ±0.17, follower x -0.05)
-      // broke the preset. At a 5 cm offset the head capsules OVERLAP by 7.9 cm
-      // at contact distance, so torso contact is not merely unreached, it is
-      // geometrically impossible: the close-embrace pull hauls them together,
-      // collision refuses, and the leftover tangential push walks the follower
-      // around him a little each frame until the heads finally clear — which
-      // they only do once she has swung ~22 cm round to his LEFT, the wrong
-      // side of the embrace entirely (her face belongs by his RIGHT cheek —
-      // see the head comment above). That settled 4 cm short of contact and
-      // happened on every engage, not occasionally. Authored at the offset,
-      // the pose is already the solution: engaging the constraints now moves
-      // nobody (measured: gap and offset identical before and after).
-      place(leader, 0, -0.11, 0);
-      place(follower, -0.14, 0.11, 180);
-      embraceArms(leader, follower);
-      // Deepen the head yaw here only, not in embraceArms: at this offset it
-      // buys the last centimetre of head clearance (y12 leaves the capsules
-      // 0.9 cm overlapped and the couple still collapses to the walked-round
-      // state; y20 clears by 0.1 cm and it holds). It is deliberately NOT
-      // shared — the other presets place the couple squarer, and y20 measurably
-      // worsens two of them (Cruzada settling 30.9 → 41.2 cm, Dissociation
-      // 29.6 → 46.3), because the yaw swings where the 8° temple tilt points
-      // and those geometries need it pointing elsewhere. The yaw belongs with
-      // the offset that calls for it.
-      leader.setJointDegrees({ neck: { y: 20 } });
-      follower.setJointDegrees({ neck: { y: 20 } });
-      // Both incline gently into the shared frame (weight toward the balls
-      // of the feet, chests meeting a shade before the hips — the "slight
-      // pyramid" of the close embrace), then re-ground the soles.
-      leader.setJointDegrees({ pelvis: { x: 3 } });
-      follower.setJointDegrees({ pelvis: { x: 3 } });
-      leader.group.updateMatrixWorld(true);
-      follower.group.updateMatrixWorld(true);
-      feetToFloor(leader);
-      feetToFloor(follower);
+      leader.setPose(CLOSE_EMBRACE_LEADER);
+      follower.setPose(CLOSE_EMBRACE_FOLLOWER);
     },
   },
   {
