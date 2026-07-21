@@ -82,7 +82,6 @@ async function probe() {
     }
     out.cogLeader = v(app.cogViz.leader.cogBall.position);
     out.cogCouple = v(app.cogViz.couple.cogBall.position);
-    out.moveTool = app.moveTool;
     out.movePivot = app.movePivot;
     out.hipsTool = app.hipsTool;
     out.mode = app.mode;
@@ -225,33 +224,33 @@ check(Math.abs(report.hipsClamp.chestDrift) < 2.5,
   `hips twist clamp: the chest turned ${deg(report.hipsClamp.chestDrift)} once clamped — it should still hold`);
 
 // ---- 6. Topbar wiring: the sub-toolbars appear with their mode and drive app state.
+// Move mode no longer has a Slide/Turn toggle — the gizmo slides and turns in
+// one — so only the pivot picker shows there; the Move-hips Slide/Twist toggle
+// stays.
 const ui = await page.evaluate(() => {
   const app = window.__app;
   const vis = (id) => !document.getElementById(id).hidden;
   const click = (sel) => document.querySelector(sel).click();
   click('#mode-buttons button[data-mode="move"]');
-  const inMove = { moveTools: vis('move-tools'), pivotBox: vis('move-pivot-box'), hipsTools: vis('hips-tools') };
-  click('#move-tools button[data-move-tool="turn"]');
-  const moveTool = app.moveTool;
+  const inMove = { pivotBox: vis('move-pivot-box'), hipsTools: vis('hips-tools') };
   const sel = document.getElementById('move-pivot');
   sel.value = 'cog';
   sel.dispatchEvent(new Event('change'));
   const movePivot = app.movePivot;
   click('#mode-buttons button[data-mode="hips"]');
   click('#hips-tools button[data-hips-tool="slide"]');
-  const inHips = { moveTools: vis('move-tools'), hipsTools: vis('hips-tools'), plant: vis('hips-plant') };
+  const inHips = { hipsTools: vis('hips-tools'), plant: vis('hips-plant') };
   click('#hips-tools button[data-hips-tool="twist"]');
   return {
-    inMove, moveTool, movePivot, inHips,
+    inMove, movePivot, inHips,
     hipsTool: app.hipsTool, mode: app.mode, plantInTwist: vis('hips-plant'),
   };
 });
 report.ui = ui;
-check(ui.inMove.moveTools && ui.inMove.pivotBox && !ui.inMove.hipsTools,
-  `topbar: Move mode should show Slide/Turn + the pivot picker only (${JSON.stringify(ui.inMove)})`);
-check(ui.moveTool === 'turn', `topbar: the Turn button left moveTool = ${ui.moveTool}`);
+check(ui.inMove.pivotBox && !ui.inMove.hipsTools,
+  `topbar: Move mode should show the pivot picker only (${JSON.stringify(ui.inMove)})`);
 check(ui.movePivot === 'cog', `topbar: the pivot dropdown left movePivot = ${ui.movePivot}`);
-check(ui.inHips.hipsTools && ui.inHips.plant && !ui.inHips.moveTools,
+check(ui.inHips.hipsTools && ui.inHips.plant,
   `topbar: Move-hips should show Slide/Twist + Planted only (${JSON.stringify(ui.inHips)})`);
 check(ui.hipsTool === 'twist', `topbar: the Twist button left hipsTool = ${ui.hipsTool}`);
 // Planted feet are a Slide-only choice: the twist turns the legs on purpose.
@@ -315,8 +314,7 @@ const resetMove = () => page.evaluate(() => {
   app.linkCouple = false;
   app.setMovePivot('foot');
   app.setMode('move');
-  app.setMoveTool('turn');
-  app.selectFigure(app.leader);
+  app.selectFigure(app.leader); // attaches the slide arrows + the yaw ring
   window.__gizmoObject = app.leader.group;
 });
 const moveDrag = await dragRing(
@@ -407,7 +405,6 @@ await page.screenshot({ path: `${outDir}/turns-hips-twist-top.png` });
 
 await setLayer('body');
 await clickUI('#mode-buttons button[data-mode="move"]');
-await clickUI('#move-tools button[data-move-tool="turn"]');
 await page.evaluate(() => {
   const el = document.getElementById('move-pivot');
   el.value = 'cog';

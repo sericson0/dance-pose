@@ -180,6 +180,12 @@ export class Figure {
     this.muscleMesh = muscles; // parsed atlas muscles (needs skeleton), or null → procedural
     this.bodyMesh = body; // parsed clothed avatar (skinned), or null → procedural mannequin
 
+    // How closed each hand is held (0 = open bind pose, 1 = closed fist),
+    // a user-posable "joint" shaping the whole hand (see setHandCurl). Kept
+    // here — not just on the finger bones — so it survives pose save/load and
+    // is the stable baseline the embrace's transient clasp curl departs from.
+    this.handCurl = { L: 0, R: 0 };
+
     this.group = new THREE.Group(); // root: position (x,z) + facing (rotation.y)
     this.group.userData.figure = this;
     this.nodes = {};
@@ -1352,6 +1358,15 @@ export class Figure {
     }
   }
 
+  // User-facing open/close of one hand: like setFingerCurl, but REMEMBERS the
+  // amount (this.handCurl) so it persists through pose save/load and is
+  // re-applied by setPose. The embrace still drives the clasp hands directly
+  // through setFingerCurl (a transient hold), leaving this baseline untouched.
+  setHandCurl(side, curl) {
+    this.handCurl[side] = curl;
+    this.setFingerCurl(side, curl);
+  }
+
   // Measure each clothed hand's real orientation AND its palm center, from the
   // avatar's own finger bones at rest.
   //
@@ -1707,6 +1722,7 @@ export class Figure {
       facing: this.group.rotation.y,
       pelvisY: this.nodes.pelvis.position.y / this.height, // stored as fraction of height
       joints,
+      handCurl: { ...this.handCurl },
     };
   }
 
@@ -1720,6 +1736,13 @@ export class Figure {
       if (!node) continue;
       node.rotation.set(x, y, z);
       this.clampJoint(name);
+    }
+    // Restore hand shape if the pose carried one (older poses omit it — leave
+    // the hands as they are rather than forcing them open).
+    if (pose.handCurl) {
+      for (const side of ['L', 'R']) {
+        if (pose.handCurl[side] !== undefined) this.setHandCurl(side, pose.handCurl[side]);
+      }
     }
     this.syncAtlasNodes(); // pivot the skeletal limb bones about the anatomical joints
     this.group.updateMatrixWorld(true);

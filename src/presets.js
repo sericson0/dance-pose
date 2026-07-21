@@ -29,6 +29,14 @@ import { feetToFloor } from './ik.js';
 // combination that also keeps the turned/pivoted transients settling where
 // the closed-side palms still reach (a y18 yaw fixed the straight default
 // but deflected the follower's collide-and-slide in the turned states).
+// NOTE the yaw cannot rescue a square placement: what decides whether the
+// heads pass or meet head-on is the couple's lateral OFFSET, not the yaw (a
+// head capsule runs head→headTop, i.e. nearly along the yaw axis, so yawing
+// barely moves it — it only swings where the 8° temple tilt points). At
+// contact distance the capsules overlap 7.9 cm at a 5 cm offset and 3.1 cm
+// at 11 cm; only ~14 cm clears them. Close embrace is authored at that offset
+// and deepens the yaw to y20 locally — see its comment for why that override
+// is not shared.
 // Hips: the leader's pelvis turns 10° toward the couple's midline
 // (her offset side, his right) with the chest counter-twisted to stay square
 // to her — his hips angle in under an unmoved embrace frame, a small
@@ -39,21 +47,31 @@ import { feetToFloor } from './ik.js';
 // these angles are offset to compensate (elbow flexion +19.4°, abduction 9.1°
 // toward zero) and reproduce roughly the intended world pose.
 //
-// KNOWN: this does NOT fix the embrace, which regressed with the collapse and
-// is pending rework. Re-authoring here was measured to move the closed-side
-// palm error only 17.8 → 17.6 cm, because the closed-side arms are IK-SOLVED
-// and these angles merely seed the swivel — the real gap is #solveArm against
-// the shoulder's new position. Fix that, not these numbers.
+// The ARM angles are READ BACK OUT of the embrace solve, not hand-authored:
+// apply this preset, tick both embrace constraints, let it settle, and dump
+// the eight arm joints (scripts/dev-verify-embrace.mjs drives the same path).
+// That is the only way to keep them honest — hand-authored angles went stale
+// when the arm chain moved onto the anatomical joint centres and nobody could
+// see it, because the constraints overwrite the arms the moment they are
+// engaged. With them OFF, which is how the app STARTS, the stale angles were
+// what the user actually saw: both dancers with their arms flung out in the
+// air, the clasp hands 32 cm apart and the leader's right palm 48 cm in FRONT
+// of his own chest instead of around her back.
+//
+// So: after changing the embrace solve or a preset's placement, re-bake these
+// rather than nudging them by hand. They still only SEED the constrained
+// solve (which re-solves all four arms every frame), but they ARE the pose in
+// the unconstrained view, and that view is the app's front door.
 function embraceArms(leader, follower) {
   leader.setJointDegrees({
-    shoulder_L: { x: -30, y: 30, z: 6 }, elbow_L: { x: -101, y: -30 }, wrist_L: { x: -15 },
-    shoulder_R: { x: -55, z: -9, y: 20 }, elbow_R: { x: -51 },
+    shoulder_L: { x: -11, y: 37, z: -6 }, elbow_L: { x: -111, y: -23 }, wrist_L: { x: -65, z: 7 },
+    shoulder_R: { x: -8, y: 3, z: -8 }, elbow_R: { x: -92, y: 9 }, wrist_R: { x: 0, y: 0, z: 0 },
     spine: { x: 4 }, chest: { x: 4, y: 10 }, pelvis: { y: -10 },
     neck: { x: -5, y: 12, z: 8 }, head: { x: 15 },
   });
   follower.setJointDegrees({
-    shoulder_R: { x: -30, y: -30, z: -6 }, elbow_R: { x: -101, y: 30 }, wrist_R: { x: -15 },
-    shoulder_L: { x: -65, z: 13 }, elbow_L: { x: -31 },
+    shoulder_R: { x: -66, y: -47, z: -72 }, elbow_R: { x: -99, y: 51 }, wrist_R: { x: -17, z: -30 },
+    shoulder_L: { x: -79, y: -45, z: -27 }, elbow_L: { x: -84, y: -2 }, wrist_L: { x: 0, y: 0, z: 0 },
     spine: { x: 4 }, chest: { x: 4 }, neck: { x: -5, y: 12, z: 8 }, head: { x: 15 },
   });
 }
@@ -80,9 +98,37 @@ export const PRESETS = [
     apply(leader, follower) {
       leader.resetPose();
       follower.resetPose();
-      place(leader, 0, -0.17, 0);
-      place(follower, -0.05, 0.17, 180);
+      // Authored ALREADY AT the embrace's own contact distance (chest gap
+      // 21.3 cm) and with the real tango OFFSET: the follower stands ~14 cm
+      // to the leader's RIGHT, sternum against his right chest, so the two
+      // heads pass cheek to cheek instead of meeting nose to nose.
+      //
+      // Both numbers matter, and the old ones (z ±0.17, follower x -0.05)
+      // broke the preset. At a 5 cm offset the head capsules OVERLAP by 7.9 cm
+      // at contact distance, so torso contact is not merely unreached, it is
+      // geometrically impossible: the close-embrace pull hauls them together,
+      // collision refuses, and the leftover tangential push walks the follower
+      // around him a little each frame until the heads finally clear — which
+      // they only do once she has swung ~22 cm round to his LEFT, the wrong
+      // side of the embrace entirely (her face belongs by his RIGHT cheek —
+      // see the head comment above). That settled 4 cm short of contact and
+      // happened on every engage, not occasionally. Authored at the offset,
+      // the pose is already the solution: engaging the constraints now moves
+      // nobody (measured: gap and offset identical before and after).
+      place(leader, 0, -0.11, 0);
+      place(follower, -0.14, 0.11, 180);
       embraceArms(leader, follower);
+      // Deepen the head yaw here only, not in embraceArms: at this offset it
+      // buys the last centimetre of head clearance (y12 leaves the capsules
+      // 0.9 cm overlapped and the couple still collapses to the walked-round
+      // state; y20 clears by 0.1 cm and it holds). It is deliberately NOT
+      // shared — the other presets place the couple squarer, and y20 measurably
+      // worsens two of them (Cruzada settling 30.9 → 41.2 cm, Dissociation
+      // 29.6 → 46.3), because the yaw swings where the 8° temple tilt points
+      // and those geometries need it pointing elsewhere. The yaw belongs with
+      // the offset that calls for it.
+      leader.setJointDegrees({ neck: { y: 20 } });
+      follower.setJointDegrees({ neck: { y: 20 } });
       // Both incline gently into the shared frame (weight toward the balls
       // of the feet, chests meeting a shade before the hips — the "slight
       // pyramid" of the close embrace), then re-ground the soles.

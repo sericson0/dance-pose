@@ -35,9 +35,9 @@ export function initUI(app) {
   const selectMode = (mode) => {
     setActive(modeButtons, (b) => b.dataset.mode === mode);
     $('draw-tools').hidden = mode !== 'draw';
-    // Slide/Turn and the turn pivot only exist while moving a whole figure;
-    // Slide/Twist and the planted-feet choice only while moving the hips.
-    $('move-tools').hidden = mode !== 'move';
+    // The turn pivot only exists while moving a whole figure (the gizmo slides
+    // and turns in one, so there is no Slide/Turn toggle); Slide/Twist and the
+    // planted-feet choice only while moving the hips.
     $('move-pivot-box').hidden = mode !== 'move';
     $('hips-tools').hidden = mode !== 'hips';
     app.setMode(mode);
@@ -47,14 +47,6 @@ export function initUI(app) {
     btn.addEventListener('click', () => selectMode(btn.dataset.mode));
   }
 
-  // Move-figure sub-toolbar: slide across the floor vs. turn about a pivot.
-  const moveToolBtns = [...document.querySelectorAll('#move-tools button[data-move-tool]')];
-  for (const btn of moveToolBtns) {
-    btn.addEventListener('click', () => {
-      setActive(moveToolBtns, (b) => b === btn);
-      app.setMoveTool(btn.dataset.moveTool);
-    });
-  }
   const movePivot = $('move-pivot');
   movePivot.addEventListener('change', () => app.setMovePivot(movePivot.value));
 
@@ -137,6 +129,13 @@ export function initUI(app) {
   embraceHeight.addEventListener('input', () => {
     embraceHeightVal.textContent = embraceHeight.value;
     app.setClaspHeight(Number(embraceHeight.value) / 100);
+  });
+  // Anchor: freeze the couple for hands-on embrace placement (see app.setAnchor).
+  const embraceAnchor = $('embrace-anchor');
+  const embraceAnchorHint = $('embrace-anchor-hint');
+  embraceAnchor.addEventListener('change', () => {
+    app.setAnchor(embraceAnchor.checked);
+    embraceAnchorHint.hidden = !embraceAnchor.checked;
   });
   const showButtons = [...document.querySelectorAll('#show-buttons button')];
   for (const btn of showButtons) {
@@ -491,6 +490,28 @@ export function initUI(app) {
       jointPanel.appendChild(row);
     }
 
+    // Selecting a wrist also offers a whole-hand open/close (the fingers curl
+    // together — not individual joints, just a looser or tighter hand). Only
+    // the clothed avatar has finger bones to curl.
+    if ((jointName === 'wrist_L' || jointName === 'wrist_R') && figure.fingerBones) {
+      const side = jointName.slice(-1);
+      const row = document.createElement('div');
+      row.className = 'slider-row';
+      const pct = Math.round(figure.handCurl[side] * 100);
+      row.innerHTML = `
+        <div class="lbl"><span>Hand (open / closed)</span><span class="val">${pct}%</span></div>
+        <input type="range" min="0" max="100" step="1" value="${pct}" />
+        <div class="range-hint"><span>open</span><span>closed</span></div>`;
+      const input = row.querySelector('input');
+      const valEl = row.querySelector('.val');
+      pushHistoryOnEdit(input);
+      input.addEventListener('input', () => {
+        app.setHandCurl(figure, side, Number(input.value) / 100);
+        valEl.textContent = `${input.value}%`;
+      });
+      jointPanel.appendChild(row);
+    }
+
     const reset = document.createElement('button');
     reset.textContent = 'Reset this joint';
     reset.addEventListener('click', () => {
@@ -499,7 +520,11 @@ export function initUI(app) {
         node.rotation.set(0, 0, 0);
         if (jointName === 'pelvis') node.position.y = 0.53 * figure.height;
       });
+      if (jointName === 'wrist_L' || jointName === 'wrist_R') {
+        app.setHandCurl(figure, jointName.slice(-1), 0);
+      }
       refreshJointValues();
+      renderJointPanel(); // the hand slider's value needs redrawing after a reset
     });
     jointPanel.appendChild(reset);
   }
