@@ -499,9 +499,19 @@ export function measureAxes(figure) {
       // how far off-axis the skeletal foot sits, independent of length.
       const d = sf.centroid.clone().sub(bf.centroid);
       const perp = d.clone().sub(bf.axis.clone().multiplyScalar(d.dot(bf.axis)));
+      // The angle between the midlines, as an UNDIRECTED line (a principal axis
+      // has no inherent direction, so an ~11° tilt must not read as its ~169°
+      // supplement when the build-time forward-flip happens to resolve the other
+      // way). This is the whole relative orientation — pose-invariant, since the
+      // skeletal foot and the shoe rotate together when the ankle is posed. For a
+      // flat shoe it is ~0 after the fit; for a heeled figure it is the deliberate
+      // heel pitch, a pure SAGITTAL tilt (the foot stands up inside its raised
+      // heel; see Figure.#pitchHeeledFoot), which the gate allows for via
+      // Figure.heelPitchDeg.
+      const raw = THREE.MathUtils.radToDeg(sf.axis.angleTo(bf.axis));
       out.push({
         key: `${fit.pivot}${side}`,
-        deg: THREE.MathUtils.radToDeg(sf.axis.angleTo(bf.axis)),
+        deg: Math.min(raw, 180 - raw),
         offsetMm: perp.length() * 1000,
       });
     }

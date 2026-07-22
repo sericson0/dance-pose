@@ -134,6 +134,7 @@ const report = await page.evaluate(async (POSES) => {
         })),
         axes: measureAxes(fig),
         axisFitDeg: fig.calibration?.axisDeg || null,
+        heelPitchDeg: fig.heelPitchDeg || 0,
       });
     }
     out.poses.push({ name: pose.name, figures: figs });
@@ -174,12 +175,19 @@ if (axisRows.size) {
     const [figure, key] = k.split('|');
     const dMax = Math.max(...v.deg);
     const oMax = Math.max(...v.off);
-    const flagD = dMax > AXIS_DEG_TOL ? '!' : ' ';
+    // A heeled figure's skeletal foot is deliberately pitched up at the heel (a
+    // pure sagittal tilt; see Figure.#pitchHeeledFoot), so the midline sits that
+    // far off the shoe's flat sole BY DESIGN. Allow the design pitch on top of
+    // the ordinary aim tolerance; 0 for a flat foot leaves the check unchanged.
+    const heelPitch = report.poses[0].figures.find((f) => f.name === figure)?.heelPitchDeg || 0;
+    const tol = AXIS_DEG_TOL + heelPitch;
+    const flagD = dMax > tol ? '!' : ' ';
     const fitDeg = report.poses[0].figures.find((f) => f.name === figure)?.axisFitDeg?.[key];
     const was = fitDeg == null ? '' : `   was ${fitDeg.toFixed(1)}° off`;
-    console.log(`  ${(`${figure}/${key}`).padEnd(24)} ${dMax.toFixed(1).padStart(7)}°${flagD}  ${oMax.toFixed(1).padStart(9)} mm${was}`);
-    if (dMax > AXIS_DEG_TOL) {
-      problems.push(`${figure}/${key}: midlines ${dMax.toFixed(1)}° apart (tol ${AXIS_DEG_TOL}°) — the foot points a different way than the shoe`);
+    const heel = heelPitch ? `   (${heelPitch.toFixed(1)}° heel)` : '';
+    console.log(`  ${(`${figure}/${key}`).padEnd(24)} ${dMax.toFixed(1).padStart(7)}°${flagD}  ${oMax.toFixed(1).padStart(9)} mm${was}${heel}`);
+    if (dMax > tol) {
+      problems.push(`${figure}/${key}: midlines ${dMax.toFixed(1)}° apart (tol ${tol.toFixed(1)}°) — the foot points a different way than the shoe`);
     }
   }
 }

@@ -116,6 +116,15 @@ const FLOOR_CLEARANCE = {
   knee_L: 0.042, knee_R: 0.042,
 };
 
+// Translucent heel/shoe outline shown under a heeled figure's bare foot in
+// skeleton and muscle views (see Figure.#buildHeelOutline): a faint filled
+// shape with a brighter edge line, so the viewer can see the heel the follower
+// is standing in when the shoe itself (the body avatar) is hidden.
+const HEEL_OUTLINE_FILL = 0x3a3b47;
+const HEEL_OUTLINE_EDGE = 0xcdd3e0;
+const HEEL_OUTLINE_FILL_OPACITY = 0.22;
+const HEEL_OUTLINE_EDGE_OPACITY = 0.85;
+
 // Nodes whose floor contact the sole corner sets fully describe — skipped by
 // lowestPointY's joint-clearance sweep. The rig's toe segment overshoots the
 // rendered shoe (the toes joint sits near the shoe TIP), so clearing the
@@ -168,6 +177,10 @@ export class Figure {
     // heel lifts) so a heeled avatar's foot sits natively on the floor instead
     // of being squashed flat, and the skeletal foot pitches to match.
     this.heelRise = heelRise;
+    // The sagittal pitch (degrees) #pitchHeeledFoot tilts the skeletal foot up at
+    // the heel — 0 for a flat figure. The frame gate (dev-verify-frames) allows
+    // the foot midline to sit this far off the shoe's flat sole; see measureAxes.
+    this.heelPitchDeg = 0;
     // Per-figure sole footprint scale ({ front, width }, both default 1): the
     // shared FOOT_CORNERS/TOE_CORNERS tables are sized to the man's shoe, and
     // this stretches/shrinks them so the balance footprint hugs THIS avatar's
@@ -198,6 +211,9 @@ export class Figure {
     this.atlasNodes = {};
     this.pickSpheres = [];
     this.layerMeshes = { skeleton: [], body: [], muscle: [] };
+    // Translucent shoe/heel outline meshes, shown only when the body avatar is
+    // hidden (skeleton / muscle views). Empty for a flat-shoed figure.
+    this.heelOutline = [];
     this.jointSphereByName = {};
     // Bi-articular muscles that skin between two joints (see updateMuscleSkin).
     this._skinMuscles = [];
@@ -1318,22 +1334,11 @@ export class Figure {
     return { R, S, T };
   }
 
-  // Drop a heeled figure's balance corners back onto the shoe sole.
-  //
-  // This used also to PITCH the skeletal foot heel-up about the ball, bisecting
-  // for the angle that raised its ankle end to the ankle node. The foot's axis
-  // fit (ENDPOINT_FITS, mode 'axis') now does that as a side effect and better:
-  // a heeled shoe's midline is already pitched, so matching the skeletal foot's
-  // midline to it reproduces the pitch at any heel height, with no bisection
-  // and no special case. Keeping both would double-count the pitch — and worse,
-  // the old code assigned mesh.quaternion outright, so it would silently erase
-  // the fit on exactly the figure that needs it most.
-  //
-  // What remains is the corner half, which is about the balance tables rather
-  // than the mesh: the ankle raise floated the corners by heelLift and the shoe
-  // still contacts heel-block + ball flat on the floor, so they only need
-  // un-floating, no pitch. Stores this.footCorners / this.toeCorners, which
-  // lowestPointY and analysis.js prefer over the flat shared tables.
+  // Seat a heeled figure's foot inside its shoe: drop the balance corners onto
+  // the shoe sole, pitch the foot heel-up (both the bare skeleton AND the clothed
+  // body, so they agree) so it stands in the heel the way a real foot does, and
+  // draw a translucent outline of the shoe for the skeleton/muscle views (where
+  // the shoe itself is hidden).
   #applyHeel() {
     // Floor corners: drop back to the shoe sole. The ankle raise floated them by
     // heelLift; the shoe still contacts heel-block + ball flat on the floor, so
@@ -1343,6 +1348,165 @@ export class Figure {
     const drop = (corners) => corners.map(([x, y, z]) => [x, y - this.heelRise, z]);
     this.footCorners = { _L: drop(this.footCorners._L), _R: drop(this.footCorners._R) };
     this.toeCorners = { _L: drop(this.toeCorners._L), _R: drop(this.toeCorners._R) };
+    this.#pitchHeeledFoot();
+    for (const side of ['_L', '_R']) this.#buildHeelOutline(side);
+  }
+
+  // Pitch a heeled figure's foot heel-up — BOTH the bare skeleton and the
+  // clothed body — so it sits in the heeled shoe the way a real foot does:
+  // calcaneus lifted onto the heel, forefoot on the floor, breaking at the MTP,
+  // instead of lying flat with the heel on the ground.
+  //
+  // The heel is a FAKE: both avatars ship FLAT shoes, and a figure is "heeled"
+  // only by #build raising its ankle node by heelLift. Left alone, each layer
+  // fakes the heel differently and they disagree — the mannequin's heel reads
+  // higher than the skeleton's. The skeleton starts flat: its endpoint axis fit
+  // (ENDPOINT_FITS, mode 'axis') lands it on the shoe's OUTER sole (flat on the
+  // floor) while the ankle node rides heelLift up, so the leg meets the foot
+  // heelLift above the bones. The BODY doesn't fit — its foot bones just ride the
+  // raised ankle+toe nodes RIGIDLY (no ball-pitch), so the flat shoe stretches
+  // heel-up instead of tilting cleanly and the toe box deforms (pinched/drooped).
+  //
+  // Both are fixed by the SAME rotation about the ball (the MTP / toes joint) by
+  // atan2(heelLift, run): it rotates only the ankle-region mesh / the foot bone
+  // (bip01*foot) — lifting its ankle end up to the raised ankle node — while the
+  // phalanges (toes mesh) / toe bone (bip01*toe0), which ride the toes node, stay
+  // flat in the toe box, so the break falls at the MTP as in a real heeled shoe.
+  // The foot bone rides the same atlas ankle node as the skeleton mesh, so the
+  // identical transform lands both layers on one heel.
+  //
+  // Baked into each matrix ONCE (they ride their node rigidly, so the pitch holds
+  // through any pose) and COMPOSED with — never overwrites — the fit matrix
+  // #alignEndpointGeometry wrote / the body bone's retarget matrix: assigning the
+  // matrix outright would erase the fit/retarget on exactly the foot that needs
+  // it. Runs after the calibration is recorded, so the frozen snapshot (and
+  // dev-verify-calibration) is unaffected — no re-bake needed.
+  #pitchHeeledFoot() {
+    this.group.updateMatrixWorld(true);
+    const gInv = this.group.matrixWorld.clone().invert();
+    const local = (name) => this.#seatNode(name).getWorldPosition(new THREE.Vector3()).applyMatrix4(gInv);
+    const m = new THREE.Matrix4();
+    for (const side of ['_L', '_R']) {
+      const ball = local(`toes${side}`); // MTP joint = pivot
+      const ankle = local(`ankle${side}`);
+      const run = ball.z - ankle.z; // horizontal ball→ankle distance
+      if (run < 1e-4) continue;
+      // Heel-up rotation about the figure-local lateral (X) axis that lifts the
+      // foot's ankle end by heelLift over that run — back up to the raised node.
+      const theta = Math.atan2(this._heelLift, run);
+      this.heelPitchDeg = THREE.MathUtils.radToDeg(theta); // both sides equal
+
+      const pitch = new THREE.Matrix4()
+        .makeTranslation(ball.x, ball.y, ball.z)
+        .multiply(m.makeRotationX(theta))
+        .multiply(new THREE.Matrix4().makeTranslation(-ball.x, -ball.y, -ball.z));
+      for (const mesh of this.layerMeshes.skeleton) {
+        if (this.#nodeNameOf(mesh) !== `ankle${side}`) continue;
+        // Re-express the figure-local pitch in the mesh's parent (atlas ankle
+        // node) frame and pre-apply it to the baked fit matrix.
+        const pl = gInv.clone().multiply(mesh.parent.matrixWorld);
+        mesh.matrixAutoUpdate = false;
+        mesh.matrix.copy(pl.clone().invert().multiply(pitch).multiply(pl).multiply(mesh.matrix));
+      }
+      // Pitch the CLOTHED foot the same way. The body's flat shoe was faking its
+      // heel only by riding the raised ankle node rigidly (no ball-pitch), so it
+      // tilted more than the skeleton's block and deformed the toe box. The foot
+      // bone (bip01*foot) rides the same atlas ankle node as the skeleton mesh,
+      // so the identical about-the-ball pitch lands it on the same heel; the toe
+      // bone (bip01*toe0) rides the toes node and is left flat, so the shoe now
+      // breaks at the MTP like a real heeled shoe instead of stretching.
+      const footBone = this.jointBone && this.jointBone[`ankle${side}`];
+      if (footBone && footBone.parent) {
+        const pl = gInv.clone().multiply(footBone.parent.matrixWorld);
+        footBone.matrixAutoUpdate = false;
+        footBone.matrix.copy(pl.clone().invert().multiply(pitch).multiply(pl).multiply(footBone.matrix));
+      }
+    }
+  }
+
+  // A faint translucent outline of one shoe (flat sole footprint + the raised
+  // heel wedge at the back), parented to the rig ankle node so it sits on the
+  // floor at rest and rides the foot when it is posed. Shown only when the body
+  // avatar is hidden (skeleton / muscle views), where it stands in for the shoe
+  // the bones are wearing. Built from this figure's fitted sole corners, so it
+  // tracks the balance footprint and any soleScale change for free.
+  #buildHeelOutline(side) {
+    const H = this.height;
+    const hl = this._heelLift;
+    const ankleNode = this.nodes[`ankle${side}`];
+    const toesNode = this.nodes[`toes${side}`];
+    if (!ankleNode || !toesNode) return;
+    const foot = this.footCorners[side]; // ankle-frame, [heel-out, heel-in, ball-in, ball-out]
+    const toe = this.toeCorners[side]; // toes-frame, [toe-out, toe-in]
+    // Bring the toe-pad corners into the ankle node's frame (identity rest
+    // rotations, so a plain offset of the toes node from the ankle).
+    const toesOff = toesNode.position.clone().sub(ankleNode.position).multiplyScalar(1 / H);
+    const P = (x, y, z) => new THREE.Vector3(x * H, y * H, z * H);
+    const soleY = foot[0][1]; // dropped sole plane (fraction), on the floor at rest
+    const outline = [
+      P(...foot[0]), P(...foot[1]), P(...foot[2]),
+      P(toe[0][0] + toesOff.x, soleY, toe[0][2] + toesOff.z),
+      P(toe[1][0] + toesOff.x, soleY, toe[1][2] + toesOff.z),
+      P(...foot[3]),
+    ];
+
+    const fillMat = new THREE.MeshStandardMaterial({
+      color: HEEL_OUTLINE_FILL, roughness: 0.6, transparent: true,
+      opacity: HEEL_OUTLINE_FILL_OPACITY, depthWrite: false, side: THREE.DoubleSide,
+    });
+    const edgeMat = new THREE.LineBasicMaterial({
+      color: HEEL_OUTLINE_EDGE, transparent: true,
+      opacity: HEEL_OUTLINE_EDGE_OPACITY, depthWrite: false,
+    });
+
+    const group = new THREE.Group();
+    // --- Sole: a flat filled polygon (triangle fan from its centroid) + edge. ---
+    const c = new THREE.Vector3();
+    for (const p of outline) c.add(p);
+    c.multiplyScalar(1 / outline.length);
+    const solePos = [];
+    for (let i = 0; i < outline.length; i++) {
+      const a = outline[i]; const b = outline[(i + 1) % outline.length];
+      solePos.push(c.x, c.y, c.z, a.x, a.y, a.z, b.x, b.y, b.z);
+    }
+    const soleGeo = new THREE.BufferGeometry();
+    soleGeo.setAttribute('position', new THREE.Float32BufferAttribute(solePos, 3));
+    soleGeo.computeVertexNormals();
+    group.add(new THREE.Mesh(soleGeo, fillMat));
+    const edgePos = [];
+    for (let i = 0; i < outline.length; i++) {
+      const a = outline[i]; const b = outline[(i + 1) % outline.length];
+      edgePos.push(a.x, a.y, a.z, b.x, b.y, b.z);
+    }
+    const edgeGeo = new THREE.BufferGeometry();
+    edgeGeo.setAttribute('position', new THREE.Float32BufferAttribute(edgePos, 3));
+    group.add(new THREE.LineSegments(edgeGeo, edgeMat));
+
+    // --- Heel: a wedge from the heel corners (on the floor) up to heelLift,
+    // sloping down to the sole around the arch. Slightly inset from the sole. ---
+    const xOut = foot[0][0] * 0.92; const xIn = foot[1][0] * 0.92;
+    const zBack = foot[0][2]; const zArch = 0.006; // wedge front, ~1 cm ahead of the ankle
+    const A = P(xOut, soleY, zBack); const A2 = P(xIn, soleY, zBack);
+    const B = new THREE.Vector3(A.x, A.y + hl, A.z); const B2 = new THREE.Vector3(A2.x, A2.y + hl, A2.z);
+    const Cc = P(xOut, soleY, zArch); const Cc2 = P(xIn, soleY, zArch);
+    const tri = (p, q, r) => [p.x, p.y, p.z, q.x, q.y, q.z, r.x, r.y, r.z];
+    const wedgePos = [
+      ...tri(A, B, B2), ...tri(A, B2, A2), // vertical back face
+      ...tri(A, A2, Cc2), ...tri(A, Cc2, Cc), // bottom
+      ...tri(B, Cc, Cc2), ...tri(B, Cc2, B2), // sloped top
+      ...tri(A, Cc, B), ...tri(A2, B2, Cc2), // side triangles
+    ];
+    const wedgeGeo = new THREE.BufferGeometry();
+    wedgeGeo.setAttribute('position', new THREE.Float32BufferAttribute(wedgePos, 3));
+    wedgeGeo.computeVertexNormals();
+    group.add(new THREE.Mesh(wedgeGeo, fillMat));
+    const wedgeEdges = new THREE.LineSegments(new THREE.EdgesGeometry(wedgeGeo, 20), edgeMat);
+    group.add(wedgeEdges);
+
+    group.visible = false; // shown by setLayers when the body avatar is hidden
+    for (const o of group.children) { o.castShadow = false; o.raycast = () => {}; }
+    ankleNode.add(group);
+    this.heelOutline.push(group);
   }
 
   // Curl one hand's fingers (0 = bind pose, 1 = closed around the partner's
@@ -1687,6 +1851,9 @@ export class Figure {
     for (const m of this.layerMeshes.skeleton) m.visible = skeleton;
     for (const m of this.layerMeshes.body) m.visible = body;
     for (const m of this.layerMeshes.muscle) m.visible = muscle;
+    // The shoe/heel outline stands in for the (hidden) shoe: show it whenever
+    // the body avatar is off, i.e. in the skeleton and muscle views.
+    for (const g of this.heelOutline) g.visible = skeleton || muscle;
     // Joint spheres are click targets, not anatomy: keep them faint in skeleton
     // view (the bones already show the joints) and invisible-but-clickable
     // otherwise. Raycasting ignores opacity, so picking is unaffected.
@@ -1872,6 +2039,7 @@ export class Figure {
     this.dispose();
     this.pickSpheres = [];
     this.layerMeshes = { skeleton: [], body: [], muscle: [] };
+    this.heelOutline = [];
     this.jointSphereByName = {};
     this._skinMuscles = [];
     this.nodes = {};
