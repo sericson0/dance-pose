@@ -16,8 +16,8 @@
       <div id="mode-buttons" class="btn-group">
         <button data-mode="rotate" class="active" title="Click a joint, then drag the rings to rotate it (within anatomical limits). Keys: ↑↓ flex/extend, ←→ side-to-side, PageUp/PageDown twist — tap to nudge, hold to move. Shift = coarser.">Rotate joints</button>
         <button data-mode="ik" title="Click a hand or foot to drag the whole limb; click the toes to caress the floor (the big toe stays down while the leg reaches); click an elbow or knee to swivel it while the hand/foot and shoulder/hip stay put. Keys: arrows move the handle across the floor (↑ = away from the camera), PageUp/PageDown raise/lower it — tap to nudge, hold to move.">Drag limb</button>
-        <button data-mode="hips" title="Drag the handle at the hips (it appears on its own — click the other dancer to move it there): the whole upper body moves with them (posture unchanged) while the planted feet keep their spot — those legs bend to accommodate. Pick which feet are planted with the toolbar checkboxes. Keys: arrows slide the hips across the floor, PageUp/PageDown crouch/rise.">Move hips</button>
-        <button data-mode="move" title="Click a figure, then drag to slide it on the floor. Arrow keys nudge: ↑↓ forward/back, ←→ turn (pivoting on the support foot). Shift = coarser.">Move figure</button>
+        <button data-mode="hips" title="Drag the handle at the hips (it appears on its own — click the other dancer to move it there): the whole upper body moves with them (posture unchanged) while the planted feet keep their spot — those legs bend to accommodate. Switch to Twist to turn the hips under a still chest (the dissociation of an ocho pivot). Pick which feet are planted with the toolbar checkboxes. Keys: arrows slide the hips across the floor (←→ twist them in Twist), PageUp/PageDown crouch/rise.">Move hips</button>
+        <button data-mode="move" title="Click a figure, then drag the arrows to slide it on the floor or the ring around them to spin it about the support foot, the centre of gravity, or its own centre. Arrow keys nudge: ↑↓ forward/back, ←→ turn. Shift = coarser.">Move figure</button>
         <button data-mode="step" title="Click a dancer to take a walking step forward — keep clicking to walk. Arrow keys: ↑↓ step forward/back, ←→ turn. Turn on 'Move as couple' to walk the pair together.">Walk / step</button>
         <button data-mode="pin" title="Pin a spot on one dancer to a spot on the other: click the first spot, then the matching spot on the partner. Pinned spots stay together through moves, steps and turns — author a custom hold, or a parada's foot contact. Manage pins in the sidebar.">Pin spots</button>
         <button data-mode="draw" title="Draw teaching diagrams on the floor: pick Line / Arrow / Circle / Text, then click two points on the floor (Text: one click, then type the label). Esc cancels a half-drawn shape.">Draw</button>
@@ -29,6 +29,10 @@
         <button data-tool="text" title="One click on the floor, then type the label">Text</button>
         <button id="draw-undo" title="Remove the most recent drawing">⌫ Last</button>
         <button id="draw-clear" title="Remove all drawings">Clear</button>
+      </div>
+      <div id="hips-tools" class="btn-group" hidden>
+        <button data-hips-tool="slide" class="active" title="Drag the handle to move the hips; the posture rides along unchanged">Slide</button>
+        <button data-hips-tool="twist" title="Drag the ring to turn the hips while the chest and shoulders stay facing where they are — tango dissociation, the pivot of an ocho">Twist</button>
       </div>
       <div id="show-buttons" class="btn-group" title="Show one dancer or both">
         <button data-show="both" class="active">Both</button>
@@ -43,6 +47,14 @@
       <label class="topbar-check" title="Move, turn, or walk one dancer and the partner comes along — the embrace travels as one unit">
         <input type="checkbox" id="link-couple" /> Move as couple
       </label>
+      <span class="topbar-check" id="move-pivot-box" hidden title="The vertical axis a turn spins about. Support foot: the tango pivot, ground-referenced (ocho, giro). Centre of gravity: the balance axis — with 'Move as couple' it is the pair's shared COG, the axis a giro really orbits. Body centre: the figure's own origin.">
+        <span>Turn about:</span>
+        <select id="move-pivot">
+          <option value="foot" selected>Support foot</option>
+          <option value="cog">Centre of gravity</option>
+          <option value="root">Body centre</option>
+        </select>
+      </span>
       <span class="topbar-check" id="hips-plant" hidden title="Feet that stay planted while the hips move — a planted leg's joints re-solve to keep the foot in place; an unplanted foot rides along with the body">
         <span>Planted:</span>
         <label><input type="checkbox" id="plant-L" checked /> left</label>
@@ -103,17 +115,13 @@
             <input type="range" id="embrace-height" min="-6" max="8" step="1" value="0" />
             <div class="range-hint"><span>low</span><span>high</span></div>
           </div>
-          <div class="slider-row">
-            <div class="lbl"><span title="Swing the leader's open-side (left) elbow around the shoulder→wrist line without moving the joined hands (0 = elbow hanging down).">Leader elbow</span><span class="val" id="embrace-elbow-leader-val">0°</span></div>
-            <input type="range" id="embrace-elbow-leader" min="-60" max="60" step="1" value="0" />
-            <div class="range-hint"><span>down</span><span>up</span></div>
-          </div>
-          <div class="slider-row">
-            <div class="lbl"><span title="Swing the follower's open-side (right) elbow around the shoulder→wrist line without moving the joined hands (0 = elbow hanging down).">Follower elbow</span><span class="val" id="embrace-elbow-follower-val">0°</span></div>
-            <input type="range" id="embrace-elbow-follower" min="-60" max="60" step="1" value="0" />
-            <div class="range-hint"><span>down</span><span>up</span></div>
-          </div>
         </div>
+        <div class="check-row">
+          <label title="Freeze both dancers where they stand so you can build the embrace by hand. The automatic torso pull, body collision and hand-join stop moving anyone — so posing one dancer's arm no longer pushes the partner away. Joint limits still keep every arm reachable. Uncheck to let the embrace settle again.">
+            <input type="checkbox" id="embrace-anchor" /> Anchor figures (place arms by hand)
+          </label>
+        </div>
+        <div class="muted" id="embrace-anchor-hint" hidden>Both dancers are held in place — pose the arm or shoulder you want (try <b>Drag limb</b> to pull a hand into position) and the partner stays put. Joint limits stop an arm short of an impossible reach. Uncheck to let the embrace re-settle.</div>
       </section>
 
       <section class="collapsed" id="pins-section">

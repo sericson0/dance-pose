@@ -1,4 +1,34 @@
 import * as THREE from 'three';
+import { JOINTS } from './skeletonDef.js';
+
+// How far a limb is ALREADY bent at its hinge in the rest pose, per mid joint
+// (radians). solveTwoBone drives the hinge as `rotation.x = ±(π − interior)`,
+// which silently assumes rotation.x = 0 is full extension. That held while a
+// limb's two segments were collinear — the legs still are — but the ARM chain
+// now sits on the imported skeleton's own joint centres, and its anatomical
+// rest pose carries a 19.4° elbow bend. Without this correction every arm
+// solve lands 19° short (measured: an arm contact pin resting 6.6 cm open).
+const REST_BEND = (() => {
+  const byName = Object.fromEntries(JOINTS.map((j) => [j.name, j]));
+  const rest = {};
+  const at = (n) => {
+    if (rest[n]) return rest[n];
+    const j = byName[n];
+    const p = j.parent ? at(j.parent).clone() : new THREE.Vector3();
+    rest[n] = p.add(new THREE.Vector3(...j.offset));
+    return rest[n];
+  };
+  JOINTS.forEach((j) => at(j.name));
+  const out = {};
+  for (const [root, mid, eff] of [['shoulder', 'elbow', 'wrist'], ['hip', 'knee', 'ankle']]) {
+    for (const side of ['_L', '_R']) {
+      const a = at(`${mid}${side}`).clone().sub(at(`${root}${side}`));
+      const b = at(`${eff}${side}`).clone().sub(at(`${mid}${side}`));
+      out[`${mid}${side}`] = a.angleTo(b); // 0 when the segments are collinear
+    }
+  }
+  return out;
+})();
 
 const _R = new THREE.Vector3();
 const _M = new THREE.Vector3();
@@ -32,9 +62,14 @@ export function solveTwoBone(figure, chain, targetWorld) {
     _R.distanceTo(targetWorld), Math.abs(a - b) + 1e-4, a + b - 1e-4,
   );
 
-  // Hinge angle at the mid joint (local X).
+  // Hinge angle at the mid joint (local X). The law of cosines gives the
+  // INTERIOR angle we want between the two segments; rotation.x is measured
+  // from the rest pose, which is only full extension when the rest segments are
+  // collinear — so subtract whatever bend the rest already carries (0 for the
+  // legs, 19.4° for the anatomically-seated arm). See REST_BEND.
   const cosMid = THREE.MathUtils.clamp((a * a + b * b - d * d) / (2 * a * b), -1, 1);
-  mid.rotation.x = chain.hingeSign * (Math.PI - Math.acos(cosMid));
+  const bend0 = REST_BEND[chain.mid] || 0;
+  mid.rotation.x = chain.hingeSign * (Math.PI - Math.acos(cosMid) - bend0);
   figure.clampJoint(chain.mid);
 
   // Swing the root so the effector points at the target.

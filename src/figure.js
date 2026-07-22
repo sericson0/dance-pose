@@ -6,6 +6,7 @@ import {
 import { buildSkeleton, buildMuscles } from './anatomy.js';
 import { LIMB_BASES, reverseWinding, BODY_RETARGET, normBoneName } from './skeletonMesh.js';
 import { RIG_CALIBRATION } from './rigCalibration.js';
+import { ENDPOINT_FITS, regionCentroid, axisFrame } from './landmarks.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 
@@ -115,6 +116,15 @@ const FLOOR_CLEARANCE = {
   knee_L: 0.042, knee_R: 0.042,
 };
 
+// Translucent heel/shoe outline shown under a heeled figure's bare foot in
+// skeleton and muscle views (see Figure.#buildHeelOutline): a faint filled
+// shape with a brighter edge line, so the viewer can see the heel the follower
+// is standing in when the shoe itself (the body avatar) is hidden.
+const HEEL_OUTLINE_FILL = 0x3a3b47;
+const HEEL_OUTLINE_EDGE = 0xcdd3e0;
+const HEEL_OUTLINE_FILL_OPACITY = 0.22;
+const HEEL_OUTLINE_EDGE_OPACITY = 0.85;
+
 // Nodes whose floor contact the sole corner sets fully describe — skipped by
 // lowestPointY's joint-clearance sweep. The rig's toe segment overshoots the
 // rendered shoe (the toes joint sits near the shoe TIP), so clearing the
@@ -152,6 +162,7 @@ const FINGER_CURL = [0.75, 0.9, 0.6];
 const THUMB_CURL = [0.15, 0.45, 0.35];
 const FINGER_AXIS = new THREE.Vector3(0, 0, 1);
 const _fingerQ = new THREE.Quaternion();
+const _handV = new THREE.Vector3(); // scratch for the hand-mesh measurements
 
 export class Figure {
   constructor({ name, height = 1.72, mass = 70, color = 0x4d8fd1, skin = 0xd9a68a, skeleton = null, muscles = null, body = null, bodyKey = null, heelRise = 0, soleScale = null }) {
@@ -166,6 +177,10 @@ export class Figure {
     // heel lifts) so a heeled avatar's foot sits natively on the floor instead
     // of being squashed flat, and the skeletal foot pitches to match.
     this.heelRise = heelRise;
+    // The sagittal pitch (degrees) #pitchHeeledFoot tilts the skeletal foot up at
+    // the heel — 0 for a flat figure. The frame gate (dev-verify-frames) allows
+    // the foot midline to sit this far off the shoe's flat sole; see measureAxes.
+    this.heelPitchDeg = 0;
     // Per-figure sole footprint scale ({ front, width }, both default 1): the
     // shared FOOT_CORNERS/TOE_CORNERS tables are sized to the man's shoe, and
     // this stretches/shrinks them so the balance footprint hugs THIS avatar's
@@ -177,6 +192,12 @@ export class Figure {
     this.skeletonMesh = skeleton; // parsed atlas bones, or null → procedural bones
     this.muscleMesh = muscles; // parsed atlas muscles (needs skeleton), or null → procedural
     this.bodyMesh = body; // parsed clothed avatar (skinned), or null → procedural mannequin
+
+    // How closed each hand is held (0 = open bind pose, 1 = closed fist),
+    // a user-posable "joint" shaping the whole hand (see setHandCurl). Kept
+    // here — not just on the finger bones — so it survives pose save/load and
+    // is the stable baseline the embrace's transient clasp curl departs from.
+    this.handCurl = { L: 0, R: 0 };
 
     this.group = new THREE.Group(); // root: position (x,z) + facing (rotation.y)
     this.group.userData.figure = this;
@@ -190,6 +211,9 @@ export class Figure {
     this.atlasNodes = {};
     this.pickSpheres = [];
     this.layerMeshes = { skeleton: [], body: [], muscle: [] };
+    // Translucent shoe/heel outline meshes, shown only when the body avatar is
+    // hidden (skeleton / muscle views). Empty for a flat-shoed figure.
+    this.heelOutline = [];
     this.jointSphereByName = {};
     // Bi-articular muscles that skin between two joints (see updateMuscleSkin).
     this._skinMuscles = [];
@@ -291,6 +315,10 @@ export class Figure {
     // frozen snapshot is the drift tripwire (see #assertCalibration).
     this.calibration = { rest: atlasRest, endpointR: {}, endpointS: {}, endpointT: {} };
 
+    // Mesh-truth hand frames, filled by #buildMeshBody (null = rig-canonical:
+    // palm along wrist-local +Z, fingers along -Y). See #measureHandMesh.
+    this.handMesh = { L: null, R: null };
+
     // --- Body layer: imported clothed avatar if available, else the
     // procedural mannequin volumes ---
     if (this.bodyMesh) this.#buildMeshBody();
@@ -389,11 +417,15 @@ export class Figure {
     // before T, so the mirror handles the left hand). Keyed by finger ray 1–5.
     const desplay = this.#handDesplayRotations(bones, HAND_DESPLAY);
 
-    const groups = new Map(); // `${node}|${material}` → [geometry, …]
-    const stash = (nodeName, material, geom) => {
+    // `${node}|${material}` → [{ geom, name }, …]. The bone NAME is carried
+    // through the merge so the rendered geometry stays addressable per bone
+    // (see userData.boneRanges below) — landmarks.js selects verts by bone, and
+    // a merged mesh with no name map would only be addressable per node.
+    const groups = new Map();
+    const stash = (nodeName, material, geom, name) => {
       const key = `${nodeName}|${material}`;
       if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(geom);
+      groups.get(key).push({ geom, name });
     };
 
     for (const b of bones) {
@@ -419,17 +451,29 @@ export class Figure {
         const X = node.matrixWorld.clone().invert().multiply(this.group.matrixWorld).multiply(T);
         g.applyMatrix4(X);
         if (mirror) reverseWinding(g);
-        stash(nodeName, b.material, g);
+        stash(nodeName, b.material, g, b.name);
       }
     }
 
-    for (const [key, geoms] of groups) {
+    for (const [key, parts] of groups) {
       const [nodeName, material] = key.split('|');
-      const merged = mergeGeometries(geoms, false);
-      geoms.forEach((g) => g.dispose());
+      const merged = mergeGeometries(parts.map((p) => p.geom), false);
+      // Vertex ranges per source bone, in merge order — mergeGeometries
+      // concatenates, so a running offset is exact. This is what lets a
+      // landmark recipe say "the 3rd metacarpal" against a mesh that merged
+      // ~40 bones for the draw-call budget.
+      const boneRanges = [];
+      let start = 0;
+      for (const p of parts) {
+        const count = p.geom.attributes.position.count;
+        boneRanges.push({ name: p.name, start, count });
+        start += count;
+      }
+      parts.forEach((p) => p.geom.dispose());
       if (!merged) continue;
-      this.addMesh(nodeName, new THREE.Mesh(merged, this.materials[material]), 'skeleton', true,
-        this.atlasNodes[nodeName] || null);
+      const mesh = new THREE.Mesh(merged, this.materials[material]);
+      mesh.userData.boneRanges = boneRanges;
+      this.addMesh(nodeName, mesh, 'skeleton', true, this.atlasNodes[nodeName] || null);
     }
   }
 
@@ -457,10 +501,15 @@ export class Figure {
     // [seated base, parent base, parent is a rig node?]. Rest rotations are all
     // identity, so a parent's local axes equal the figure axes and the child's
     // local offset is a plain figure-local subtraction.
+    // LEGS ONLY. The arm chain used to be seated here too, but its rig joints
+    // now sit ON the anatomical centres (skeletonDef.js), so an arm atlas node
+    // would be a zero-offset duplicate of its rig node — #seatNode falls
+    // through to the rig node and the arm has ONE frame. That also collapses
+    // handMesh's old split, where the palm's ORIENTATION was measured in the
+    // rig wrist and its POSITION stored in the atlas wrist. The legs keep their
+    // atlas sub-tree because their rig joints are still Drillis–Contini, which
+    // the COG, the sole corners and the floor clamp all depend on.
     const chain = [
-      ['shoulder', 'scapula', true],
-      ['elbow', 'shoulder', false],
-      ['wrist', 'elbow', false],
       ['hip', 'pelvis', true],
       ['knee', 'hip', false],
       ['ankle', 'knee', false],
@@ -808,10 +857,33 @@ export class Figure {
       return c.multiplyScalar(1 / k);
     };
     const PARENT = { shoulder: 'chest', elbow: 'shoulder', wrist: 'elbow', hip: 'pelvis', knee: 'hip', ankle: 'knee', toes: 'ankle' };
+    // The two joints whose PARENT is a torso cluster, located from the child
+    // side instead. "Verts of this bone nearest the parent cluster's centroid"
+    // is a good rule while the parent is a limb bone — the humerus's centroid
+    // sits up the arm, so the nearest radius/ulna verts really are the elbow.
+    // It fails badly for the shoulder and the hip, whose parents are the whole
+    // chest and the whole pelvis: those centroids lie far away and medial, and
+    // they drag the estimate down and inward. Measured against the atlas's own
+    // bones, the error was 74 mm at the shoulder (estimated upper arm 259 mm
+    // against a real humerus of 333 mm) and 56 mm at the hip (thigh 418 mm
+    // against a femur of 474 mm) — and since this rest positions the atlas
+    // display tree AND drives the body retarget, every layer was pivoting the
+    // limb about a joint centre that far from the real head of the bone.
+    // Both are instead the far end of their OWN bone, away from the next joint
+    // down the chain: the head of the humerus, the head of the femur.
+    const FROM_CHILD = { shoulder: 'elbow', hip: 'knee' };
     for (const side of ['_L', '_R']) {
       for (const [base, parBase] of Object.entries(PARENT)) {
         const a = verts.get(`${base}${side}`);
         if (!a || !a.length) continue;
+        const childBase = FROM_CHILD[base];
+        if (childBase) {
+          const ch = verts.get(`${childBase}${side}`);
+          if (ch && ch.length) {
+            out.set(`${base}${side}`, extremeMean(a, centroid(ch), 0.10, true));
+            continue;
+          }
+        }
         const par = verts.get(LIMB_BASES.has(parBase) ? `${parBase}${side}` : parBase);
         out.set(`${base}${side}`, par && par.length ? extremeMean(a, centroid(par), 0.05, false) : centroid(a));
       }
@@ -1032,6 +1104,18 @@ export class Figure {
       });
     }
 
+    // Where the avatar's palms REALLY face: the rig's canonical hand frame
+    // (palm = wrist-local +Z, fingers = -Y; anatomical position, palms
+    // forward) is NOT what the retargeted skin shows. The Biped bind carries
+    // each hand rolled about the forearm — palms toward the thighs — and the
+    // retarget only aligns the hand bone's direction along the wrist segment,
+    // keeping that roll. Anything that aims the node's +Z at a target (the
+    // embrace clasp) therefore turns the VISIBLE hand ~110° away from it —
+    // the back of the leader's hand faced his partner. Measure the mesh-truth
+    // frame from the finger bones instead (see #measureHandMesh); embrace.js
+    // conjugates its hand-orientation targets by this offset.
+    this.#measureHandMesh();
+
     // The skinned meshes themselves: identity bind under `group` ('attached'
     // mode divides the mesh's own world transform back out, so parenting is
     // only for visibility/layer bookkeeping).
@@ -1072,36 +1156,39 @@ export class Figure {
     // match: the foot rests on the floor and its flat-bone-vs-heeled-shoe shape
     // mismatch makes a centroid match over-pitch it through the floor, so the
     // foot is handled separately (#applyHeel pitches a heeled foot about the ball).
-    const specs = [
-      { rotNodes: ['wrist'], pivot: 'wrist' },
-    ];
+    const specs = ENDPOINT_FITS;
     const A = new THREE.Vector3(); const P = new THREE.Vector3(); const off = new THREE.Vector3();
     for (const side of ['_L', '_R']) {
       for (const spec of specs) {
         const fit = this.#endpointAlignR(side, spec, gInv);
         if (!fit) continue;
-        const { R, S, T } = fit;
+        const { R, S, T, X } = fit;
         this.calibration.endpointR[`${spec.pivot}${side}`] = R.clone(); // record for the tripwire
         this.calibration.endpointS[`${spec.pivot}${side}`] = S;
         this.calibration.endpointT[`${spec.pivot}${side}`] = T.clone();
         this.#seatNode(`${spec.pivot}${side}`).getWorldPosition(A).applyMatrix4(gInv);
+        // The endpoint's linear map about the pivot. A similarity fit is just
+        // S·R; the foot's axis fit also stretches along its own midline, which
+        // is NOT expressible as mesh.scale (that is per-local-axis, and the
+        // midline is an arbitrary direction), so both modes go through one
+        // general 3×3 and the mesh matrix is written directly.
+        const L = X ? X.clone() : new THREE.Matrix4().makeRotationFromQuaternion(R)
+          .premultiply(new THREE.Matrix4().makeScale(S, S, S));
         for (const base of spec.rotNodes) {
           const nodeName = `${base}${side}`;
-          // Scale+rotate this node's geometry about the pivot A, then seat it with
-          // T so the whole hand lands on the glove (roll alone leaves the atlas
-          // hand — longer from the wrist and shaped differently — poking past the
-          // skin). A mesh parented at a node with origin P and identity rest
-          // rotation needs a local offset A + S·R·(P − A) − P so the transform
-          // pivots about A, not P (zero when the node *is* the pivot, e.g. the
-          // wrist's own mesh — the hand rides the atlas wrist node, whose origin
-          // is that pivot); T is a figure-local displacement = node-local at rest.
+          // Transform geometry about the pivot A, then seat it with T. A mesh
+          // parented at a node with origin P and identity rest rotation needs a
+          // local offset A + L·(P − A) − P + T so the transform pivots about A,
+          // not P (zero when the node *is* the pivot, e.g. the wrist's own mesh
+          // — the hand rides the atlas wrist node, whose origin is that pivot);
+          // T is a figure-local displacement = node-local at rest.
           this.#seatNode(nodeName).getWorldPosition(P).applyMatrix4(gInv);
-          off.copy(P).sub(A).applyQuaternion(R).multiplyScalar(S).add(A).sub(P).add(T);
+          off.copy(P).sub(A).applyMatrix4(L).add(A).sub(P)
+            .add(T);
           for (const mesh of this.layerMeshes.skeleton) {
             if (this.#nodeNameOf(mesh) !== nodeName) continue;
-            mesh.scale.setScalar(S);
-            mesh.quaternion.copy(R);
-            mesh.position.copy(off);
+            mesh.matrixAutoUpdate = false;
+            mesh.matrix.copy(L).setPosition(off);
           }
         }
       }
@@ -1128,102 +1215,109 @@ export class Figure {
     return obj.userData.skinNode !== undefined ? obj.userData.skinNode : this.#nodeNameOf(obj);
   }
 
-  // Similarity fit ({ R, S, T }) that lays the atlas hand onto the clothed hand:
-  // R rolls it to the glove's orientation, S scales it to the glove's size about
-  // the wrist, and T seats the whole hand on the glove. Rather than build a palm
-  // frame from a few axes — fragile,
-  // because the two hands are shaped differently and the opposable thumb sits
-  // off the palm plane, so any single normal is tilted differently in each layer
-  // — this fits the *optimal* rotation (hornRotation) that overlays six
-  // corresponding regions at once: the five finger clusters and the palm block.
-  // The skeleton regions are atlas-bone centroids (baked to figure-local with
-  // the same scale/settle/mirror as the mesh); the body regions are centroids of
-  // the retargeted skin grouped by dominant Biped bone (Finger0..4 → thumb..
-  // pinky, Hand → palm). No rigid rotation can make two differently-shaped hands
-  // coincide, so the palm block — the rigid part that must truly match — is
-  // weighted up, and the fingers merely steer the roll. Returns null if the
-  // regions can't be gathered (body fell back to the mannequin, or the atlas
-  // isn't the named anatomy skeleton) — the caller then leaves the hand as-is.
+  // Similarity fit ({ R, S, T }) laying the atlas geometry of an endpoint onto
+  // the clothed avatar's: R rolls it to the avatar's orientation, S scales it to
+  // the avatar's size about the pivot joint, and T seats the whole thing. Rather
+  // than build a frame from a few axes — fragile, because the two models are
+  // shaped differently and a landmark off the main plane (the opposable thumb)
+  // tilts any single normal differently in each layer — this fits the *optimal*
+  // rotation (hornRotation) that overlays every corresponding region at once.
+  //
+  // The regions come from ENDPOINT_FITS in landmarks.js, so the correspondences
+  // are data rather than code and the same {bones, pick} recipe language serves
+  // both this fit and the verification gate. Both layers are read from the
+  // RENDERED meshes through landmarks.js's resolver — valid because this runs
+  // during build, before any endpoint correction has been applied, so the
+  // meshes still carry identity local transforms. Returns null if fewer than
+  // three regions resolve (body fell back to the mannequin, or the atlas isn't
+  // the named anatomy skeleton) — the caller then leaves the endpoint as-is.
   #endpointAlignR(side, spec, gInv) {
     const jointName = `${spec.pivot}${side}`;
     const jointPos = this.#seatNode(jointName).getWorldPosition(new THREE.Vector3()).applyMatrix4(gInv);
+    const nodes = spec.rotNodes.map((b) => `${b}${side}`);
 
-    // Skeleton region centroids from the atlas bones (figure-local, same bake).
-    // Fingers are the phalanges of each ray; the palm is the metacarpal + carpal
-    // block (which is where the body's Hand bone owns the skin, so they match).
-    const { atlasMinY, atlasHeight } = this.skeletonMesh;
-    const s = this.height / atlasHeight;
-    const settleY = -atlasMinY * s;
-    const mir = side === '_L' ? -1 : 1;
-    const skelCentroid = (re) => {
-      const c = new THREE.Vector3();
-      let n = 0;
-      for (const b of this.skeletonMesh.bones) {
-        if (b.node !== spec.pivot || !re.test(b.name)) continue;
-        const p = b.geometry.attributes.position;
-        const step = Math.max(1, Math.floor(p.count / 120));
-        for (let i = 0; i < p.count; i += step) {
-          c.add(new THREE.Vector3(p.getX(i) * s * mir, p.getY(i) * s + settleY, p.getZ(i) * s));
-          n++;
-        }
-      }
-      return n ? c.multiplyScalar(1 / n) : null;
-    };
-    const skelGroups = {
-      thumb: /of_1st_finger/i, index: /of_2(?:nd|d)_finger/i, middle: /of_3(?:rd|d)_finger/i,
-      ring: /of_4th_finger/i, pinky: /of_5th_finger/i,
-      palm: /metacarpal|capitat|hamat|lunat|scaphoid|pisiform|trapez|triquetr|sesamoid/i,
-    };
-    const skelC = {};
-    for (const [k, re] of Object.entries(skelGroups)) skelC[k] = skelCentroid(re);
+    // Axis mode: match the MIDLINE through the two layers' geometry and change
+    // nothing else — the rotation that makes the skeletal foot point the way
+    // the shoe points, plus the translation that puts the two midlines on top
+    // of each other. No scale: the bare foot and the shoe are genuinely
+    // different sizes, and a scale term here is what slid the follower's heel
+    // 55 mm forward when this was a similarity fit (see ENDPOINT_FITS).
+    if (spec.mode === 'axis') {
+      const sf = axisFrame(this, 'skeleton', spec.axis.skeleton, nodes, side, spec.axis.forward);
+      const bf = axisFrame(this, 'body', spec.axis.body, nodes, side, spec.axis.forward);
+      if (!sf || !bf) return null;
+      const R = new THREE.Quaternion().setFromUnitVectors(sf.axis, bf.axis);
+      // Record how far off the two midlines were BEFORE this correction — the
+      // fit's own rotation angle is exactly that. Worth keeping: it is the only
+      // record of how misaligned the raw geometry is, which the post-fit
+      // measurement can no longer see.
+      this.calibration.axisDeg = this.calibration.axisDeg || {};
+      this.calibration.axisDeg[jointName] = THREE.MathUtils.radToDeg(2 * Math.acos(Math.min(1, Math.abs(R.w))));
+      const Cs = sf.center.applyMatrix4(gInv);
+      const Cb = bf.center.applyMatrix4(gInv);
 
-    // Body region centroids from the retargeted skin, grouped by each vertex's
-    // dominant Biped bone (figure-local).
-    const fingerName = ['thumb', 'index', 'middle', 'ring', 'pinky'];
-    const bodyAcc = {};
-    const v = new THREE.Vector3();
-    for (const mesh of this.layerMeshes.body) {
-      if (!mesh.isSkinnedMesh) continue;
-      mesh.updateMatrixWorld(true);
-      const si = mesh.geometry.attributes.skinIndex;
-      const sw = mesh.geometry.attributes.skinWeight;
-      const p = mesh.geometry.attributes.position;
-      const step = Math.max(1, Math.floor(p.count / 4000));
-      for (let i = 0; i < p.count; i += step) {
-        let bi = si.getX(i), bw = sw.getX(i);
-        if (sw.getY(i) > bw) { bw = sw.getY(i); bi = si.getY(i); }
-        if (sw.getZ(i) > bw) { bw = sw.getZ(i); bi = si.getZ(i); }
-        if (sw.getW(i) > bw) { bw = sw.getW(i); bi = si.getW(i); }
-        const bone = mesh.skeleton.bones[bi];
-        if (!bone || !bone.name.startsWith(`Bip01${side}_`)) continue;
-        let key = null;
-        const fm = /Finger(\d)/.exec(bone.name);
-        if (fm) key = fingerName[+fm[1]]; else if (/_Hand$/.test(bone.name)) key = 'palm';
-        if (!key) continue;
-        let a = bodyAcc[key]; if (!a) { a = bodyAcc[key] = { c: new THREE.Vector3(), n: 0 }; }
-        a.c.add(mesh.getVertexPosition(i, v)); a.n++;
-      }
+      // Stretch along the midline ONLY, to the length of the part we are laying
+      // this one inside. The two feet are genuinely different lengths — the
+      // leader's skeletal foot is shorter than his shoe, the follower's longer
+      // than her heeled one — and that surplus has to go somewhere. A UNIFORM
+      // scale is the wrong way to absorb it (it was what slid the follower's
+      // heel 55 mm forward when this was a similarity fit): the feet differ in
+      // length far more than in width, so scaling all three axes to fix the
+      // length distorts the other two. One axis, so width and height are
+      // untouched. Clamped, so a degenerate cloud cannot collapse the foot.
+      const k = THREE.MathUtils.clamp(
+        sf.extent > 1e-6 ? bf.extent / sf.extent : 1, 0.75, 1.25,
+      );
+      // X = R · (I + (k−1)·â⊗â): stretch along the skeleton's own midline, then
+      // rotate that midline onto the body's.
+      const a = sf.axis;
+      const kk = k - 1;
+      const stretch = new THREE.Matrix4().set(
+        1 + kk * a.x * a.x, kk * a.x * a.y, kk * a.x * a.z, 0,
+        kk * a.y * a.x, 1 + kk * a.y * a.y, kk * a.y * a.z, 0,
+        kk * a.z * a.x, kk * a.z * a.y, 1 + kk * a.z * a.z, 0,
+        0, 0, 0, 1,
+      );
+      const X = new THREE.Matrix4().makeRotationFromQuaternion(R).multiply(stretch);
+
+      // With the lengths now MATCHED, aligning the two centroids is no longer
+      // arbitrary — equal-length segments sharing a centre also share their
+      // ends, so this lands the heel and the toe together. (Before the stretch
+      // it was actively wrong: the centroids of two different-length feet do
+      // not correspond, and matching them slid the skeletal foot so far down
+      // its own length that its farthest point from the ankle flipped from toe
+      // to heel — 290 mm of error, which `measureAxes` could not see because a
+      // metric that measures what the fit forces will always agree with it.)
+      const T = Cb.clone().sub(jointPos)
+        .sub(Cs.clone().sub(jointPos).applyMatrix4(X));
+      // S is recorded (not used for the transform — X carries it) so the frozen
+      // calibration tripwires the along-axis stretch too.
+      return { R, S: k, T, X };
     }
 
-    // Corresponding wrist-relative point pairs, palm weighted up.
-    const P = [], Q = [], W = [];
-    for (const k of ['thumb', 'index', 'middle', 'ring', 'pinky', 'palm']) {
-      const bc = bodyAcc[k];
-      if (!skelC[k] || !bc) continue;
-      P.push(skelC[k].clone().sub(jointPos));
-      Q.push(bc.c.multiplyScalar(1 / bc.n).sub(jointPos));
-      W.push(k === 'palm' ? 2 : 1);
+    // Corresponding pivot-relative point pairs, in figure-local space.
+    const P = []; const Q = []; const W = [];
+    for (const region of spec.regions) {
+      const sc = regionCentroid(this, 'skeleton', region.skeleton, nodes, side);
+      const bc = regionCentroid(this, 'body', region.body, nodes, side);
+      if (!sc || !bc) continue;
+      P.push(sc.applyMatrix4(gInv).sub(jointPos));
+      Q.push(bc.applyMatrix4(gInv).sub(jointPos));
+      W.push(region.weight ?? 1);
     }
     if (P.length < 3) return null;
 
     // Weighted similarity fit (Umeyama): a roll R, a uniform scale S about the
-    // wrist, and a seat translation T that together overlay the atlas hand onto
-    // the glove. Scale earns its keep because the atlas hand is a bit longer from
-    // the wrist than the glove — a rotation alone leaves the fingertips poking
-    // past the skin, and a translation alone would only trade that overshoot for
-    // a palm offset. Centering by the weighted centroids first frees the roll
-    // from having to pass through the wrist, then S/T seat the whole hand; S is
-    // clamped so a degenerate correspondence can't collapse or inflate it.
+    // pivot, and a seat translation T that together overlay the atlas endpoint
+    // onto the avatar's. Scale earns its keep because the two models disagree
+    // about size — the atlas hand is longer from the wrist than the glove, and
+    // the atlas foot is 20 mm SHORTER than the leader's shoe but 22 mm LONGER
+    // than the follower's heeled one, so the term is per-figure and signed both
+    // ways. A rotation alone leaves geometry poking through the skin, and a
+    // translation alone only trades that overshoot for an offset at the pivot.
+    // Centering by the weighted centroids first frees the roll from having to
+    // pass through the joint, then S/T seat the whole endpoint; S is clamped so
+    // a degenerate correspondence can't collapse or inflate it.
     let wsum = 0; const muP = new THREE.Vector3(); const muQ = new THREE.Vector3();
     for (let i = 0; i < P.length; i++) { muP.addScaledVector(P[i], W[i]); muQ.addScaledVector(Q[i], W[i]); wsum += W[i]; }
     muP.multiplyScalar(1 / wsum); muQ.multiplyScalar(1 / wsum);
@@ -1240,89 +1334,12 @@ export class Figure {
     return { R, S, T };
   }
 
-  // Seat a heeled figure's skeletal foot inside its clothed heel. The ankle is
-  // already raised (heelLift) so the shoe sits natively, but the skeletal foot
-  // settles flat on the floor — heel bone down — 22–32 mm below the raised
-  // ankle node, while inside a real heel the foot is pitched (heel bone lifted,
-  // ankle high, ball on the floor). So here the skeletal foot is rotated
-  // heel-up about the ball until its ankle end rises to the ankle node, closing
-  // the gap to the shin and matching the shoe's pitch. Separately, the floor
-  // corners just drop back to the shoe sole (the ankle raise floated them): the
-  // shoe still contacts heel-block + ball, so the balance footprint stays flat,
-  // it only needs un-floating. Geometry only, never the ankle joint (the shoe's
-  // heel is baked into its mesh, so a joint pitch would double it). Stores
-  // this.footCorners / this.toeCorners, which lowestPointY and analysis prefer.
+  // Seat a heeled figure's foot inside its shoe: drop the balance corners onto
+  // the shoe sole, pitch the foot heel-up (both the bare skeleton AND the clothed
+  // body, so they agree) so it stands in the heel the way a real foot does, and
+  // draw a translucent outline of the shoe for the skeleton/muscle views (where
+  // the shoe itself is hidden).
   #applyHeel() {
-    this.group.updateMatrixWorld(true);
-    const gInv = this.group.matrixWorld.clone().invert();
-    const t = new THREE.Vector3();
-    const P = new THREE.Vector3();
-    const off = new THREE.Vector3();
-    for (const side of ['_L', '_R']) {
-      // The pitch target is the seated ankle — the atlas node when the leg
-      // chain is seated (where the retargeted shoe's foot bone sits), else the
-      // rig node.
-      const A = this.#seatNode(`ankle${side}`).getWorldPosition(new THREE.Vector3()).applyMatrix4(gInv);
-      // Skeleton foot vertices (ankle + toes meshes), figure-local.
-      const verts = [];
-      for (const mesh of this.layerMeshes.skeleton) {
-        const nn = this.#nodeNameOf(mesh);
-        if (nn !== `ankle${side}` && nn !== `toes${side}`) continue;
-        mesh.updateMatrixWorld(true);
-        const p = mesh.geometry.attributes.position;
-        const step = Math.max(1, Math.floor(p.count / 1500));
-        for (let i = 0; i < p.count; i += step) {
-          verts.push(new THREE.Vector3().fromBufferAttribute(p, i).applyMatrix4(mesh.matrixWorld).applyMatrix4(gInv));
-        }
-      }
-      if (!verts.length) continue;
-      // Ball pivot: the lowest vertex in the forward half of the foot (the ball/
-      // toe contact, ~y = 0). Pitch axis: horizontal, perpendicular to forward.
-      const c = new THREE.Vector3();
-      verts.forEach((v) => c.add(v));
-      c.multiplyScalar(1 / verts.length);
-      const fwd = new THREE.Vector3(c.x - A.x, 0, c.z - A.z).normalize();
-      const axis = new THREE.Vector3(0, 1, 0).cross(fwd).normalize();
-      let ball = verts[0];
-      for (const v of verts) {
-        if (v.clone().sub(c).dot(fwd) > 0 && v.y < ball.y) ball = v;
-      }
-      const B = ball.clone();
-      // Rotate heel-up (back of the foot rises) about the ball until the foot's
-      // highest point reaches the ankle node — seating the ankle end at the
-      // shin and lifting the heel bone off the floor, as a heel does.
-      const q = new THREE.Quaternion();
-      const maxYAt = (phi) => {
-        q.setFromAxisAngle(axis, phi);
-        let m = -Infinity;
-        for (const v of verts) {
-          t.copy(v).sub(B).applyQuaternion(q).add(B);
-          if (t.y > m) m = t.y;
-        }
-        return m;
-      };
-      const dir = maxYAt(0.15) > maxYAt(-0.15) ? 1 : -1; // sign that raises the back
-      let lo = 0;
-      let hi = 1.0;
-      for (let it = 0; it < 40; it++) {
-        const mid = (lo + hi) / 2;
-        if (maxYAt(dir * mid) < A.y) lo = mid; else hi = mid;
-      }
-      const R = new THREE.Quaternion().setFromAxisAngle(axis, dir * (lo + hi) / 2);
-      // Apply to the ankle + toes skeleton meshes (rotate about the ball B; a
-      // mesh parented at node P needs local offset B + R·(P − B) − P). P is the
-      // mesh's ACTUAL parent — the seated atlas node when the leg is seated.
-      for (const base of ['ankle', 'toes']) {
-        const nodeName = `${base}${side}`;
-        this.#seatNode(nodeName).getWorldPosition(P).applyMatrix4(gInv);
-        off.copy(P).sub(B).applyQuaternion(R).add(B).sub(P);
-        for (const mesh of this.layerMeshes.skeleton) {
-          if (this.#nodeNameOf(mesh) !== nodeName) continue;
-          mesh.quaternion.copy(R);
-          mesh.position.copy(off);
-        }
-      }
-    }
     // Floor corners: drop back to the shoe sole. The ankle raise floated them by
     // heelLift; the shoe still contacts heel-block + ball flat on the floor, so
     // just lower each corner by heelRise (fraction of height) — no pitch. Bases
@@ -1331,6 +1348,165 @@ export class Figure {
     const drop = (corners) => corners.map(([x, y, z]) => [x, y - this.heelRise, z]);
     this.footCorners = { _L: drop(this.footCorners._L), _R: drop(this.footCorners._R) };
     this.toeCorners = { _L: drop(this.toeCorners._L), _R: drop(this.toeCorners._R) };
+    this.#pitchHeeledFoot();
+    for (const side of ['_L', '_R']) this.#buildHeelOutline(side);
+  }
+
+  // Pitch a heeled figure's foot heel-up — BOTH the bare skeleton and the
+  // clothed body — so it sits in the heeled shoe the way a real foot does:
+  // calcaneus lifted onto the heel, forefoot on the floor, breaking at the MTP,
+  // instead of lying flat with the heel on the ground.
+  //
+  // The heel is a FAKE: both avatars ship FLAT shoes, and a figure is "heeled"
+  // only by #build raising its ankle node by heelLift. Left alone, each layer
+  // fakes the heel differently and they disagree — the mannequin's heel reads
+  // higher than the skeleton's. The skeleton starts flat: its endpoint axis fit
+  // (ENDPOINT_FITS, mode 'axis') lands it on the shoe's OUTER sole (flat on the
+  // floor) while the ankle node rides heelLift up, so the leg meets the foot
+  // heelLift above the bones. The BODY doesn't fit — its foot bones just ride the
+  // raised ankle+toe nodes RIGIDLY (no ball-pitch), so the flat shoe stretches
+  // heel-up instead of tilting cleanly and the toe box deforms (pinched/drooped).
+  //
+  // Both are fixed by the SAME rotation about the ball (the MTP / toes joint) by
+  // atan2(heelLift, run): it rotates only the ankle-region mesh / the foot bone
+  // (bip01*foot) — lifting its ankle end up to the raised ankle node — while the
+  // phalanges (toes mesh) / toe bone (bip01*toe0), which ride the toes node, stay
+  // flat in the toe box, so the break falls at the MTP as in a real heeled shoe.
+  // The foot bone rides the same atlas ankle node as the skeleton mesh, so the
+  // identical transform lands both layers on one heel.
+  //
+  // Baked into each matrix ONCE (they ride their node rigidly, so the pitch holds
+  // through any pose) and COMPOSED with — never overwrites — the fit matrix
+  // #alignEndpointGeometry wrote / the body bone's retarget matrix: assigning the
+  // matrix outright would erase the fit/retarget on exactly the foot that needs
+  // it. Runs after the calibration is recorded, so the frozen snapshot (and
+  // dev-verify-calibration) is unaffected — no re-bake needed.
+  #pitchHeeledFoot() {
+    this.group.updateMatrixWorld(true);
+    const gInv = this.group.matrixWorld.clone().invert();
+    const local = (name) => this.#seatNode(name).getWorldPosition(new THREE.Vector3()).applyMatrix4(gInv);
+    const m = new THREE.Matrix4();
+    for (const side of ['_L', '_R']) {
+      const ball = local(`toes${side}`); // MTP joint = pivot
+      const ankle = local(`ankle${side}`);
+      const run = ball.z - ankle.z; // horizontal ball→ankle distance
+      if (run < 1e-4) continue;
+      // Heel-up rotation about the figure-local lateral (X) axis that lifts the
+      // foot's ankle end by heelLift over that run — back up to the raised node.
+      const theta = Math.atan2(this._heelLift, run);
+      this.heelPitchDeg = THREE.MathUtils.radToDeg(theta); // both sides equal
+
+      const pitch = new THREE.Matrix4()
+        .makeTranslation(ball.x, ball.y, ball.z)
+        .multiply(m.makeRotationX(theta))
+        .multiply(new THREE.Matrix4().makeTranslation(-ball.x, -ball.y, -ball.z));
+      for (const mesh of this.layerMeshes.skeleton) {
+        if (this.#nodeNameOf(mesh) !== `ankle${side}`) continue;
+        // Re-express the figure-local pitch in the mesh's parent (atlas ankle
+        // node) frame and pre-apply it to the baked fit matrix.
+        const pl = gInv.clone().multiply(mesh.parent.matrixWorld);
+        mesh.matrixAutoUpdate = false;
+        mesh.matrix.copy(pl.clone().invert().multiply(pitch).multiply(pl).multiply(mesh.matrix));
+      }
+      // Pitch the CLOTHED foot the same way. The body's flat shoe was faking its
+      // heel only by riding the raised ankle node rigidly (no ball-pitch), so it
+      // tilted more than the skeleton's block and deformed the toe box. The foot
+      // bone (bip01*foot) rides the same atlas ankle node as the skeleton mesh,
+      // so the identical about-the-ball pitch lands it on the same heel; the toe
+      // bone (bip01*toe0) rides the toes node and is left flat, so the shoe now
+      // breaks at the MTP like a real heeled shoe instead of stretching.
+      const footBone = this.jointBone && this.jointBone[`ankle${side}`];
+      if (footBone && footBone.parent) {
+        const pl = gInv.clone().multiply(footBone.parent.matrixWorld);
+        footBone.matrixAutoUpdate = false;
+        footBone.matrix.copy(pl.clone().invert().multiply(pitch).multiply(pl).multiply(footBone.matrix));
+      }
+    }
+  }
+
+  // A faint translucent outline of one shoe (flat sole footprint + the raised
+  // heel wedge at the back), parented to the rig ankle node so it sits on the
+  // floor at rest and rides the foot when it is posed. Shown only when the body
+  // avatar is hidden (skeleton / muscle views), where it stands in for the shoe
+  // the bones are wearing. Built from this figure's fitted sole corners, so it
+  // tracks the balance footprint and any soleScale change for free.
+  #buildHeelOutline(side) {
+    const H = this.height;
+    const hl = this._heelLift;
+    const ankleNode = this.nodes[`ankle${side}`];
+    const toesNode = this.nodes[`toes${side}`];
+    if (!ankleNode || !toesNode) return;
+    const foot = this.footCorners[side]; // ankle-frame, [heel-out, heel-in, ball-in, ball-out]
+    const toe = this.toeCorners[side]; // toes-frame, [toe-out, toe-in]
+    // Bring the toe-pad corners into the ankle node's frame (identity rest
+    // rotations, so a plain offset of the toes node from the ankle).
+    const toesOff = toesNode.position.clone().sub(ankleNode.position).multiplyScalar(1 / H);
+    const P = (x, y, z) => new THREE.Vector3(x * H, y * H, z * H);
+    const soleY = foot[0][1]; // dropped sole plane (fraction), on the floor at rest
+    const outline = [
+      P(...foot[0]), P(...foot[1]), P(...foot[2]),
+      P(toe[0][0] + toesOff.x, soleY, toe[0][2] + toesOff.z),
+      P(toe[1][0] + toesOff.x, soleY, toe[1][2] + toesOff.z),
+      P(...foot[3]),
+    ];
+
+    const fillMat = new THREE.MeshStandardMaterial({
+      color: HEEL_OUTLINE_FILL, roughness: 0.6, transparent: true,
+      opacity: HEEL_OUTLINE_FILL_OPACITY, depthWrite: false, side: THREE.DoubleSide,
+    });
+    const edgeMat = new THREE.LineBasicMaterial({
+      color: HEEL_OUTLINE_EDGE, transparent: true,
+      opacity: HEEL_OUTLINE_EDGE_OPACITY, depthWrite: false,
+    });
+
+    const group = new THREE.Group();
+    // --- Sole: a flat filled polygon (triangle fan from its centroid) + edge. ---
+    const c = new THREE.Vector3();
+    for (const p of outline) c.add(p);
+    c.multiplyScalar(1 / outline.length);
+    const solePos = [];
+    for (let i = 0; i < outline.length; i++) {
+      const a = outline[i]; const b = outline[(i + 1) % outline.length];
+      solePos.push(c.x, c.y, c.z, a.x, a.y, a.z, b.x, b.y, b.z);
+    }
+    const soleGeo = new THREE.BufferGeometry();
+    soleGeo.setAttribute('position', new THREE.Float32BufferAttribute(solePos, 3));
+    soleGeo.computeVertexNormals();
+    group.add(new THREE.Mesh(soleGeo, fillMat));
+    const edgePos = [];
+    for (let i = 0; i < outline.length; i++) {
+      const a = outline[i]; const b = outline[(i + 1) % outline.length];
+      edgePos.push(a.x, a.y, a.z, b.x, b.y, b.z);
+    }
+    const edgeGeo = new THREE.BufferGeometry();
+    edgeGeo.setAttribute('position', new THREE.Float32BufferAttribute(edgePos, 3));
+    group.add(new THREE.LineSegments(edgeGeo, edgeMat));
+
+    // --- Heel: a wedge from the heel corners (on the floor) up to heelLift,
+    // sloping down to the sole around the arch. Slightly inset from the sole. ---
+    const xOut = foot[0][0] * 0.92; const xIn = foot[1][0] * 0.92;
+    const zBack = foot[0][2]; const zArch = 0.006; // wedge front, ~1 cm ahead of the ankle
+    const A = P(xOut, soleY, zBack); const A2 = P(xIn, soleY, zBack);
+    const B = new THREE.Vector3(A.x, A.y + hl, A.z); const B2 = new THREE.Vector3(A2.x, A2.y + hl, A2.z);
+    const Cc = P(xOut, soleY, zArch); const Cc2 = P(xIn, soleY, zArch);
+    const tri = (p, q, r) => [p.x, p.y, p.z, q.x, q.y, q.z, r.x, r.y, r.z];
+    const wedgePos = [
+      ...tri(A, B, B2), ...tri(A, B2, A2), // vertical back face
+      ...tri(A, A2, Cc2), ...tri(A, Cc2, Cc), // bottom
+      ...tri(B, Cc, Cc2), ...tri(B, Cc2, B2), // sloped top
+      ...tri(A, Cc, B), ...tri(A2, B2, Cc2), // side triangles
+    ];
+    const wedgeGeo = new THREE.BufferGeometry();
+    wedgeGeo.setAttribute('position', new THREE.Float32BufferAttribute(wedgePos, 3));
+    wedgeGeo.computeVertexNormals();
+    group.add(new THREE.Mesh(wedgeGeo, fillMat));
+    const wedgeEdges = new THREE.LineSegments(new THREE.EdgesGeometry(wedgeGeo, 20), edgeMat);
+    group.add(wedgeEdges);
+
+    group.visible = false; // shown by setLayers when the body avatar is hidden
+    for (const o of group.children) { o.castShadow = false; o.raycast = () => {}; }
+    ankleNode.add(group);
+    this.heelOutline.push(group);
   }
 
   // Curl one hand's fingers (0 = bind pose, 1 = closed around the partner's
@@ -1344,6 +1520,113 @@ export class Figure {
       f.bone.quaternion.copy(f.rest);
       if (curl * amt) f.bone.quaternion.multiply(_fingerQ.setFromAxisAngle(FINGER_AXIS, curl * amt));
     }
+  }
+
+  // User-facing open/close of one hand: like setFingerCurl, but REMEMBERS the
+  // amount (this.handCurl) so it persists through pose save/load and is
+  // re-applied by setPose. The embrace still drives the clasp hands directly
+  // through setFingerCurl (a transient hold), leaving this baseline untouched.
+  setHandCurl(side, curl) {
+    this.handCurl[side] = curl;
+    this.setFingerCurl(side, curl);
+  }
+
+  // Measure each clothed hand's real orientation AND its palm center, from the
+  // avatar's own finger bones at rest.
+  //
+  // Orientation, in the wrist node's frame: `fingers` runs along the middle
+  // finger's proximal phalanx; `palm` (the visible palm's outward normal) is
+  // the direction a curl first sweeps the fingertips — the Biped fingers bend
+  // about their bones' local Z (FINGER_AXIS) and positive curl closes onto the
+  // palm by construction, so curlAxis × fingers points out of the palm with no
+  // sign ambiguity. `offset` is the rotation taking the rig-canonical hand
+  // frame (fingers -Y, palm +Z) onto the mesh frame; embrace.js multiplies its
+  // orientation targets by `offsetInv` so the visible palm — not the rig's
+  // phantom +Z — faces the partner. The rig wrist node is the right frame for
+  // this half: it and the atlas wrist share their local rotations, so the two
+  // agree in orientation exactly (measured: 0.0° apart in every pose).
+  //
+  // POSITION is a different matter, and is stored in the ATLAS wrist's frame
+  // (#seatNode) because that is the node the clothed hand is welded to. The
+  // two chains share rotations but NOT local positions, so they drift apart as
+  // the arm flexes — measured 6 cm with the arm hanging, ~18 cm at the
+  // embrace's -120° elbow. Anything that POSITIONS a hand off the rig node is
+  // therefore aiming a phantom: it is what let the embrace solve a perfect
+  // palm-to-palm clasp on the rig nodes while the rendered hands hung ~15 cm
+  // apart (and why a rig-node metric could never see it). `center` is the
+  // position half of the same mesh-truth correction — midway between the
+  // avatar's own hand-bone origin (its wrist) and the row of finger knuckles,
+  // i.e. the middle of the palm, which is the surface a clasp actually joins.
+  #measureHandMesh() {
+    this.group.updateMatrixWorld(true);
+    for (const side of ['L', 'R']) {
+      const mid = this.fingerBones[side].filter((b) => b.digit === 2);
+      const seg0 = mid.find((b) => b.seg === 0);
+      const seg1 = mid.find((b) => b.seg === 1);
+      if (!seg0 || !seg1) continue;
+      const root = seg0.bone.getWorldPosition(new THREE.Vector3());
+      const fingers = seg1.bone.getWorldPosition(new THREE.Vector3()).sub(root);
+      const curlAxis = new THREE.Vector3().setFromMatrixColumn(seg0.bone.matrixWorld, 2);
+      const palm = new THREE.Vector3().crossVectors(curlAxis, fingers);
+      if (fingers.lengthSq() < 1e-10 || palm.lengthSq() < 1e-10) continue;
+      const qInv = this.nodes[`wrist_${side}`].getWorldQuaternion(new THREE.Quaternion()).invert();
+      fingers.normalize().applyQuaternion(qInv);
+      palm.normalize().applyQuaternion(qInv);
+      const y = fingers.clone().negate();
+      const z = palm.addScaledVector(y, -y.dot(palm)).normalize();
+      const x = new THREE.Vector3().crossVectors(y, z);
+      const offset = new THREE.Quaternion()
+        .setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, z));
+      // Palm center, in the frame the hand is welded to (see above). The thumb
+      // (digit 0) is left out of the knuckle row: its metacarpal sits off the
+      // palm plane and would drag the center toward the thumb side.
+      const knuckles = this.fingerBones[side].filter((b) => b.seg === 0 && b.digit > 0);
+      const handBone = seg0.bone.parent;
+      let center = null;
+      if (handBone && knuckles.length) {
+        const mcp = new THREE.Vector3();
+        for (const k of knuckles) mcp.add(k.bone.getWorldPosition(_handV));
+        mcp.divideScalar(knuckles.length);
+        center = handBone.getWorldPosition(new THREE.Vector3())
+          .add(mcp).multiplyScalar(0.5);
+        this.#seatNode(`wrist_${side}`).worldToLocal(center);
+      }
+      this.handMesh[side] = {
+        fingers, palm: z.clone(), offset, offsetInv: offset.clone().invert(), center,
+      };
+    }
+  }
+
+  // World direction the VISIBLE palm faces (mesh-truth; falls back to the
+  // rig convention, wrist-local +Z, when no clothed avatar is loaded).
+  palmDirWorld(side) {
+    const q = this.nodes[`wrist_${side}`].getWorldQuaternion(new THREE.Quaternion());
+    const p = this.handMesh[side]?.palm ?? new THREE.Vector3(0, 0, 1);
+    return p.clone().applyQuaternion(q);
+  }
+
+  // World direction the VISIBLE fingers point (mesh-truth, measured on the
+  // uncurled hand — so it reports where the hand is AIMED regardless of any
+  // clasp curl, which is what an aim target means). Falls back to the rig
+  // convention, wrist-local -Y, with no clothed avatar.
+  fingerDirWorld(side) {
+    const q = this.nodes[`wrist_${side}`].getWorldQuaternion(new THREE.Quaternion());
+    const d = this.handMesh[side]?.fingers ?? new THREE.Vector3(0, -1, 0);
+    return d.clone().applyQuaternion(q);
+  }
+
+  // World position of the VISIBLE palm's center — where the clothed hand
+  // really is, which on a flexed arm is nowhere near the rig wrist/hand nodes
+  // (see #measureHandMesh). Anything joining, resting or measuring a hand
+  // against the world wants this, not the rig nodes. Falls back to the rig
+  // wrist→hand midpoint when no clothed avatar is loaded (the procedural
+  // mannequin's hand IS on the rig node, so the fallback is exact there).
+  palmPosWorld(side, target = new THREE.Vector3()) {
+    const c = this.handMesh[side]?.center;
+    if (c) return this.#seatNode(`wrist_${side}`).localToWorld(target.copy(c));
+    target.setFromMatrixPosition(this.nodes[`wrist_${side}`].matrixWorld);
+    return target.add(_handV.setFromMatrixPosition(this.nodes[`hand_${side}`].matrixWorld))
+      .multiplyScalar(0.5);
   }
 
   #buildBody() {
@@ -1568,6 +1851,9 @@ export class Figure {
     for (const m of this.layerMeshes.skeleton) m.visible = skeleton;
     for (const m of this.layerMeshes.body) m.visible = body;
     for (const m of this.layerMeshes.muscle) m.visible = muscle;
+    // The shoe/heel outline stands in for the (hidden) shoe: show it whenever
+    // the body avatar is off, i.e. in the skeleton and muscle views.
+    for (const g of this.heelOutline) g.visible = skeleton || muscle;
     // Joint spheres are click targets, not anatomy: keep them faint in skeleton
     // view (the bones already show the joints) and invisible-but-clickable
     // otherwise. Raycasting ignores opacity, so picking is unaffected.
@@ -1603,6 +1889,7 @@ export class Figure {
       facing: this.group.rotation.y,
       pelvisY: this.nodes.pelvis.position.y / this.height, // stored as fraction of height
       joints,
+      handCurl: { ...this.handCurl },
     };
   }
 
@@ -1616,6 +1903,13 @@ export class Figure {
       if (!node) continue;
       node.rotation.set(x, y, z);
       this.clampJoint(name);
+    }
+    // Restore hand shape if the pose carried one (older poses omit it — leave
+    // the hands as they are rather than forcing them open).
+    if (pose.handCurl) {
+      for (const side of ['L', 'R']) {
+        if (pose.handCurl[side] !== undefined) this.setHandCurl(side, pose.handCurl[side]);
+      }
     }
     this.syncAtlasNodes(); // pivot the skeletal limb bones about the anatomical joints
     this.group.updateMatrixWorld(true);
@@ -1649,8 +1943,31 @@ export class Figure {
     this.group.updateMatrixWorld(true);
   }
 
+  // Rig joint centre, world. This is the ANTHROPOMETRIC skeleton (Drillis–
+  // Contini), and it is the right thing for BIOMECHANICS — computeCOG lerps de
+  // Leva segment masses between exactly these points, and the joint-angle and
+  // balance readouts are defined on them. It is the WRONG thing for anything
+  // about where the body physically is; see surfaceNode/surfacePos.
   worldPos(jointName, target = new THREE.Vector3()) {
     return this.nodes[jointName].getWorldPosition(target);
+  }
+
+  // The node the VISIBLE body is welded to: the atlas node on a seated limb
+  // joint, else the rig node (torso joints, where the two coincide).
+  //
+  // Use this for contact — collision volumes, pin spots, anything asking where
+  // the dancer physically IS. Measured across six poses, the difference is not
+  // subtle: the visible palm sits 165 mm from the rig wrist and wanders 107 mm
+  // inside it as the arm flexes, while in the ATLAS wrist it sits a steady
+  // 39 mm away and wanders 0.0 mm. The elbow is 97 mm / 111 mm versus 37 mm /
+  // 15 mm. A capsule or a pin built on the rig node is displaced from the limb
+  // it represents by more than that limb's own radius.
+  surfaceNode(jointName) {
+    return this.#seatNode(jointName);
+  }
+
+  surfacePos(jointName, target = new THREE.Vector3()) {
+    return this.#seatNode(jointName).getWorldPosition(target);
   }
 
   // Lowest sole corner of one foot ('L' | 'R'), world Y — how far this foot's
@@ -1722,6 +2039,7 @@ export class Figure {
     this.dispose();
     this.pickSpheres = [];
     this.layerMeshes = { skeleton: [], body: [], muscle: [] };
+    this.heelOutline = [];
     this.jointSphereByName = {};
     this._skinMuscles = [];
     this.nodes = {};

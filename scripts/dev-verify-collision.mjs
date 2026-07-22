@@ -63,19 +63,23 @@ if (c < -PEN_TOL) problems.push(`walk-into: interpenetration ${(-c * 100).toFixe
 if (pushed < 0.05) problems.push(`walk-into: follower not displaced (${(pushed * 100).toFixed(1)} cm)`);
 await page.screenshot({ path: `${outDir}/collision-walk-into.png` });
 
-// ---- 3. The edited dancer keeps their ground: with the follower selected,
-//         moving her into the leader must displace HIM.
+// ---- 3. The edited dancer keeps their ground: MOVING the follower into the
+//         leader must displace HIM. Which dancer yields follows who is being
+//         EDITED, not who is merely selected (selecting a joint must never move
+//         anyone — that was a jolt bug). Every real move path (gizmo drag,
+//         Move-hips, arrow keys) calls app.markEdit; this test moves her with a
+//         raw position write, so it marks the edit itself to stand in for one.
 await page.evaluate(() => window.__app.applyPreset(0));
 await sleep(350);
 const leaderBefore = await page.evaluate(() => {
   const app = window.__app;
-  app.selectJoint(app.follower, 'pelvis');
   return { x: app.leader.group.position.x, z: app.leader.group.position.z };
 });
 const followerHeld = await page.evaluate(() => {
   const app = window.__app;
   app.follower.group.position.x = app.leader.group.position.x;
   app.follower.group.position.z = app.leader.group.position.z;
+  app.markEdit(app.follower); // as a real move of the follower would
   return { x: app.follower.group.position.x, z: app.follower.group.position.z };
 });
 await sleep(400);

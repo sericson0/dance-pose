@@ -36,6 +36,29 @@ const _spot = new THREE.Vector3();
 const _target = new THREE.Vector3();
 const _eff = new THREE.Vector3();
 
+// The frame a pin spot on `nodeName` is stored in — ARM spots ride the atlas
+// node the clothed arm is welded to, everything else stays on the rig node.
+//
+// Arms migrate because the error there is enormous and self-contained: the rig
+// elbow sits 97 mm from the visible elbow and wanders 111 mm across poses,
+// against 37 mm / 15 mm in the atlas frame, and nothing else depends on where
+// an arm spot lives. LEGS deliberately do not, even though they are seated
+// too: clampToFloor and the balance hull read this figure's sole corners in
+// the RIG ankle's frame, so a leg spot driven in the atlas frame fights the
+// floor clamp — measured, it lifted the pinned foot from 9 mm off the floor to
+// 66 mm. Migrating legs means moving the corner tables with them and
+// re-verifying grounding, which is a separate change (collision.js draws the
+// same arm/leg line, for the same reason).
+//
+// Every site that touches a spot must go through this: nearestJointNode picks
+// with it, main.js's authoring stores with it, endWorld plays it back with it,
+// and maintainLimbs re-reads it with it. A spot measured in one frame and
+// replayed in another lands somewhere the user never clicked — measured at
+// ~10 cm on a flexed arm.
+export function spotNode(figure, nodeName) {
+  return ARM.test(nodeName) ? figure.surfaceNode(nodeName) : figure.nodes[nodeName];
+}
+
 // The joint node whose origin sits nearest a world point on `figure` — the
 // anchor a clicked spot is stored under. Every joint (endpoints included) is
 // a candidate; the arm/leg regexes above decide how the spot later resolves.
@@ -43,7 +66,7 @@ export function nearestJointNode(figure, worldPoint) {
   let best = null;
   let bestD = Infinity;
   for (const def of JOINTS) {
-    const d = figure.nodes[def.name].getWorldPosition(_spot).distanceToSquared(worldPoint);
+    const d = spotNode(figure, def.name).getWorldPosition(_spot).distanceToSquared(worldPoint);
     if (d < bestD) { bestD = d; best = def.name; }
   }
   return best;
@@ -70,10 +93,11 @@ export class ContactPins {
     return role === 'leader' ? this.leader : this.follower;
   }
 
-  // World position of one pin end (the spot riding its joint node).
+  // World position of one pin end (the spot riding its joint node). Must use
+  // the same frame nearestJointNode stored it in — see the note there.
   endWorld(role, pin, out = new THREE.Vector3()) {
     const end = pin[role];
-    return this.#figure(role).nodes[end.node].localToWorld(out.copy(end.local));
+    return spotNode(this.#figure(role), end.node).localToWorld(out.copy(end.local));
   }
 
   // ends: { node: 'wrist_R', local: THREE.Vector3 } per role.
@@ -159,7 +183,10 @@ export class ContactPins {
         ? { root: `shoulder_${side}`, mid: `elbow_${side}`, effector: `wrist_${side}`, hingeSign: -1 }
         : { root: `hip_${side}`, mid: `knee_${side}`, effector: `ankle_${side}`, hingeSign: 1 };
       this.endWorld(role === 'leader' ? 'follower' : 'leader', pin, _target);
-      const node = mover.nodes[end.node];
+      // The spot is READ back through the frame it was STORED in (surfaceNode);
+      // the effector stays a rig node because that is what the IK actually
+      // drives. Mixing the two silently costs ~10 cm on a flexed arm.
+      const node = spotNode(mover, end.node);
       const eff = mover.nodes[chain.effector];
       // Aim the chain effector at target + (effector − spot): exact when the
       // spot rides the effector's own subtree, converging for spots up the
@@ -169,6 +196,13 @@ export class ContactPins {
         if (_spot.distanceToSquared(_target) < 1e-8) break;
         eff.getWorldPosition(_eff).add(_target).sub(_spot);
         solveTwoBone(mover, chain, _eff);
+        // solveTwoBone writes RIG rotations; the atlas sub-tree the spot rides
+        // does not follow until it is synced. Without this the next pass reads
+        // the spot for the PREVIOUS pose and the residual correction becomes a
+        // divergent feedback loop instead of a fixed point — the same trap
+        // documented for the embrace's handCenter.
+        mover.syncAtlasNodes();
+        mover.group.updateMatrixWorld(true);
       }
       if (leg) legMoved = true;
     }
