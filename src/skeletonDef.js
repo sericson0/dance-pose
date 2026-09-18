@@ -185,13 +185,27 @@ export const MASS_SEGMENTS = [
 // support. The heel/ball corners live in the ankle's local frame; the toe-tip
 // corners live in the toes joint's frame so they follow toe flexion (a curled
 // or lifted toe stops counting as its flat-foot floor point).
+// Standing height of the ankle joint above the floor, as a fraction of stature
+// (Drillis–Contini): the sole plane sits this far below the ankle, so
+// FOOT_CORNERS below carry y = −ANKLE_REST_FRAC. Named here so the IK grounding
+// paths (feetToFloor, the gait ankle target, the IK floor-min clamp) share one
+// source instead of a bare 0.039 in each. NOTE: the FOOT_CORNERS table below is
+// still a literal −0.039 — keep the two in step by hand if the sole moves.
+export const ANKLE_REST_FRAC = 0.039;
+
+// A sole corner within this height of the floor (fraction of stature) counts as
+// resting on it. Shared by footContactsBySide (the balance base of support) and
+// the foot-map contact patch so the two never disagree about what is grounded.
+export const FLOOR_CONTACT_FRAC = 0.035;
+
 // Sized to the RENDERED shoe of the clothed avatars (measured from the skinned
-// mesh: the man's shoe spans ankle−0.059H … ankle+0.095H long and ≈0.058H wide
+// mesh: the man's shoe spans ankle−0.057H … ankle+0.087H long and ≈0.058H wide
 // at the ball), so the drawn support base matches the foot the user sees — the
-// old corners overhung the shoe by several cm at the toe and sides. Note the
-// rig's toes joint (ankle+0.090H) sits near the shoe TIP, so the toe-pad
-// corners live only a little ahead of it. A figure whose avatar wears a
-// different shoe scales these via its `soleScale` option (see Figure).
+// old corners overhung the shoe by several cm at the toe and sides. The rig's
+// toes joint (ankle+0.090H) actually sits ~0.003H PAST the shoe tip, so the
+// toe-pad corners are pulled a hair BEHIND the joint to land right at the tip
+// (a +0.010H corner poked ~2 cm past the shoe — the "toe overshoot"). A figure
+// whose avatar wears a different shoe scales these via its `soleScale` option.
 // Order: heel-in, heel-out, ball-out, ball-in.
 export const FOOT_CORNERS_L = [
   [-0.024, -0.039, -0.055],
@@ -201,10 +215,11 @@ export const FOOT_CORNERS_L = [
 ];
 export const FOOT_CORNERS_R = FOOT_CORNERS_L.map(([x, y, z]) => [-x, y, z]);
 // Toe-tip corners in the toes joint's frame (joint at ankle-local
-// (0, -0.030, 0.090); sole plane is 0.009H below it). Order: toe-out, toe-in.
+// (0, -0.030, 0.090); sole plane is 0.009H below it). z = −0.003 lands them on
+// the shoe TIP (the joint overshoots it), not ~2 cm past. Order: toe-out, toe-in.
 export const TOE_CORNERS_L = [
-  [0.014, -0.009, 0.010],
-  [-0.014, -0.009, 0.010],
+  [0.014, -0.009, -0.003],
+  [-0.014, -0.009, -0.003],
 ];
 export const TOE_CORNERS_R = TOE_CORNERS_L.map(([x, y, z]) => [-x, y, z]);
 
@@ -225,23 +240,45 @@ export const IK_CHAINS = {
   toes_R: { root: 'hip_R', mid: 'knee_R', effector: 'ankle_R', hingeSign: 1 },
 };
 
+// The same two-bone IK chain as a per-side builder. Callers that solve a limb
+// from a side letter (feet-to-floor, grounded interp, closed-chain edits, leg
+// pins) built this literal by hand in ~6 places; funnel them through one
+// definition so the effector convention / hinge direction can't drift between
+// copies. Returns a fresh object each call (matching the old inline literals).
+export const legChain = (side) => (
+  { root: `hip_${side}`, mid: `knee_${side}`, effector: `ankle_${side}`, hingeSign: 1 }
+);
+export const armChain = (side) => (
+  { root: `shoulder_${side}`, mid: `elbow_${side}`, effector: `wrist_${side}`, hingeSign: -1 }
+);
+
 // Highlightable body parts: every mesh attached under one of `nodes` belongs
 // to the part. Bones/muscles that span a joint live on the proximal node, so
 // e.g. the thigh (attached to hip_L) highlights with the left leg.
+//
+// `color` is the part's default highlight colour — each part lights in its own
+// hue so several highlighted at once stay tellable apart (the Highlight panel
+// lets the user repick any of them; left/right share a hue, the right side
+// darker). `short`/`rep` are the plain-English callout name and the joint it
+// hangs on at the Simple label detail ("Foot" rather than every tarsal bone).
 export const BODY_PARTS = [
-  { id: 'head', title: 'Head & neck', nodes: ['neck', 'head', 'headTop'] },
-  { id: 'torso', title: 'Torso', nodes: ['spine', 'chest'] },
-  { id: 'pelvis', title: 'Pelvis', nodes: ['pelvis'] },
-  { id: 'arm_L', title: 'Left arm', nodes: ['scapula_L', 'shoulder_L', 'elbow_L', 'wrist_L', 'hand_L'] },
-  { id: 'arm_R', title: 'Right arm', nodes: ['scapula_R', 'shoulder_R', 'elbow_R', 'wrist_R', 'hand_R'] },
-  { id: 'leg_L', title: 'Left leg', nodes: ['hip_L', 'knee_L'] },
-  { id: 'leg_R', title: 'Right leg', nodes: ['hip_R', 'knee_R'] },
-  { id: 'foot_L', title: 'Left foot', nodes: ['ankle_L', 'toes_L', 'toe_L'] },
-  { id: 'foot_R', title: 'Right foot', nodes: ['ankle_R', 'toes_R', 'toe_R'] },
+  { id: 'head', title: 'Head & neck', short: 'Head', rep: 'head', color: '#e0913a', nodes: ['neck', 'head', 'headTop'] },
+  { id: 'torso', title: 'Torso', short: 'Torso', rep: 'chest', color: '#4fa3e3', nodes: ['spine', 'chest'] },
+  { id: 'pelvis', title: 'Pelvis', short: 'Hips', rep: 'pelvis', color: '#b478d8', nodes: ['pelvis'] },
+  { id: 'arm_L', title: 'Left arm', short: 'Arm', rep: 'elbow_L', color: '#5fc27e', nodes: ['scapula_L', 'shoulder_L', 'elbow_L', 'wrist_L', 'hand_L'] },
+  { id: 'arm_R', title: 'Right arm', short: 'Arm', rep: 'elbow_R', color: '#2f8f5b', nodes: ['scapula_R', 'shoulder_R', 'elbow_R', 'wrist_R', 'hand_R'] },
+  { id: 'leg_L', title: 'Left leg', short: 'Leg', rep: 'knee_L', color: '#e8695f', nodes: ['hip_L', 'knee_L'] },
+  { id: 'leg_R', title: 'Right leg', short: 'Leg', rep: 'knee_R', color: '#b9413c', nodes: ['hip_R', 'knee_R'] },
+  { id: 'foot_L', title: 'Left foot', short: 'Foot', rep: 'ankle_L', color: '#e8c452', nodes: ['ankle_L', 'toes_L', 'toe_L'] },
+  { id: 'foot_R', title: 'Right foot', short: 'Foot', rep: 'ankle_R', color: '#bf9a2c', nodes: ['ankle_R', 'toes_R', 'toe_R'] },
 ];
 
 export const PART_OF_NODE = {};
+export const PART_BY_ID = {};
+export const PART_COLOR = {};
 for (const part of BODY_PARTS) {
+  PART_BY_ID[part.id] = part;
+  PART_COLOR[part.id] = part.color;
   for (const node of part.nodes) PART_OF_NODE[node] = part.id;
 }
 

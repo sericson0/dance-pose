@@ -35,7 +35,8 @@ const _r = new THREE.Vector3();
 
 // Closest points between segments p1→q1 and p2→q2 (Ericson, Real-Time
 // Collision Detection §5.1.9), written into c1/c2; returns the distance.
-function closestSegSeg(p1, q1, p2, q2, c1, c2) {
+// Exported for unit testing (test/collision.test.js).
+export function closestSegSeg(p1, q1, p2, q2, c1, c2) {
   _d1.subVectors(q1, p1);
   _d2.subVectors(q2, p2);
   _r.subVectors(p1, p2);
@@ -165,6 +166,22 @@ function maxPenetrationBetween(capsA, capsB) {
   return worst;
 }
 
+// The one branch below the author flagged as impossible ("should not happen":
+// every candidate slide direction wedged) used to produce no trace at all, so
+// a pose that reached it would simply render as two dancers inside each other
+// with nothing to look at. Warn instead — but throttled, because this runs
+// every frame and a wedged pose would otherwise flood the console (and the
+// headless suites) for as long as it is held. Console only: the user cannot
+// act on it, and the visible result is already the pose they can see.
+let lastWedgeWarn = 0;
+function warnWedged(mover, pen) {
+  const now = performance.now();
+  if (now - lastWedgeWarn < 2000) return;
+  lastWedgeWarn = now;
+  console.warn(`collision: no horizontal direction separates the dancers (deepest ${
+    Math.round(pen * 1000)} mm, ${mover.name} yielding) — leaving them where they are.`);
+}
+
 // Resolve body penetration between the two dancers by translating `mover`
 // (the partner of the actively edited dancer; default: the follower yields,
 // matching Embrace.maintainTorso). Horizontal only — dancers stand on the
@@ -239,7 +256,13 @@ export function resolveBodyCollision(a, b, activeFigure, editedArm = null) {
     return;
   }
   // No direction separates (should not happen) — stay put rather than
-  // catapult the dancer.
+  // catapult the dancer. "Should not happen" was the whole problem: the one
+  // branch the author flagged as impossible left no trace at all, so a pose
+  // that reached it would just render as two dancers inside each other. It is
+  // reachable in principle (every candidate direction wedged), so say so —
+  // loudly enough for the console and the headless suites, without a
+  // user-facing message for something the user cannot act on.
+  warnWedged(mover, worst.pen);
   mover.group.position.copy(base);
   mover.group.updateMatrixWorld(true);
 }

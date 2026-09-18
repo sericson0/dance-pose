@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { JOINTS } from './skeletonDef.js';
+import { JOINTS, legChain, ANKLE_REST_FRAC } from './skeletonDef.js';
 
 // How far a limb is ALREADY bent at its hinge in the rest pose, per mid joint
 // (radians). solveTwoBone drives the hinge as `rotation.x = ±(π − interior)`,
@@ -161,9 +161,9 @@ export function swivelLimb(figure, chain, targetWorld) {
 // Drop each foot back to standing ankle height directly below its current
 // position — handy after lowering the pelvis or leaning a figure.
 export function feetToFloor(figure) {
-  const ankleRestY = 0.039 * figure.height;
+  const ankleRestY = ANKLE_REST_FRAC * figure.height;
   for (const side of ['L', 'R']) {
-    const chain = { root: `hip_${side}`, mid: `knee_${side}`, effector: `ankle_${side}`, hingeSign: 1 };
+    const chain = legChain(side);
     const ankle = figure.nodes[chain.effector].getWorldPosition(new THREE.Vector3());
     solveTwoBone(figure, chain, new THREE.Vector3(ankle.x, ankleRestY, ankle.z));
     flattenFoot(figure, side);

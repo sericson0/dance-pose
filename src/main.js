@@ -2,20 +2,27 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { Figure } from './figure.js';
-import { IK_CHAINS, JOINT_BY_NAME, ANCHOR_FOR, DEG } from './skeletonDef.js';
+import {
+  IK_CHAINS, JOINT_BY_NAME, JOINT_TITLES, ANCHOR_FOR, DEG, legChain, ANKLE_REST_FRAC, PART_COLOR,
+} from './skeletonDef.js';
 import { solveTwoBone, swivelLimb, editWithAnchor, pinAnchor, feetToFloor, flattenFoot } from './ik.js';
 import { balanceReport, coupleReport, footContactsBySide } from './analysis.js';
 import { PRESETS } from './presets.js';
 import { loadSkeletonBones, loadMuscleMeshes, loadBodyMesh } from './skeletonMesh.js';
 import { Embrace } from './embrace.js';
-import { ContactPins, nearestJointNode, spotNode } from './pins.js';
+import {
+  ContactPins, nearestJointNode, spotNode, STRAIN_COLOR, makeStrainLine, setStrainLine,
+} from './pins.js';
 import { resolveBodyCollision, bodyClearance, bodyContacts } from './collision.js';
 import { Drawings } from './draw.js';
+import { createStudio } from './studio.js';
 import { initUI } from './ui.js';
 
 // ---------------------------------------------------------------- scene
 const container = document.getElementById('viewport');
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+// alpha: the "transparent" backdrop (studio.js) exports PNGs with no background;
+// every other backdrop paints an opaque scene.background, so nothing else changes.
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
@@ -119,6 +126,14 @@ floor.receiveShadow = true;
 scene.add(floor);
 
 // ---------------------------------------------------------------- figures
+// Every asset below has a working fallback, so a failed load never stops the
+// app — but it does hand the user a DIFFERENT app (procedural bones, a plain
+// mannequin, no atlas to label), which used to be announced only to the
+// developer console. Each failure appends its own plain sentence here; main.js
+// surfaces the list once the UI exists (status line + a note in the View
+// panel), in the shape of the Muscles panel's "atlas unavailable" line.
+const degraded = [];
+
 // Imported anatomical skeleton (CC-BY-SA, see public/models/ATTRIBUTION.md).
 // Loaded once and shared; on failure we fall back to the procedural bones.
 let skeletonBones = null;
@@ -126,6 +141,7 @@ try {
   skeletonBones = await loadSkeletonBones(`${import.meta.env.BASE_URL}models/skeleton.glb`);
 } catch (err) {
   console.warn('Skeleton mesh failed to load; using procedural bones.', err);
+  degraded.push('Skeleton atlas unavailable — showing simplified bones.');
 }
 
 // Imported main-mover muscles (same atlas, so they need the skeleton's scale).
@@ -136,27 +152,44 @@ if (skeletonBones) {
     muscleMeshes = await loadMuscleMeshes(`${import.meta.env.BASE_URL}models/muscles.glb`);
   } catch (err) {
     console.warn('Muscle mesh failed to load; using procedural muscles.', err);
+    degraded.push('Muscle atlas unavailable — showing simplified muscle shapes.');
   }
 }
 
 // Imported clothed body avatars (Microsoft Rocketbox, MIT). Loaded per role;
 // on failure that figure falls back to the procedural mannequin body.
-async function tryLoadBody(file) {
+async function tryLoadBody(file, who) {
   try {
     return await loadBodyMesh(`${import.meta.env.BASE_URL}models/${file}`);
   } catch (err) {
     console.warn(`Body avatar ${file} failed to load; using the mannequin body.`, err);
+    degraded.push(`The ${who}'s clothed avatar is unavailable — showing a plain mannequin.`);
     return null;
   }
 }
-const [manBody, womanBody] = await Promise.all([tryLoadBody('man.glb'), tryLoadBody('woman.glb')]);
+const [manBody, womanBody] = await Promise.all([
+  tryLoadBody('man.glb', 'leader'), tryLoadBody('woman.glb', 'follower'),
+]);
 
 // soleScale fits each figure's balance footprint to its OWN rendered shoe (the
 // shared corner tables in skeletonDef.js are sized to the man's): the woman's
-// heeled shoe ends 0.073H ahead of her ankle vs the man's 0.095H, so her
+// heeled shoe tip sits 0.068H ahead of her ankle vs the man's 0.087H, so her
 // forward corners pull in by 0.78.
 const leader = new Figure({ name: 'Leader', height: 1.78, mass: 75, color: 0x4d8fd1, skeleton: skeletonBones, muscles: muscleMeshes, body: manBody, bodyKey: 'man' });
-const follower = new Figure({ name: 'Follower', height: 1.65, mass: 60, color: 0xc95f8e, skin: 0xe0b092, skeleton: skeletonBones, muscles: muscleMeshes, body: womanBody, bodyKey: 'woman', heelRise: 0.012, soleScale: { front: 0.78 } });
+// The woman avatar's shoe ALREADY has a real molded heel (measured ≈2.9 cm ≈
+// 0.0175 H — the shoe's own heel raises her instep that far above the ball, heel
+// and ball both grounded). So she stands on that heel natively (heelRise 0, no
+// fake ankle raise/pitch that floated her en-pointe); `moldedHeel` only pitches
+// the bare skeleton foot up inside the shoe and sizes the skeleton heel wedge.
+// footNarrow squeezes her bare skeletal foot laterally into her narrower shoe:
+// the atlas foot's little-toe/5th-metatarsal edge otherwise pokes ~1 cm past the
+// shoe at the ball (the foot fit matches shoe length/aim but not width). The
+// leader's wider shoe already contains his foot, so he keeps the default 1.
+// Side effect: the intentionally narrower foot widens her toe_tip skeleton-vs-
+// shoe layer gap to ~30 mm at the hardest pose (forward-ocho) — dev-verify-frames
+// REPORTS this (soft, non-gating) but still exits 0; it's the "different sizes"
+// the design deliberately allows, not a regression.
+const follower = new Figure({ name: 'Follower', height: 1.65, mass: 60, color: 0xc95f8e, skin: 0xe0b092, skeleton: skeletonBones, muscles: muscleMeshes, body: womanBody, bodyKey: 'woman', moldedHeel: 0.0175, soleScale: { front: 0.78 }, footNarrow: 0.82 });
 scene.add(leader.group, follower.group);
 
 // Embrace constraints (open-side hand clasp, close-embrace torso contact),
@@ -430,9 +463,7 @@ function groundInterpFeet(figure, fa, fb, t) {
     if (!a.planted || !b.planted) continue;
     _gfPos.copy(a.pos).lerp(b.pos, t);
     _gfQuat.copy(a.quat).slerp(b.quat, t);
-    solveTwoBone(figure, {
-      root: `hip_${side}`, mid: `knee_${side}`, effector: `ankle_${side}`, hingeSign: 1,
-    }, _gfPos);
+    solveTwoBone(figure, legChain(side), _gfPos);
     const ankle = figure.nodes[`ankle_${side}`];
     ankle.parent.getWorldQuaternion(_gfParentQ);
     ankle.quaternion.copy(_gfParentQ.invert().multiply(_gfQuat));
@@ -573,6 +604,13 @@ turnControls.addEventListener('dragging-changed', (e) => {
 });
 turnControls.addEventListener('objectChange', applyFigureTurn);
 
+// Is EITHER gizmo being dragged? Every drag guard must ask this, not
+// `tcontrols.dragging` alone: Move mode attaches both, and a short turn on the
+// yaw ring (under the 6 px click threshold) used to fall through to handleClick
+// — which re-raycasts, misses the dancer, and deselects, so the handle vanished
+// mid-turn.
+const gizmoDragging = () => tcontrols.dragging || turnControls.dragging;
+
 const ikTarget = new THREE.Mesh(
   new THREE.SphereGeometry(0.025, 14, 10),
   new THREE.MeshBasicMaterial({ color: 0xffe08a, transparent: true, opacity: 0.85 }),
@@ -613,6 +651,144 @@ const hipsTarget = new THREE.Mesh(
 );
 hipsTarget.visible = false;
 scene.add(hipsTarget);
+
+// Each handle's resting colour, so the strain amber below can be undone.
+ikTarget.userData.baseColor = ikTarget.material.color.getHex();
+swivelTarget.userData.baseColor = swivelTarget.material.color.getHex();
+caressTarget.children[0].userData.baseColor = caressTarget.children[0].material.color.getHex();
+
+// ----------------------------------------------- out-of-reach drag handles
+// The IK target, the swivel pole and the toe-caress ring all keep following
+// the cursor after the body has stopped following THEM: solveTwoBone clamps
+// the target to the limb's reach, swivelLimb bisects down to the largest
+// feasible roll, and caressToe pulls its goal back toward the hip until the
+// toe can still touch the floor. The handle then sits somewhere the dancer
+// is not, with nothing at all to say so — the caress is the worst of the
+// three, the toe landing up to ~20 cm from the ring.
+//
+// This is the contact-pin strain line generalised (makeStrainLine /
+// setStrainLine in pins.js): the same amber, the same picture — a segment
+// between what was asked for and what anatomy delivered.
+const HANDLE_STRAIN_GAP = 0.02; // 2 cm, matching the pin strain threshold
+const handleStrain = makeStrainLine();
+handleStrain.visible = false;
+scene.add(handleStrain);
+let handleStrained = false;
+
+// The mesh carrying a handle's colour (the caress ring hangs off a holder).
+function handleMesh(handle) {
+  return handle.material ? handle : (handle.children.find((c) => c.material) || null);
+}
+
+function paintHandle(handle, hex) {
+  const mesh = handleMesh(handle);
+  if (mesh) mesh.material.color.setHex(hex ?? mesh.userData.baseColor);
+}
+
+// Amber the handle and draw the gap while `goal` (what the user pointed at)
+// and `reached` (what the body achieved) are more than a couple of cm apart.
+// `lineFrom` defaults to `goal`; the swivel pole passes the handle instead,
+// because its goal is a point on the elbow's circle (the fair comparison)
+// while the thing the user is holding is the handle.
+// The status message fires on the TRANSITION into strain only — this runs on
+// every pointermove of a drag, and a per-frame message would strobe.
+function showHandleStrain(handle, goal, reached, message, lineFrom = goal) {
+  const strained = goal.distanceTo(reached) > HANDLE_STRAIN_GAP;
+  if (strained) {
+    setStrainLine(handleStrain, lineFrom, reached);
+    paintHandle(handle, STRAIN_COLOR);
+    if (!handleStrained) app.status(message, 'limit');
+  } else {
+    paintHandle(handle, null);
+  }
+  handleStrain.visible = strained;
+  handleStrained = strained;
+  requestRender(); // the line/tint are scene changes; the loop may be idling
+}
+
+// Scratch for the comparisons above (they run on every pointermove).
+const _strainA = new THREE.Vector3();
+const _strainB = new THREE.Vector3();
+
+// ------------------------------------------------------- the hips' two limits
+// Both of these clamps are deliberate and correct (see moveHips / pivotHips);
+// what was missing is that the handle just stopped moving and never said why.
+// Each function already returns the amount it actually applied, so "requested
+// vs applied" is the whole test.
+
+// A rise stops where the most-lifted planted foot can no longer hold the floor
+// even at a full relevé. moveHips names that foot in app.hipsRiseLimit.
+function reportHipsRise(wanted, applied) {
+  if (!(wanted > 0) || wanted - applied < 0.001) return;
+  const foot = app.hipsRiseLimit === 'L' ? 'left' : app.hipsRiseLimit === 'R' ? 'right' : null;
+  app.status(foot
+    ? `Planted ${foot} foot is at full relevé — the hips can't rise further`
+    : "The hips are as high as this stance goes — they can't rise further", 'limit');
+}
+
+// The trunk's counter-twist range in the direction the pelvis is turning, and
+// how much of it the spine has already spent — read from the SAME chest/spine
+// y limits pivotHips derives its clamp from (skeletonDef.js), so the quoted
+// number can never drift from the behaviour.
+function trunkTwistBudget(figure, dYaw) {
+  let total = 0;
+  let room = 0;
+  for (const name of ['chest', 'spine']) {
+    const [lo, hi] = JOINT_BY_NAME[name].limits.y;
+    const cur = figure.nodes[name].rotation.y / DEG;
+    total += dYaw > 0 ? -lo : hi; // the trunk counter-yaws AGAINST the pelvis
+    room += Math.max(0, dYaw > 0 ? cur - lo : hi - cur);
+  }
+  return { total, spent: Math.max(0, total - room) };
+}
+
+// A hips twist stops when the SPINE, not the hips, has run out: turning
+// further would saturate the chest and start carrying the shoulders round —
+// the one thing the ocho dissociation is defined by not doing.
+function reportHipsTwist(figure, wanted, applied) {
+  if (Math.abs(wanted) - Math.abs(applied) < 1e-4) return;
+  const { total, spent } = trunkTwistBudget(figure, wanted);
+  app.status(`Trunk twist spent (${Math.round(spent)}° of ${Math.round(total)}°) — the shoulders would start to follow`, 'limit');
+}
+
+// Drop the strain visuals (a handle was released, or a new one picked up).
+function clearHandleStrain() {
+  handleStrain.visible = false;
+  handleStrained = false;
+  for (const h of [ikTarget, swivelTarget, caressTarget]) paintHandle(h, null);
+}
+
+// The big-toe pad — the point caressToe pins to the floor — in the toes
+// joint's own frame (`toeCorners` holds it as fractions of stature).
+function toePadLocal(figure, side, out = new THREE.Vector3()) {
+  const tc = figure.toeCorners[`_${side}`];
+  return out.set(
+    (tc[0][0] + tc[1][0]) / 2, (tc[0][1] + tc[1][1]) / 2, (tc[0][2] + tc[1][2]) / 2,
+  ).multiplyScalar(figure.height);
+}
+
+function toePadWorld(figure, side, out = new THREE.Vector3()) {
+  return figure.nodes[`toes_${side}`].localToWorld(toePadLocal(figure, side, out));
+}
+
+// Where on the elbow/knee's circle the pole handle is asking it to sit.
+// swivelLimb can only roll the limb about the root→effector axis, so the
+// handle's distance from that axis carries no information — projecting it
+// onto the circle is what makes "did the swivel get there?" a fair question.
+function swivelGoalPoint(figure, chain, handlePos, out = new THREE.Vector3()) {
+  const R = figure.nodes[chain.root].getWorldPosition(new THREE.Vector3());
+  const M = figure.nodes[chain.mid].getWorldPosition(new THREE.Vector3());
+  const E = figure.nodes[chain.effector].getWorldPosition(new THREE.Vector3());
+  const axis = E.sub(R);
+  if (axis.lengthSq() < 1e-10) return out.copy(M); // limb folded flat: no axis
+  axis.normalize();
+  const center = R.clone().addScaledVector(axis, M.clone().sub(R).dot(axis));
+  const radius = M.distanceTo(center);
+  const rel = handlePos.clone().sub(center);
+  rel.addScaledVector(axis, -rel.dot(axis));
+  if (rel.lengthSq() < 1e-10) return out.copy(M); // handle on the axis: no direction
+  return out.copy(center).addScaledVector(rel.normalize(), radius);
+}
 
 // The two-bone chain whose middle joint is `jointName` (elbow/knee), or null.
 function swivelChainFor(jointName) {
@@ -742,7 +918,7 @@ function rotateAbout(figure, point, dYaw) {
 // mid-flight); iterated because re-solving the leg tips the shank, which
 // moves the sole.
 function plantFoot(figure, side, target, pitchDeg = 0, ground = true) {
-  const chain = { root: `hip_${side}`, mid: `knee_${side}`, effector: `ankle_${side}`, hingeSign: 1 };
+  const chain = legChain(side);
   const t = target.clone();
   let pitch = pitchDeg;
   if (pitch) {
@@ -791,7 +967,7 @@ function plantFoot(figure, side, target, pitchDeg = 0, ground = true) {
 // never lift the body — clampToFloor reacts only to penetration.
 function caressToe(figure, side, pt) {
   const H = figure.height;
-  const chain = { root: `hip_${side}`, mid: `knee_${side}`, effector: `ankle_${side}`, hingeSign: 1 };
+  const chain = legChain(side);
   const ankleNode = figure.nodes[`ankle_${side}`];
   const toesNode = figure.nodes[`toes_${side}`];
   figure.nodes[`toes_${side}`].rotation.set(0, 0, 0); // pads stay in the sole plane
@@ -799,10 +975,7 @@ function caressToe(figure, side, pt) {
 
   // The contact point: this figure's toe-pad center (midpoint of its fitted
   // toe corners), in the toes joint's frame.
-  const tc = figure.toeCorners[`_${side}`];
-  const pad = new THREE.Vector3(
-    (tc[0][0] + tc[1][0]) / 2, (tc[0][1] + tc[1][1]) / 2, (tc[0][2] + tc[1][2]) / 2,
-  ).multiplyScalar(H);
+  const pad = toePadLocal(figure, side);
 
   // Clamp the target inside the leg's reach (leg long + foot pointed) so the
   // solve converges with the toe ON the floor instead of hovering toward an
@@ -898,7 +1071,7 @@ const _hipsQ = new THREE.Quaternion();
 // positive once even a full relevé can't reach — the signal to stop rising.
 function groundPlantedLeg(figure, keep) {
   const { side, pos, quat, low0 } = keep;
-  const chain = { root: `hip_${side}`, mid: `knee_${side}`, effector: `ankle_${side}`, hingeSign: 1 };
+  const chain = legChain(side);
   solveTwoBone(figure, chain, pos);
   const ankle = figure.nodes[`ankle_${side}`];
   // Restore the flat sole orientation captured with the spot (solveTwoBone's
@@ -943,7 +1116,7 @@ function beginStep(figure, dir, strideM = null, forceSwing = null) {
   const fwd = figureForward(figure);
   const lat = new THREE.Vector3().crossVectors(fwd, _UP).normalize();
   const travel = fwd.clone().multiplyScalar(dir);
-  const ankleRestY = 0.039 * H;
+  const ankleRestY = ANKLE_REST_FRAC * H;
   // A linked partner steps the INITIATOR's stride (see stepFigure): two
   // different strides walk the couple apart a few cm per step until they
   // rest foot-against-foot — a follower really does match the leader's
@@ -1067,6 +1240,116 @@ function takeStep(figure, dir) {
   finalizeStep(figure, beginStep(figure, dir));
 }
 
+// ---------------------------------------------------------- on-demand render
+// The scene is static between interactions, so `animate()` does NOT run the
+// per-frame constraint/analysis pass — or even redraw — continuously; it stays
+// awake only for a short window after something changes, then idles (freeing a
+// CPU core and letting the GPU sleep through a long class). Two wake levels:
+//   requestSim()    — the POSE or a constraint may have changed: run the full
+//                     solve pass AND redraw. The window is generous so the
+//                     per-frame embrace/collision/pin solvers have time to
+//                     converge after the change.
+//   requestRender() — only the VIEW changed (camera orbit, hover glow, a
+//                     selection highlight): redraw, but don't waste a re-solve.
+// When in doubt, requestSim (it is a strict superset). Every pose-mutating path
+// pokes it: markEdit directly, DOM input events, and a wrapper over the whole
+// `app` API (added just before animate()) so the programmatic surface — the UI
+// and the headless verification scripts — never has to remember to poke.
+const WAKE_FRAMES = 45; // ~0.75s at 60fps: long enough for the solvers to settle
+let simFrames = WAKE_FRAMES; // full solve passes still owed
+let renderFrames = WAKE_FRAMES; // redraws still owed (a superset of simFrames)
+function requestSim(n = WAKE_FRAMES) {
+  if (n > simFrames) simFrames = n;
+  if (n > renderFrames) renderFrames = n;
+}
+function requestRender(n = WAKE_FRAMES) {
+  if (n > renderFrames) renderFrames = n;
+}
+
+// ------------------------------------------------------------- status line
+// The app's one non-modal notice region (#status-line in index.html): why a
+// constraint just refused — a joint at its limit, a drag handle the body
+// cannot reach, a save that failed. It is DOM chrome, so it is structurally
+// incapable of reaching an export: studio.photoDataURL / startRecorder
+// composite the GL canvas with the overlay canvas and never read the page.
+//
+// This fires from inside drags, i.e. potentially every pointermove, so the
+// repeat path must be free: an identical (text, kind) only pushes the expiry
+// out and touches NO DOM. The timer is a single self-rescheduling timeout
+// rather than a clear/set per call.
+const STATUS_MS = 3000;
+// A message carrying an action (the Undo offered after a single-item delete)
+// stays up longer — it is something to click, not merely to read.
+const STATUS_ACTION_MS = 6000;
+const statusEl = document.getElementById('status-line');
+let statusMsg = '';
+let statusKind = '';
+let statusUntil = 0;
+let statusTimer = null;
+let onStatusClear = null; // set by the joint-limit flash so the amber fades with the words
+// The joint currently wearing the "anatomy says no" amber, and its fade timer.
+// Declared here (rather than beside the flash logic further down, next to
+// styleSphere) so no early caller — deselect, a preset — can hit the TDZ.
+let limitHit = null; // { figure, jointName }
+let limitTimer = null;
+
+// `action` is an optional { label, run } — one button appended after the words.
+// textContent first (the text may quote a user-typed pose name), then the
+// button, so nothing here can ever become markup.
+function paintStatus(msg, kind, action = null) {
+  if (!statusEl) return;
+  statusEl.textContent = msg;
+  statusEl.className = msg ? `status-${kind}` : '';
+  statusEl.hidden = !msg;
+  if (!msg || !action) return;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = action.label;
+  btn.addEventListener('click', () => {
+    setStatus('');
+    action.run();
+  });
+  statusEl.appendChild(btn);
+}
+
+function statusTick() {
+  const left = statusUntil - performance.now();
+  if (left > 10) { statusTimer = setTimeout(statusTick, left); return; }
+  statusTimer = null;
+  statusMsg = '';
+  statusKind = '';
+  paintStatus('', '');
+  const done = onStatusClear;
+  onStatusClear = null;
+  if (done) done();
+}
+
+// kind: 'info' | 'limit' (anatomy refused) | 'error' (the action failed).
+// `action` (optional): { label, run } — one clickable affordance, e.g. the Undo
+// offered after deleting a keyframe, which the pose-only undo stack cannot
+// recover. A message with an action always repaints (the button is new every
+// time) and never takes the coalescing shortcut.
+function setStatus(text, kind = 'info', action = null) {
+  const msg = text == null ? '' : String(text);
+  if (!msg) {
+    statusUntil = 0;
+    if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; }
+    statusMsg = '';
+    statusKind = '';
+    paintStatus('', '');
+    return;
+  }
+  const ms = action ? STATUS_ACTION_MS : STATUS_MS;
+  statusUntil = performance.now() + ms;
+  // Burst of the same plain message: no DOM work.
+  if (!action && msg === statusMsg && kind === statusKind) return;
+  statusMsg = msg;
+  statusKind = kind;
+  paintStatus(msg, kind, action);
+  if (statusTimer !== null) clearTimeout(statusTimer);
+  statusTimer = setTimeout(statusTick, ms);
+}
+
 const app = {
   scene, camera, renderer, orbit,
   leader, follower,
@@ -1080,6 +1363,13 @@ const app = {
   bodyContacts: (n = 5) => bodyContacts(leader, follower).slice(0, n),
   figures: [leader, follower],
   presets: PRESETS,
+  // Plain sentences naming every asset that failed to load (empty on a healthy
+  // session). Read once by initUI for the View panel's note; main.js also flashes
+  // it through the status line right after the UI comes up.
+  degraded,
+  // Whether this browser can record at all. An enabled ⏺ that console.warns and
+  // returns false is worse than a disabled one.
+  canRecord: typeof MediaRecorder !== 'undefined',
   mode: 'rotate',
   chainMode: 'open', // 'open' (move distal) | 'closed' (anchor foot, move proximal)
   drawTool: 'line', // Draw-mode sub-tool: 'line' | 'arrow' | 'circle' | 'text'
@@ -1171,6 +1461,7 @@ const app = {
     this.pinPending = null; // a half-authored pin dies with its mode
     pinPendingMarker.visible = false;
     this.cancelDraw();      // …and so does a half-drawn annotation
+    studio.hover = null;    // …and the Label mode's cursor preview
     this.deselect();
     // Move hips needs no click: the handle appears right away on the
     // last-touched (else the first visible) dancer; clicking the other
@@ -1229,6 +1520,41 @@ const app = {
     this.pinPending = null;
     pinPendingMarker.visible = false;
     if (this.ui) this.ui.onPinsChanged();
+  },
+
+  // Drop a half-authored pin without releasing the finished ones. Escape and
+  // the Pin-spots mode change both route here (see cancelPending).
+  cancelPinPending() {
+    if (!this.pinPending) return false;
+    this.pinPending = null;
+    pinPendingMarker.visible = false;
+    if (this.ui) this.ui.onPinsChanged();
+    return true;
+  },
+
+  // Escape, and the one place that decides what Escape means. Precedence runs
+  // from the most transient thing on screen to the least: a half-drawn floor
+  // shape, then a half-authored pin, then the selection (with its gizmo). Each
+  // step says what it just abandoned — an Escape that silently does nothing
+  // reads as an Escape that is not wired up. Move-hips is exempt from the
+  // deselect step because its handle is seated automatically with no click, so
+  // dismissing it would leave the mode with nothing to drag.
+  cancelPending() {
+    if (this.drawPending) {
+      this.cancelDraw();
+      this.status('Drawing cancelled.', 'info');
+      return 'draw';
+    }
+    if (this.cancelPinPending()) {
+      this.status('Pin cancelled — the first spot was released.', 'info');
+      return 'pin';
+    }
+    if (this.selected || this.ikState || this.swivelState || this.caressState) {
+      this.deselect();
+      this.status('Selection cleared.', 'info');
+      return 'selection';
+    }
+    return null;
   },
 
   // ------------------------------------------------------------ floor drawings
@@ -1376,11 +1702,23 @@ const app = {
     // Pose the pelvis at height `cand` and re-solve every planted leg to hold
     // its foot down; report how far the most-lifted planted foot ends up above
     // its floor spot (0 while grounded).
+    // WHICH planted foot ran out of leg — the exact reason a rise stops, which
+    // the solve itself only needs as a magnitude and used to discard entirely.
+    // It LATCHES across the back-off below: once the height has been wound back
+    // the foot is grounded again, so reading it at the end would always say
+    // "nobody". Null means the pelvis stopped at the crouch range's own ceiling
+    // rather than at a leg's limit. applyHandleChange names it in the status line.
+    let riseLimitSide = null;
     const solveLegsAt = (cand) => {
       figure.nodes.pelvis.position.y = cand;
       figure.group.updateMatrixWorld(true);
       let lift = 0;
-      for (const k of keep) lift = Math.max(lift, groundPlantedLeg(figure, k));
+      let worst = null;
+      for (const k of keep) {
+        const l = groundPlantedLeg(figure, k);
+        if (l > lift) { lift = l; worst = k.side; }
+      }
+      if (lift > GROUND_TOL && worst) riseLimitSide = worst;
       return lift;
     };
 
@@ -1396,10 +1734,15 @@ const app = {
     }
 
     const dy = figure.nodes.pelvis.position.y - py0;
+    this.hipsRiseLimit = riseLimitSide;
     figure.syncAtlasNodes();
     figure.group.updateMatrixWorld(true);
     return dy;
   },
+
+  // The planted foot that stopped the last Move-hips rise ('L' | 'R' | null) —
+  // set by moveHips, read by reportHipsRise.
+  hipsRiseLimit: null,
 
   // Which handle the Move-hips gizmo offers: 'slide' translates the pelvis,
   // 'twist' turns it under a still chest (see pivotHips).
@@ -1498,10 +1841,22 @@ const app = {
     this.embrace.setClaspHeight(frac);
   },
 
-  // Highlight body parts (Set of BODY_PARTS ids, empty/null clears).
-  setHighlight(parts) {
+  // Highlight body parts (Set of BODY_PARTS ids, empty/null clears). Each part
+  // lights in its own colour — its BODY_PARTS default unless recoloured here.
+  setHighlight(parts, colors = this.highlightColors ?? null) {
     this.highlightParts = parts;
-    for (const f of this.figures) f.setHighlight(parts);
+    this.highlightColors = colors;
+    for (const f of this.figures) f.setHighlight(parts, colors);
+  },
+
+  // Recolour one highlighted body part; `hex` null restores its default.
+  setHighlightColor(partId, hex) {
+    const colors = new Map(this.highlightColors ?? []);
+    if (hex) colors.set(partId, hex); else colors.delete(partId);
+    this.setHighlight(this.highlightParts, colors);
+  },
+  highlightColor(partId) {
+    return this.highlightColors?.get(partId) ?? PART_COLOR[partId] ?? null;
   },
 
   // Muscles panel: hide (make transparent) / highlight (recolour) individual
@@ -1663,6 +2018,7 @@ const app = {
   markEdit(figure) {
     if (figure) this.lastEditedFigure = figure;
     this.editStamp = performance.now();
+    requestSim(); // a pose just changed — wake the solve/redraw loop
   },
 
   // Edit a joint honouring the current chain mode. `mutate` changes rotations.
@@ -1671,19 +2027,39 @@ const app = {
     this.markEdit(figure);
     const useClosed = this.chainMode === 'closed' && CHAIN_JOINTS.has(jointName);
     const anchor = useClosed ? this.anchorNode(figure, jointName) : null;
+    // How far the anatomical limits pulled the edit back (0 = it was legal):
+    // a DIRECT user edit, so it is reported — amber joint + status line.
+    let clamped = 0;
     if (anchor) {
-      editWithAnchor(figure, anchor, () => { mutate(); figure.clampJoint(jointName); });
+      editWithAnchor(figure, anchor, () => { mutate(); clamped = figure.clampJoint(jointName); });
     } else {
       mutate();
-      figure.clampJoint(jointName);
+      clamped = figure.clampJoint(jointName);
     }
+    reportJointClamp(figure, jointName, clamped);
     // Re-slave the skeletal limb bones (and their muscles) to the edited joints
     // so they pivot about the anatomical joints, then refresh world matrices.
     figure.syncAtlasNodes();
     figure.group.updateMatrixWorld(true);
   },
 
-  // Standard teaching camera angles.
+  // Where the shown dancers are standing, on the floor plane: the mean of their
+  // group origins. Nothing pins a dancer near the world origin — slideFigure,
+  // stepFigure, turnFigure and the Move gizmo all translate group.position
+  // without bound — so this, not (0,0,0), is what a camera should look at.
+  sceneCenter(out = new THREE.Vector3()) {
+    const figs = this.visibleFigures();
+    out.set(0, 0, 0);
+    if (!figs.length) return out;
+    for (const f of figs) out.add(f.group.position);
+    return out.multiplyScalar(1 / figs.length).setY(0);
+  },
+
+  // Standard teaching camera angles — AIMED AT THE DANCERS, not at the world
+  // origin. The offsets are unchanged (same distance and elevation as before);
+  // only what they are measured from moved. Walk a couple across the floor and
+  // an origin-locked preset used to snap to empty wood with the dancers out of
+  // shot, recoverable only by right-drag panning.
   setView(name) {
     const views = {
       front: [0, 1.35, 3.4],
@@ -1693,8 +2069,38 @@ const app = {
     };
     const p = views[name];
     if (!p) return;
-    camera.position.set(...p);
-    orbit.target.set(0, name === 'top' ? 0 : 1.05, 0);
+    const c = this.sceneCenter();
+    camera.position.set(c.x + p[0], p[1], c.z + p[2]);
+    orbit.target.set(c.x, name === 'top' ? 0 : 1.05, c.z);
+    // Re-aim now rather than on the next animation frame, so the camera is
+    // consistent the instant this returns (frameDancers does the same through
+    // studio.fitPoints). The loop's own orbit.update() is idempotent after it.
+    orbit.update();
+  },
+
+  // Fit the shown dancers to the frame from the direction you are already
+  // looking — the "frame this dancer" control the view presets never were.
+  // Shares studio.fitPoints with the movement clips' auto-frame, so there is one
+  // fitter in the app rather than two that can disagree.
+  frameDancers() {
+    const figs = this.visibleFigures();
+    if (!figs.length) {
+      this.status('No dancer is shown to frame.', 'info');
+      return false;
+    }
+    const pts = [];
+    for (const f of figs) {
+      f.group.updateMatrixWorld(true);
+      for (const node of Object.values(f.nodes)) pts.push(node.getWorldPosition(new THREE.Vector3()));
+    }
+    // Keep the viewing DIRECTION; only the aim and the distance change.
+    const dir = camera.position.clone().sub(orbit.target);
+    if (dir.lengthSq() < 1e-8) dir.set(1.9, 1.5, 2.7);
+    dir.normalize();
+    // pad is flesh around the joint centres; the fills leave a margin so the
+    // dancers don't touch the frame edge.
+    studio.fitPoints(pts, dir, { pad: 0.09 * figs[0].height, fillX: 0.82, fillY: 0.86 });
+    return true;
   },
 
   // Show 'both' | 'leader' | 'follower'.
@@ -1717,6 +2123,9 @@ const app = {
   },
 
   deselect() {
+    // Drop any "anatomy says no" feedback with the thing it was about.
+    clearJointLimit();
+    clearHandleStrain();
     if (this.selected) {
       const s = this.selected.figure.jointSphereByName[this.selected.jointName];
       if (s) s.material.emissive.set(0x000000);
@@ -1815,11 +2224,7 @@ const app = {
     if (sphere) sphere.material.emissive.set(0x3b6ea5);
     this.caressState = { figure, side };
     figure.group.updateMatrixWorld(true);
-    const tc = figure.toeCorners[`_${side}`];
-    const pad = new THREE.Vector3(
-      (tc[0][0] + tc[1][0]) / 2, (tc[0][1] + tc[1][1]) / 2, (tc[0][2] + tc[1][2]) / 2,
-    ).multiplyScalar(figure.height);
-    figure.nodes[`toes_${side}`].localToWorld(pad);
+    const pad = toePadWorld(figure, side);
     caressTarget.position.set(pad.x, 0, pad.z);
     caressTarget.visible = true;
     tcontrols.setMode('translate');
@@ -1836,17 +2241,10 @@ const app = {
     figure.group.updateMatrixWorld(true);
   },
 
-  // PNG snapshot of the current 3D view, gizmos and drag handles hidden.
-  photoDataURL() {
-    const hidden = [];
-    for (const o of [tcontrols, turnControls, ikTarget, swivelTarget, caressTarget, hipsTarget,
-      pins.group, pinPendingMarker]) {
-      if (o.visible) { hidden.push(o); o.visible = false; }
-    }
-    renderer.render(scene, camera);
-    const url = renderer.domElement.toDataURL('image/png');
-    for (const o of hidden) o.visible = true;
-    return url;
+  // PNG snapshot of the current 3D view WITH its labels/overlays, gizmos and
+  // drag handles hidden (studio.js composites the GL canvas and the overlay).
+  photoDataURL(scale) {
+    return studio.photoDataURL(scale);
   },
 
   // Download the snapshot as tangle-<timestamp>.png (the 📷 Photo button).
@@ -1901,6 +2299,7 @@ const app = {
   applyPreset(index) {
     const preset = PRESETS[index];
     if (!preset) return;
+    if (studio.clipActive) studio.exitClip(); // a preset is for the couple, not the clip stage
     this.pushHistory();
     this.deselect();
     // A preset places both dancers outright, so no one is mid-edit any more:
@@ -1997,9 +2396,21 @@ const app = {
     this.onSeqChanged();
   },
 
+  // A keyframe is not pose state, so the undo stack (couple poses only) cannot
+  // bring it back — Ctrl+Z after this would restore the POSE and leave the
+  // keyframe gone. The recovery is therefore offered where the loss happened,
+  // as a clickable Undo on the status line.
   seqDelete(i) {
-    this.seqStates.splice(i, 1);
+    const [removed] = this.seqStates.splice(i, 1);
     this.onSeqChanged();
+    if (!removed) return;
+    this.status(`Keyframe ${i + 1} deleted.`, 'info', {
+      label: 'Undo',
+      run: () => {
+        this.seqStates.splice(Math.min(i, this.seqStates.length), 0, removed);
+        this.onSeqChanged();
+      },
+    });
   },
 
   // Swap keyframe i with its neighbour at i + di (di = ±1).
@@ -2046,34 +2457,40 @@ const app = {
   // `states` is any couple-state chain ([A, B] or the sequence). Returns false
   // if a capture is already running or the chain can't play.
   recordPlayback(states, name = 'tangle-movement') {
-    if (this.recording || !states || states.length < 2) return false;
-    if (typeof MediaRecorder === 'undefined' || !renderer.domElement.captureStream) {
-      console.warn('MediaRecorder is not available in this browser.');
-      return false;
-    }
+    if (this.recording || studio.recorder || !states || states.length < 2) return false;
     this.deselect(); // also hides every gizmo/handle
     this.interpPlaying = false;
     this.seqPlaying = false;
-    const stream = renderer.domElement.captureStream(60);
-    const mime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']
-      .find((m) => MediaRecorder.isTypeSupported(m));
-    const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
-    const chunks = [];
-    rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
-    rec.onstop = () => {
-      const blob = new Blob(chunks, { type: 'video/webm' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = `${name}.webm`;
-      a.click();
-      URL.revokeObjectURL(a.href);
-      this.recording = null;
-      if (this.ui) this.ui.onRecordingChanged();
-    };
+    if (!this.canRecord) {
+      this.status('This browser has no video recorder (MediaRecorder) — use 📷 Save photo instead.', 'error');
+      return false;
+    }
     applyStatesT(states, 0); // first frames show the start pose, not the editor state
-    this.recording = { states, t: 0, secs: SEQ_SEG_SECONDS * (states.length - 1), rec };
-    rec.start();
+    // The shared recorder captures GL + the label overlay, as MP4 by default
+    // (studio.videoFormat) — PowerPoint will not play a .webm. The job is held
+    // on its first frame (rec: null) until the H.264 encoder is awake; see
+    // warmUpMp4 in studio.js for why an unwarmed recording is an empty file.
+    // `arming` is that wait made visible: the H.264 encoder can take ~5.5 s to
+    // wake on the first recording of a page, and the button used to read
+    // "⏺ Recording…" throughout while capturing nothing. The clip recorder
+    // already showed "⏺ Preparing…" here; this mirrors it.
+    const job = { states, t: 0, secs: SEQ_SEG_SECONDS * (states.length - 1), rec: null, arming: true };
+    this.recording = job;
     if (this.ui) this.ui.onRecordingChanged();
+    studio.whenEncoderReady().then(() => {
+      if (this.recording !== job) return;
+      job.arming = false;
+      if (this.ui) this.ui.onRecordingChanged();
+      job.rec = studio.startRecorder(name, ({ retry }) => {
+        this.recording = null;
+        if (this.ui) this.ui.onRecordingChanged();
+        if (retry) this.recordPlayback(states, name); // MP4 unavailable here → WebM
+      });
+      if (!job.rec) {
+        this.recording = null;
+        if (this.ui) this.ui.onRecordingChanged();
+      }
+    });
     return true;
   },
 
@@ -2093,6 +2510,94 @@ const app = {
     this.ghosts[which] = figs;
   },
 };
+
+// Escape hatches for anything that changes the scene outside the wrapped API
+// (e.g. a future direct scene mutation): app.requestSim() to re-solve + redraw,
+// app.requestRender() for a view-only redraw.
+app.requestSim = requestSim;
+app.requestRender = requestRender;
+// Non-modal user feedback; see setStatus. Skipped by the render wrapper below
+// (it changes no scene state, and it is called from inside drags).
+app.status = setStatus;
+
+// ------------------------------------------------------ presentation studio
+// Labels, backdrop, the 16:9 slide frame, photo/video export and the movement
+// clips all live in studio.js; this is its seam into the scene. Everything the
+// UI or a script drives goes through an app.* method so the render wrapper at
+// the bottom of this file pokes the loop after each call.
+function hideGizmos() {
+  const hidden = [];
+  // The pick spheres are click targets, not anatomy: faint blobs on every joint
+  // in skeleton view, so they stay out of exported pictures with the gizmos.
+  for (const o of [tcontrols, turnControls, ikTarget, swivelTarget, caressTarget, hipsTarget,
+    handleStrain, pins.group, pinPendingMarker, ...leader.pickSpheres, ...follower.pickSpheres]) {
+    if (o.visible) { hidden.push(o); o.visible = false; }
+  }
+  return () => { for (const o of hidden) o.visible = true; };
+}
+
+let clipDissoc = null; // the figure a clip wants the dissociation wedge drawn for
+const studio = createStudio({
+  renderer, scene, camera, orbit, floor, container, app,
+  hooks: {
+    hideGizmos,
+    setDissoc(figure) { clipDissoc = figure; applyVizVisibility(); },
+  },
+});
+app.studio = studio;
+app.labels = studio.labels;
+app.labelFilter = 'auto'; // Label-mode sub-tool: 'auto' | 'bone' | 'muscle' | 'joint'
+
+const LABELS_KEY = 'tangoPoseStudio.labels.v1';
+try { studio.labels.fromJSON(JSON.parse(localStorage.getItem(LABELS_KEY) || '[]')); } catch { /* stale store */ }
+studio.labels.onChange = () => {
+  try { localStorage.setItem(LABELS_KEY, JSON.stringify(studio.labels.toJSON())); } catch { /* private mode */ }
+  if (app.ui) app.ui.onLabelsChanged();
+  requestRender();
+};
+
+Object.assign(app, {
+  setBackdrop(name) { studio.setBackdrop(name); },
+  setFrame(frame) { studio.setFrame(frame); },
+  setPhotoScale(n) { studio.photoScale = n; },
+  setVideoFormat(f) { studio.videoFormat = f; },
+
+  // ------------------------------------------------------------------ labels
+  setLabelFilter(f) { this.labelFilter = f; },
+  // Scriptable labelling: kind 'joint' (name = joint), 'muscle' (atlas label,
+  // e.g. 'Rectus femoris') or 'bone' (readable or atlas name, e.g. 'Femur').
+  addLabel(figure, kind, name, side = null, text = undefined) {
+    return studio.labels.addByName(figure, kind, name, side, { text, camera });
+  },
+  removeLabel(id) { return studio.labels.remove(id); },
+  clearLabels() { studio.labels.clear(); },
+  setLabelText(id, text) { studio.labels.setText(id, text); studio.labels.onChange(); },
+  flipLabel(id) {
+    const at = studio.lastLayout?.find((p) => p.label.id === id);
+    studio.labels.flip(id, at?.side ?? 'left');
+  },
+  setLabelSize(frac) { studio.labels.size = frac; },
+  setLabelsVisible(on) { studio.labels.visible = !!on; },
+  // How much anatomy a NEW label names: 'simple' (one everyday name per body
+  // part — "Foot", "Hip") or 'full' (every bone and muscle, anatomically).
+  setLabelDetail(detail) { studio.labels.setDetail(detail); },
+  // Name everything the current highlight picks out (see Labels.labelHighlighted).
+  labelHighlighted(figure = this.visibleFigures()[0]) {
+    return figure ? studio.labels.labelHighlighted(figure, camera) : 0;
+  },
+
+  // ---------------------------------------------------------- movement clips
+  enterClip(moveId, opts) { return studio.enterClip(moveId, opts); },
+  exitClip() { studio.exitClip(); },
+  playClip(on = true) { studio.playClip(on); },
+  scrubClip(p) { studio.scrubClip(p); },
+  recordClip() { return studio.recordClip(); },
+  setClipOptions(patch) {
+    const pattern = studio.clipOptions.pattern;
+    Object.assign(studio.clipOptions, patch);
+    studio.refreshClip(pattern !== studio.clipOptions.pattern);
+  },
+});
 
 // Muscle catalog for the Muscles panel: unique bellies (deduped by label, each
 // tagged with its region node), or empty when the muscle atlas failed to load.
@@ -2159,17 +2664,44 @@ function applyHandleChange() {
   if (app.ikState) {
     // Keep the IK target where the limb can reach without going underground.
     const H = app.ikState.figure.height;
-    const minY = app.ikState.chain.effector.startsWith('ankle') ? 0.039 * H : 0.115 * H;
+    const minY = app.ikState.chain.effector.startsWith('ankle') ? ANKLE_REST_FRAC * H : 0.115 * H;
     if (ikTarget.position.y < minY) ikTarget.position.y = minY;
-    solveTwoBone(app.ikState.figure, app.ikState.chain, ikTarget.position);
+    const { figure, chain } = app.ikState;
+    solveTwoBone(figure, chain, ikTarget.position);
+    // solveTwoBone clamps the target distance into [|a−b|, a+b] and then
+    // clamps both joints: past the limb's reach the handle keeps travelling
+    // and the hand stops dead. Say so instead of letting it look broken.
+    // Measured on the RIG effector deliberately — that is the node the handle
+    // was seeded from and the node the IK drives, so the two are the same
+    // frame. (Mesh truth is the right frame for a GOAL about the visible hand;
+    // this is a question about the handle and the thing it moves.)
+    showHandleStrain(ikTarget, ikTarget.position,
+      figure.nodes[chain.effector].getWorldPosition(_strainA),
+      `${JOINT_TITLES[chain.effector] || chain.effector} can't reach there — the limb is at full stretch or its limit`);
   } else if (app.swivelState) {
     // The pole handle stays where dragged; the elbow swivels to aim at it.
-    swivelLimb(app.swivelState.figure, app.swivelState.chain, swivelTarget.position);
+    const { figure, chain } = app.swivelState;
+    swivelLimb(figure, chain, swivelTarget.position);
+    // swivelLimb bisects for the largest roll the ROOT's limits allow, so an
+    // infeasible pole direction simply stops turning the elbow. Measure against
+    // the circle the elbow actually travels on (swivelGoalPoint), but draw the
+    // line to the handle, which is the thing the user is holding.
+    swivelGoalPoint(figure, chain, swivelTarget.position, _strainB);
+    showHandleStrain(swivelTarget, _strainB, figure.nodes[chain.mid].getWorldPosition(_strainA),
+      `${JOINT_TITLES[chain.mid] || chain.mid} can't swivel further — ${JOINT_TITLES[chain.root] || chain.root} is at its limit`,
+      swivelTarget.position);
     if (app.ui) app.ui.refreshJointValues();
   } else if (app.caressState) {
     // The ring stays on the floor; the leg re-solves so the toe pad rests on it.
     caressTarget.position.y = 0;
-    caressToe(app.caressState.figure, app.caressState.side, caressTarget.position);
+    const { figure, side } = app.caressState;
+    caressToe(figure, side, caressTarget.position);
+    // When joint limits stop the toe reaching the floor at the ring, caressToe
+    // bisects the goal back toward the hip and leaves the toe grounded short of
+    // it — up to ~20 cm short, with the ring still under the cursor. The most
+    // confusing of the three handles, and now the most explicit.
+    showHandleStrain(caressTarget, caressTarget.position, toePadWorld(figure, side, _strainA),
+      `${side === 'L' ? 'Left' : 'Right'} toe can't reach there — it stays on the floor at the leg's limit`);
     if (app.ui) app.ui.refreshJointValues();
   } else if (app.hipsState && tcontrols.object === hipsTarget) {
     const { figure, last } = app.hipsState;
@@ -2177,7 +2709,9 @@ function applyHandleChange() {
       // Hips twist: the ring's delta yaws the pelvis under a still chest. The
       // trunk's counter-twist range clamps it, so wind the handle back to what
       // was actually applied or the ring runs away from the body.
-      const applied = app.pivotHips(figure, hipsTarget.rotation.y - app.hipsState.lastYaw);
+      const want = hipsTarget.rotation.y - app.hipsState.lastYaw;
+      const applied = app.pivotHips(figure, want);
+      reportHipsTwist(figure, want, applied);
       app.hipsState.lastYaw += applied;
       hipsTarget.rotation.y = app.hipsState.lastYaw;
     } else {
@@ -2186,6 +2720,7 @@ function applyHandleChange() {
       // so a clamped drag can't accumulate.
       const delta = hipsTarget.position.clone().sub(last);
       const dy = app.moveHips(figure, delta, app.hipsPlant);
+      reportHipsRise(delta.y, dy);
       last.copy(hipsTarget.position);
       last.y += dy - delta.y;
       hipsTarget.position.y = last.y;
@@ -2244,7 +2779,12 @@ tcontrols.addEventListener('objectChange', () => {
     // an active drag handle consumed the change
   } else if (app.selected) {
     app.markEdit(app.selected.figure);
-    app.selected.figure.clampJoint(app.selected.jointName);
+    // The rotate gizmo writes the joint's rotation freely; this is where the
+    // anatomical limits bite. Report it — otherwise the ring turns and the
+    // limb simply stops, which reads as a broken app rather than an anatomical
+    // one. (The solver-internal clampJoint calls stay silent by design.)
+    reportJointClamp(app.selected.figure, app.selected.jointName,
+      app.selected.figure.clampJoint(app.selected.jointName));
     if (app.ckc) pinAnchor(app.ckc.figure, app.ckc.node, app.ckc.matrix);
     if (app.ui) app.ui.refreshJointValues();
   } else if (tcontrols.object) {
@@ -2273,7 +2813,7 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   if (!downPos) return;
   const moved = Math.hypot(e.clientX - downPos[0], e.clientY - downPos[1]);
   downPos = null;
-  if (moved > 6 || tcontrols.dragging) return;
+  if (moved > 6 || gizmoDragging()) return;
   handleClick(e);
 });
 
@@ -2302,13 +2842,84 @@ function restingOpacity(figure) {
 function styleSphere(sphere, figure, { ghost = false, lit = false } = {}) {
   const { jointName } = sphere.userData;
   const isSel = app.selected && app.selected.figure === figure && app.selected.jointName === jointName;
+  // A joint the user just drove into its anatomical limit wears the app's
+  // "anatomy says no" amber (see flagJointLimit). It is read here rather than
+  // written by the flagger so that EVERY restyle path — hover, selection, a
+  // layer switch — preserves it instead of silently wiping it.
+  const strained = limitHit !== null && limitHit.figure === figure && limitHit.jointName === jointName;
   // Only body view needs the see-through treatment; skeleton view would just
-  // make the spheres float over their own bones.
-  const showThrough = (ghost || lit) && !(figure.layers && figure.layers.skeleton);
-  sphere.material.emissive.set(lit ? HOVER_EMISSIVE : (isSel ? SELECT_EMISSIVE : 0x000000));
-  sphere.material.opacity = lit ? 0.85 : (ghost ? GHOST_OPACITY : restingOpacity(figure));
+  // make the spheres float over their own bones. A strained joint must reach
+  // the screen through the opaque avatar, same as a hovered one.
+  const showThrough = (ghost || lit || strained) && !(figure.layers && figure.layers.skeleton);
+  sphere.material.emissive.set(strained ? STRAIN_COLOR
+    : (lit ? HOVER_EMISSIVE : (isSel ? SELECT_EMISSIVE : 0x000000)));
+  sphere.material.opacity = (lit || strained) ? 0.85 : (ghost ? GHOST_OPACITY : restingOpacity(figure));
   sphere.material.depthTest = !showThrough;
   sphere.renderOrder = showThrough ? 3 : 0;
+}
+
+// ------------------------------------------------ joint limits, made visible
+// A clamp is the whole point of this app and until now it was completely
+// silent: the limb stopped and nothing said why. The two DIRECT user-edit
+// paths (the rotate gizmo's objectChange and app.editJoint) report it —
+// amber on the joint's pick sphere plus a status line naming the limit.
+//
+// Deliberately NOT the solver paths (solveTwoBone / flattenFoot /
+// groundPlantedLeg / pivotHips / the embrace): those clamp every iteration as
+// a normal part of converging, and reporting there would strobe a permanent
+// message. (`limitHit` / `limitTimer` live up beside the status line.)
+
+function restyleSphere(figure, jointName) {
+  const sphere = figure.jointSphereByName?.[jointName];
+  if (!sphere) return;
+  styleSphere(sphere, figure, { ghost: hoverFigure === figure, lit: hoverSphere === sphere });
+}
+
+function clearJointLimit() {
+  if (limitTimer) { clearTimeout(limitTimer); limitTimer = null; }
+  if (!limitHit) return;
+  const { figure, jointName } = limitHit;
+  limitHit = null;
+  restyleSphere(figure, jointName);
+  requestRender(); // the tint is a scene change — the loop may be idling
+}
+
+// Name the bound the joint is now sitting on, e.g. "Left shoulder at its limit
+// (−170°)". clampJoint reports only HOW FAR it moved, so the axis is recovered
+// here: after the clamp the offending axis sits exactly on one of its bounds.
+function limitMessage(figure, jointName) {
+  const title = JOINT_TITLES[jointName] || jointName;
+  const def = JOINT_BY_NAME[jointName];
+  const r = figure.nodes[jointName].rotation;
+  let best = null;
+  for (const ax of ['x', 'y', 'z']) {
+    const deg = r[ax] / DEG;
+    for (const bound of def.limits[ax]) {
+      const d = Math.abs(deg - bound);
+      if (d < 0.5 && (!best || d < best.d)) best = { d, bound };
+    }
+  }
+  return best ? `${title} at its limit (${Math.round(best.bound)}°)` : `${title} at its limit`;
+}
+
+// Called from the two interactive edit paths with clampJoint's return value.
+// Zero (the pose was legal) clears any amber still showing on that joint.
+function reportJointClamp(figure, jointName, clamped) {
+  if (!clamped) {
+    if (limitHit && limitHit.figure === figure && limitHit.jointName === jointName) clearJointLimit();
+    return;
+  }
+  app.status(limitMessage(figure, jointName), 'limit');
+  // Fade the amber with the words, so the two are one signal.
+  onStatusClear = clearJointLimit;
+  if (limitTimer) clearTimeout(limitTimer);
+  limitTimer = setTimeout(clearJointLimit, STATUS_MS + 200);
+  if (limitHit && limitHit.figure === figure && limitHit.jointName === jointName) return;
+  const prev = limitHit;
+  limitHit = { figure, jointName };
+  if (prev) restyleSphere(prev.figure, prev.jointName);
+  restyleSphere(figure, jointName);
+  requestRender();
 }
 
 function clearHover() {
@@ -2336,18 +2947,48 @@ function setHover(figure, sphere) {
   renderer.domElement.style.cursor = sphere ? 'pointer' : '';
 }
 
+// Which joint a click on `jointName`'s pick sphere would actually ACT on, or
+// null if the click does nothing in this mode. ONE function, consulted by both
+// the hover and the click, so the sphere that lights is always the sphere the
+// click will use. Two ways they used to disagree:
+//   · Drag-limb hover skipped past a non-actionable sphere to an actionable one
+//     behind it, while the click took hits[0] and fell off the end of its
+//     if/else chain — the cursor lit a joint and the click did nothing at all.
+//   · An endpoint (hand_L, toe_R, headTop) has its own pick sphere, but
+//     selectJoint resolves it to its parent — so hovering the hand lit the HAND
+//     and clicking selected the WRIST, and the highlight jumped elsewhere.
+// Resolving here fixes both: the hover lights the resolved joint's own sphere.
+function clickTargetJoint(jointName) {
+  if (app.mode === 'ik') {
+    if (/^(?:toes|toe)_[LR]$/.test(jointName)) return jointName.replace(/^toe_/, 'toes_');
+    if (IK_CHAINS[jointName]) return IK_CHAINS[jointName].effector;
+    if (swivelChainFor(jointName)) return jointName;
+    return null; // an ordinary joint: Drag limb has nothing to do with it
+  }
+  const def = JOINT_BY_NAME[jointName];
+  return def?.endpoint ? def.parent : jointName;
+}
+
 // A joint is actionable in drag mode only if it starts an IK chain (hand/foot)
 // or an elbow/knee swivel; in rotate mode every joint can be posed.
 function jointActionable(jointName) {
-  if (app.mode === 'ik') return !!(IK_CHAINS[jointName] || swivelChainFor(jointName));
-  return true;
+  return clickTargetJoint(jointName) !== null;
 }
 
-renderer.domElement.addEventListener('pointerleave', clearHover);
+renderer.domElement.addEventListener('pointerleave', () => { clearHover(); studio.hover = null; });
 renderer.domElement.addEventListener('pointermove', (e) => {
-  if (downPos || tcontrols.dragging) return; // don't fight a click, gizmo drag, or orbit
+  if (downPos || gizmoDragging()) return; // don't fight a click, gizmo drag, or orbit
   pointerRay(e);
   const visible = app.visibleFigures();
+
+  // Label mode: preview the structure under the cursor ("+ Femur", or "✕ …" if
+  // a click would remove its label). The joint ghosting below still runs, so
+  // the invisible-in-body-view joints can be found here too.
+  if (app.mode === 'label') {
+    const pick = studio.labels.pick(raycaster, visible, app.labelFilter, camera);
+    const rect = renderer.domElement.getBoundingClientRect();
+    studio.hover = pick && { text: pick.text, remove: !!pick.existing, x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
 
   if (app.mode === 'draw') {
     clearHover();
@@ -2369,6 +3010,13 @@ renderer.domElement.addEventListener('pointermove', (e) => {
   const spheres = visible.flatMap((f) => f.pickSpheres);
   const hit = raycaster.intersectObjects(spheres, false)
     .find((h) => jointActionable(h.object.userData.jointName));
+  // Light the sphere the CLICK will act on, not merely the one under the
+  // cursor: on an endpoint (hand / toe / headTop) those differ, and the
+  // highlight used to jump to a neighbour the moment you clicked.
+  const litSphere = hit
+    ? (hit.object.userData.figure
+      .jointSphereByName[clickTargetJoint(hit.object.userData.jointName)] ?? hit.object)
+    : null;
   // Ghost in the joints of whichever dancer the cursor is over, not just when
   // it happens to land on a joint — the spheres are small and, in body view,
   // invisible until then.
@@ -2380,8 +3028,9 @@ renderer.domElement.addEventListener('pointermove', (e) => {
       figure = visible.find((f) => f.group === n) || null;
     }
   }
-  if (figure) setHover(figure, hit ? hit.object : null);
+  if (figure) setHover(figure, litSphere);
   else clearHover();
+  if (app.mode === 'label') renderer.domElement.style.cursor = studio.hover ? 'pointer' : '';
 });
 
 // Clicking a COG ball toggles drawing that COG indicator in front of the
@@ -2406,6 +3055,14 @@ function toggleCogHit(hit) {
 // Two-click authoring on the floor plane: the first click anchors the shape,
 // the second commits it (Text is a single click + prompt). A click that
 // misses the floor cancels the pending shape; so does Esc or a mode change.
+// What the second click of each two-click shape is for, so the half-authored
+// state says so instead of leaving a rubber band and no instruction.
+const DRAW_NEXT = {
+  line: 'Start point set — click the end of the line. (Esc cancels.)',
+  arrow: 'Tail set — click where the arrow should point. (Esc cancels.)',
+  circle: 'Centre set — click a point on the rim. (Esc cancels.)',
+};
+
 function handleDrawClick() {
   const p = floorPointAtPointer();
   if (!p) { app.cancelDraw(); return; }
@@ -2417,6 +3074,7 @@ function handleDrawClick() {
   if (!app.drawPending) {
     app.drawPending = p.clone();
     drawings.showPreview(app.drawTool, app.drawPending, p);
+    app.status(DRAW_NEXT[app.drawTool] ?? 'Click the second point to finish. (Esc cancels.)', 'info');
     return;
   }
   const a = app.drawPending;
@@ -2440,6 +3098,21 @@ function handleClick(e) {
   }
 
   const visible = app.visibleFigures();
+  if (app.mode === 'label') {
+    // Click a bone, muscle or joint to name it; click it again to un-name it.
+    const pick = studio.labels.pick(raycaster, visible, app.labelFilter, camera);
+    // The Labels list ships collapsed, so a new callout used to land in DOM the
+    // user cannot see; name it here as well as drawing it.
+    if (pick) {
+      const removing = !!pick.existing;
+      pick.toggle();
+      studio.hover = null;
+      app.status(removing ? `Removed the “${pick.text}” label.` : `Labelled ${pick.text}.`, 'info');
+    } else {
+      app.status('Nothing to label there — aim at a bone, muscle or joint.', 'info');
+    }
+    return;
+  }
   if (app.mode === 'pin') {
     // Author a contact pin: a spot on one dancer, then a spot on the other.
     // Pick spheres are invisible raycast targets — a pin wants the surface.
@@ -2480,15 +3153,27 @@ function handleClick(e) {
     app.deselect();
     return;
   }
-  const { figure, jointName } = hits[0].object.userData;
+  // The SAME predicate the hover uses (see clickTargetJoint): take the first
+  // joint this mode can actually act on, rather than hits[0] — which, in Drag
+  // limb, was regularly a joint the mode ignores sitting in front of one it
+  // doesn't, so the cursor lit a joint and the click did nothing.
+  const hit = hits.find((h) => jointActionable(h.object.userData.jointName));
+  if (!hit) {
+    // Every sphere under the cursor is unusable HERE. Say which mode wants it
+    // instead; silently no-opping reads as a dead click.
+    const name = JOINT_TITLES[hits[0].object.userData.jointName]
+      || hits[0].object.userData.jointName;
+    app.status(`Drag limb moves hands, feet and toes (and swivels an elbow or knee). Switch to Rotate joints to pose the ${name.toLowerCase()}.`, 'info');
+    return;
+  }
+  const { figure, jointName } = hit.object.userData;
   if (app.mode === 'ik') {
     // The toes start a floor caress (big toe pinned to the floor); the other
     // effectors keep the free-space IK drag.
     const toe = jointName.match(/^(?:toes|toe)_(L|R)$/);
     if (toe) app.startToeCaress(figure, toe[1]);
     else if (IK_CHAINS[jointName]) app.startIK(figure, jointName);
-    else if (swivelChainFor(jointName)) app.startSwivel(figure, jointName);
-    // clicks on other joints in drag mode are ignored
+    else app.startSwivel(figure, jointName);
   } else {
     app.selectJoint(figure, jointName);
   }
@@ -2500,8 +3185,22 @@ app.applyPreset(1); // start in the close embrace
 app.history.length = 0; // the pre-preset construction state is not a useful undo target
 app.ui.onHistoryChanged();
 
+// Everything is now built AND wired, so the cold-load cover can go. It is
+// removed here rather than after the GLB awaits so it never uncovers a scene
+// whose listeners are not attached yet.
+document.getElementById('loading-overlay')?.remove();
+
+// Any asset that fell back to a stand-in: say so once, in the status line. The
+// standing note lives in the View panel (initUI reads app.degraded), so the
+// difference is still discoverable after this message fades.
+if (degraded.length) {
+  app.status(degraded.length === 1
+    ? degraded[0]
+    : `${degraded[0]} (+${degraded.length - 1} more — see the View panel.)`, 'error');
+}
+
 // How long a one-shot edit (a slider tick, a key nudge) still counts as live.
-// A gizmo drag announces itself through tcontrols.dragging and needs no timer;
+// A gizmo drag announces itself through gizmoDragging() and needs no timer;
 // this covers the edits that arrive as discrete events.
 const EDIT_HOLD_MS = 350;
 
@@ -2531,7 +3230,7 @@ function embraceEditing() {
   if (app.stepAnims.length) return { figure: app.stepAnims[0].figure, jointName: null };
   const settled = app.lastEditedFigure
     ? { figure: app.lastEditedFigure, jointName: null } : null;
-  if (!tcontrols.dragging && performance.now() - app.editStamp > EDIT_HOLD_MS) return settled;
+  if (!gizmoDragging() && performance.now() - app.editStamp > EDIT_HOLD_MS) return settled;
   if (app.ikState) return { figure: app.ikState.figure, jointName: app.ikState.chain.effector };
   if (app.selected) return app.selected;
   if (tcontrols.object?.userData.figure) {
@@ -2555,17 +3254,39 @@ let vizFlags = { cog: true, support: true, couple: true, dissoc: false };
 
 function applyVizVisibility() {
   const both = leader.group.visible && follower.group.visible;
-  vizLeader.setVisible(vizFlags.cog && leader.group.visible, vizFlags.support && leader.group.visible);
-  vizFollower.setVisible(vizFlags.cog && follower.group.visible, vizFlags.support && follower.group.visible);
-  vizCouple.setVisible(vizFlags.couple && both, vizFlags.couple && vizFlags.support && both);
-  dissocLeader.setVisible(vizFlags.dissoc && leader.group.visible);
-  dissocFollower.setVisible(vizFlags.dissoc && follower.group.visible);
+  // A movement clip is a clean anatomy shot: the balance visuals step aside
+  // (the View checkboxes keep their state and return when the clip exits), and
+  // the dissociation wedge shows only if the clip itself asks for it.
+  const on = !studio.clipActive;
+  vizLeader.setVisible(on && vizFlags.cog && leader.group.visible, on && vizFlags.support && leader.group.visible);
+  vizFollower.setVisible(on && vizFlags.cog && follower.group.visible, on && vizFlags.support && follower.group.visible);
+  vizCouple.setVisible(on && vizFlags.couple && both, on && vizFlags.couple && vizFlags.support && both);
+  dissocLeader.setVisible(((on && vizFlags.dissoc) || clipDissoc === leader) && leader.group.visible);
+  dissocFollower.setVisible(((on && vizFlags.dissoc) || clipDissoc === follower) && follower.group.visible);
 }
 
 function animate() {
   requestAnimationFrame(animate);
-  const dt = clock.getDelta();
-  orbit.update();
+  // Clamp dt so returning to a backgrounded tab can't feed the animation
+  // players one giant step that overshoots.
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (orbit.update()) requestRender(2); // camera still moving (a drag / damping)
+
+  // An in-flight animation (A→B, sequence, video export, a walking step) drives
+  // the loop for as long as it runs.
+  if (app.interpPlaying || app.seqPlaying || app.recording || app.stepAnims.length
+    || studio.clipPlaying || studio.recorder)
+    requestSim(2);
+
+  if (simFrames <= 0) {
+    // Idle: nothing changed and nothing is animating. Redraw only if the VIEW
+    // still owes frames (camera damping settling, a hover glow), then skip the
+    // whole constraint/analysis pass below.
+    if (renderFrames > 0) { renderFrames--; studio.renderFrame(); }
+    return;
+  }
+  simFrames--;
+  if (renderFrames > 0) renderFrames--;
 
   if (app.interpPlaying) {
     app.interpT = Math.min(1, app.interpT + dt / SEQ_SEG_SECONDS);
@@ -2593,7 +3314,7 @@ function animate() {
 
   // Advance a video capture's playback; stop the recorder shortly after the
   // final pose so the last frames make it into the file.
-  if (app.recording) {
+  if (app.recording?.rec) {
     const r = app.recording;
     r.t = Math.min(1, r.t + dt / r.secs);
     applyStatesT(r.states, r.t);
@@ -2616,6 +3337,9 @@ function animate() {
     }
   }
 
+  // A movement clip poses its dancer for this frame (studio.js).
+  studio.update(dt);
+
   // Keep the embrace through whatever moved this frame: torso contact first
   // (it translates a dancer), the floor clamp, then re-join the hands (arm
   // rotations only, so they cannot disturb the floor contact).
@@ -2625,7 +3349,11 @@ function animate() {
   // embrace hand auto-join — so posing one dancer's arm can't shove the
   // partner. The floor clamp still runs (feet stay grounded) and the visuals
   // still refresh; only the couple-moving reactions are held off.
-  if (!app.anchored) {
+  // A movement clip shows one dancer alone on a stage: the couple constraints
+  // are held off exactly as in Anchor mode, or the hidden partner would be
+  // shoved about by (and shove) the limb being demonstrated.
+  const held = app.anchored || studio.clipActive;
+  if (!held) {
     embrace.maintainTorso(editing?.figure ?? null);
 
     // Contact pins, translation half: a pin whose adapting end rides the torso
@@ -2647,7 +3375,7 @@ function animate() {
   leader.clampToFloor();
   follower.clampToFloor();
 
-  if (!app.anchored) {
+  if (!held) {
     embrace.maintainHands(editing);
 
     // Contact pins, limb half: an adapting arm/leg re-solves so its pinned spot
@@ -2684,10 +3412,14 @@ function animate() {
     vizCouple.update(couple);
   }
 
-  if (vizFlags.dissoc) {
+  if (vizFlags.dissoc || clipDissoc) {
     if (leader.group.visible) dissocLeader.update(leader);
     if (follower.group.visible) dissocFollower.update(follower);
   }
+
+  // The clip's angle arc / plane of motion read the pose every constraint and
+  // the floor clamp have now finished with.
+  studio.updateViz();
 
   statsTimer += dt;
   if (statsTimer > 0.25) {
@@ -2695,7 +3427,7 @@ function animate() {
     app.ui.updateStats({ a: rA, b: rB, couple });
   }
 
-  renderer.render(scene, camera);
+  studio.renderFrame();
 }
 
 app.setViz = (flags) => {
@@ -2705,9 +3437,9 @@ app.setViz = (flags) => {
 app.setVisibleFiguresRefresh = applyVizVisibility;
 app.setViz(vizFlags);
 
-// Esc abandons a half-authored floor drawing.
+// Esc abandons whatever is half-finished — see app.cancelPending for the order.
 window.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') app.cancelDraw();
+  if (e.key === 'Escape') app.cancelPending();
 });
 
 window.addEventListener('keydown', (e) => {
@@ -2776,16 +3508,27 @@ function nudgeDirection(key, out) {
 window.addEventListener('keydown', (e) => {
   if (!NUDGE_KEYS.has(e.key)) return;
   const t = e.target;
-  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA') && t.type !== 'range') return;
-  if (tcontrols.dragging) return; // don't fight a live mouse drag
+  // Anything focused inside the app chrome owns its own arrow/page keys: a
+  // slider steps its value, a <select> changes option, a text field moves the
+  // caret. The old guard exempted type="range" and never mentioned SELECT, so
+  // this handler swallowed (and preventDefault'd) those keys and every slider
+  // and dropdown in the sidebar was keyboard-dead. The 3D nudges only mean
+  // anything when focus is on the canvas/body.
+  if (t && (t.closest?.('#sidebar, #topbar') || t.isContentEditable
+            || /^(?:INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+  if (gizmoDragging()) return; // don't fight a live mouse drag
   const k = e.key;
   const coarse = e.shiftKey ? 3 : 1;
 
   // Move / Step: drive the active figure (arrows only).
   if (app.mode === 'move' || app.mode === 'step') {
+    // This mode owns the whole nudge key set, so consume it here — before the
+    // early-outs below. PageUp/PageDown have no meaning for a figure slide, but
+    // returning without preventDefault let them scroll the page out from under
+    // the user instead of being swallowed by the mode they're in.
+    e.preventDefault();
     const fig = app.activeFigure;
     if (!fig || !fig.group.visible || !k.startsWith('Arrow')) return;
-    e.preventDefault();
     nudgeHistory();
     if (app.mode === 'step') {
       if (k === 'ArrowUp') app.stepFigure(fig, 1);
@@ -2812,8 +3555,9 @@ window.addEventListener('keydown', (e) => {
     // the handle; the other keys still slide/raise it.
     if (handle === hipsTarget && app.hipsTool === 'twist'
         && (k === 'ArrowLeft' || k === 'ArrowRight')) {
-      const applied = app.pivotHips(app.hipsState.figure,
-        (k === 'ArrowLeft' ? 1 : -1) * NUDGE_TURN * coarse);
+      const want = (k === 'ArrowLeft' ? 1 : -1) * NUDGE_TURN * coarse;
+      const applied = app.pivotHips(app.hipsState.figure, want);
+      reportHipsTwist(app.hipsState.figure, want, applied); // same clamp, same message
       app.hipsState.lastYaw += applied;
       hipsTarget.rotation.y = app.hipsState.lastYaw;
       if (app.ui) app.ui.refreshJointValues();
@@ -2852,10 +3596,37 @@ window.addEventListener('keydown', (e) => {
 });
 
 window.addEventListener('resize', () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
+  studio.layoutCanvas(); // window-filling, or the letterboxed 16:9 slide frame
+  requestRender(); // the canvas is now a new size — redraw it
 });
+
+// Keep the render loop awake while the user interacts (see "on-demand render"
+// above). A pointer MOVE is hover/orbit only — a redraw, no re-solve — so it
+// pokes requestRender; every discrete interaction (press/release, wheel, key,
+// and any form-control input) may change a pose, so it pokes the full solve.
+// Capture phase + a wide net means a handler that stops propagation can't
+// starve the loop.
+window.addEventListener('pointermove', () => requestRender(), { passive: true, capture: true });
+for (const ev of ['pointerdown', 'pointerup', 'wheel', 'keydown', 'keyup', 'click', 'change', 'input']) {
+  window.addEventListener(ev, () => requestSim(), { passive: true, capture: true });
+}
+
+// Wrap the programmatic API so every app.* call re-solves + redraws afterward,
+// without each method having to remember to poke. This is what keeps the UI and
+// the headless verification scripts (which drive app.* directly, firing no DOM
+// events) from screenshotting a stale frame. Pure readers that fire during
+// hover/orbit are skipped so merely looking around never triggers a re-solve;
+// markEdit and the infra pokers already poke themselves.
+const RENDER_WRAP_SKIP = new Set(['requestSim', 'requestRender', 'markEdit', 'visibleFigures', 'status']);
+for (const key of Object.keys(app)) {
+  if (typeof app[key] !== 'function' || RENDER_WRAP_SKIP.has(key)) continue;
+  const orig = app[key];
+  app[key] = function (...a) {
+    const r = orig.apply(this, a);
+    requestSim();
+    return r;
+  };
+}
 
 animate();
 

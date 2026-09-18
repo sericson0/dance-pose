@@ -196,6 +196,11 @@ export class Embrace {
     // The clasp point stored in each dancer's chest frame; the live target is
     // the midpoint of the two, so it follows both torsos as they move.
     this.claspLocal = { leader: null, follower: null };
+    // True when "Hold embrace" is on but the closed-side arms have been let go
+    // because the dancers are not facing each other (see maintainHands). The
+    // constraint switching itself off is correct; the checkbox still reading
+    // "on" while nothing holds is what needed saying, so ui.js renders it.
+    this.heldPartially = false;
   }
 
   figure(role) {
@@ -410,7 +415,7 @@ export class Embrace {
   // is posing one of the four embrace arms, that arm is left alone — on the
   // open side the clasp follows its hand and only the partner's arm re-solves.
   maintainHands(editing) {
-    if (!this.hands) return;
+    if (!this.hands) { this.heldPartially = false; return; }
     const edited = this.#editedArm(editing);
     const t = this.palmGap() / 2;
 
@@ -457,7 +462,13 @@ export class Embrace {
     // against the surface it rests on. Only while the couple roughly face
     // each other — otherwise the rest points sit behind the shoulder's range
     // and the solve would strain the arms into overhead poses.
-    if (!this.#facing()) return;
+    //
+    // Bailing out here is correct and stays. What was wrong is that it was
+    // SILENT: turn a dancer past ~70° and the closed-side arms freeze mid-pose
+    // while the "Hold embrace" checkbox goes on claiming to hold them. The
+    // flag is what ui.js reads to say the arms have been released.
+    this.heldPartially = !this.#facing();
+    if (this.heldPartially) return;
     if (edited !== 'leaderClosed') {
       this.#solveArm('leaderClosed', this.closedTargetWorld('leaderClosed'));
       const dir = this.follower.worldPos('chest')

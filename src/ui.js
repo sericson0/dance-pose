@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { JOINT_BY_NAME, JOINT_TITLES, BODY_PARTS } from './skeletonDef.js';
+import { JOINT_BY_NAME, JOINT_TITLES, BODY_PARTS, FLOOR_CONTACT_FRAC } from './skeletonDef.js';
 import { keyAngles, tangoStats, convexHull2D, stabilityMargin } from './analysis.js';
 
 const R2D = 180 / Math.PI;
@@ -8,11 +8,65 @@ const STORAGE_KEY = 'tangoPoseStudio.poses.v1';
 
 const AXIS_FALLBACK = { x: 'Forward / back', y: 'Twist', z: 'Side' };
 
+// WCAG 2.x relative luminance of a '#rrggbb' string (or a 0xrrggbb number —
+// figure/part colours arrive in both forms).
+export function relLum(color) {
+  const n = typeof color === 'number'
+    ? color
+    : parseInt(String(color ?? '').replace('#', ''), 16);
+  if (!Number.isFinite(n)) return 0;
+  const [r, g, b] = [16, 8, 0]
+    .map((s) => ((n >> s) & 0xff) / 255)
+    .map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+// WCAG 2.x contrast ratio between two colours.
+export function contrastRatio(a, b) {
+  const [hi, lo] = [relLum(a), relLum(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+// Ink for text sitting on an arbitrary fill: whichever of black/white contrasts
+// better. The highlight colours are picked by the user from a free
+// <input type="color">, so a hardcoded foreground can be driven to zero contrast
+// (the old '#1a1206' already read only 3.43:1 on the shipped Right-leg red, and
+// a pick of #101010 would have been unreadable). Black-or-white is not a style
+// choice but the optimum: the worst case over the WHOLE sRGB cube is 4.58:1, so
+// no pick can drop below AA. Softening the inks measurably lowers that floor
+// (#12100a/#f4f6fb bottom out at 4.19:1), so leave them pure.
+export const readableInk = (color) =>
+  (contrastRatio('#000000', color) >= contrastRatio('#ffffff', color) ? '#000000' : '#ffffff');
+
 // Open vs. closed chain is only offered for the legs/pelvis (the joints with a
 // foot to plant); arms and the spine are always open chain.
 const CHAIN_JOINTS = new Set([
   'pelvis', 'hip_L', 'knee_L', 'ankle_L', 'toes_L', 'hip_R', 'knee_R', 'ankle_R', 'toes_R',
 ]);
+
+// The heading toggle of a collapsible sidebar section: the <button> inside the
+// <h2> (keyboard-reachable — an <h2> is not), falling back to the h2 itself so
+// markup without the button still folds.
+function sectionToggle(section) {
+  const h2 = section?.querySelector('h2');
+  if (!h2) return null;
+  return h2.classList.contains('collapse-toggle') ? h2 : h2.querySelector('.collapse-toggle');
+}
+
+/**
+ * Fold or unfold a sidebar section, keeping the styling class and the exposed
+ * state in step: `.collapsed` on the <section> drives the CSS, `aria-expanded`
+ * on the heading button tells assistive tech. Anything that opens a section
+ * programmatically (e.g. revealing Contact pins when a pin is pending) must go
+ * through here rather than touching the class, or the two drift apart.
+ * @param {HTMLElement|null} section the sidebar <section>
+ * @param {boolean} collapsed true to fold it away, false to open it
+ */
+export function setSectionCollapsed(section, collapsed) {
+  if (!section) return;
+  section.classList.toggle('collapsed', !!collapsed);
+  sectionToggle(section)?.setAttribute('aria-expanded', String(!collapsed));
+}
 
 export function initUI(app) {
   const $ = (id) => document.getElementById(id);
@@ -25,6 +79,27 @@ export function initUI(app) {
   };
 
   // ---------------------------------------------------------------- modes
+  // One line per mode, written into #hint as the mode changes. The topbar
+  // buttons already carry a paragraph of task-specific prose in their `title`,
+  // but a title is invisible until you hover the very button you just clicked;
+  // these are the same advice cut to one line at #hint's width. NAV is always
+  // true, so it is appended rather than repeated in every row.
+  const NAV_HINT = 'left-drag to orbit · right-drag to pan · scroll to zoom';
+  const MODE_HINTS = {
+    rotate: 'Click a joint, then drag a ring to rotate it · arrows nudge it (PageUp/Down = twist) · Esc clears the selection',
+    ik: 'Click a hand or foot to drag the whole limb, the toes to caress the floor, an elbow or knee to swivel it · arrows move the handle',
+    hips: 'Drag the hips handle: the upper body rides along, planted feet stay put · PageUp/Down crouch and rise',
+    move: 'Click a dancer, then drag the arrows to slide them or the ring to turn them · pick the turn axis in "Turn about"',
+    step: 'Click a dancer to walk them one step forward — keep clicking to walk · arrows step and turn',
+    pin: 'Click a spot on one dancer, then the matching spot on the other, to hold them together · Esc cancels a half-made pin',
+    draw: 'Pick a shape, then click two points on the floor (Text: one click, then type) · Esc cancels a half-drawn shape',
+    label: 'Click a bone, muscle or joint to name it; click it again to remove the label · the toolbar limits what a click may pick',
+  };
+  const hintEl = $('hint');
+  const setHint = (mode) => {
+    if (hintEl) hintEl.textContent = `${MODE_HINTS[mode] ?? MODE_HINTS.rotate} · ${NAV_HINT}`;
+  };
+
   const modeButtons = [...document.querySelectorAll('#mode-buttons button')];
   const hipsPlantBox = $('hips-plant');
   // Planted feet belong to the hips SLIDE; the twist turns the legs and feet
@@ -35,6 +110,7 @@ export function initUI(app) {
   const selectMode = (mode) => {
     setActive(modeButtons, (b) => b.dataset.mode === mode);
     $('draw-tools').hidden = mode !== 'draw';
+    $('label-tools').hidden = mode !== 'label';
     // The turn pivot only exists while moving a whole figure (the gizmo slides
     // and turns in one, so there is no Slide/Turn toggle); Slide/Twist and the
     // planted-feet choice only while moving the hips.
@@ -42,10 +118,12 @@ export function initUI(app) {
     $('hips-tools').hidden = mode !== 'hips';
     app.setMode(mode);
     syncHipsPlant();
+    setHint(mode);
   };
   for (const btn of modeButtons) {
     btn.addEventListener('click', () => selectMode(btn.dataset.mode));
   }
+  setHint(app.mode);
 
   const movePivot = $('move-pivot');
   movePivot.addEventListener('change', () => app.setMovePivot(movePivot.value));
@@ -75,6 +153,15 @@ export function initUI(app) {
       app.setDrawTool(btn.dataset.tool);
     });
   }
+  // Label-mode sub-toolbar: what a click is allowed to pick.
+  const labelFilterBtns = [...document.querySelectorAll('#label-tools button[data-label-filter]')];
+  for (const btn of labelFilterBtns) {
+    btn.addEventListener('click', () => {
+      setActive(labelFilterBtns, (b) => b === btn);
+      app.setLabelFilter(btn.dataset.labelFilter);
+    });
+  }
+
   const drawUndo = $('draw-undo');
   const drawClear = $('draw-clear');
   drawUndo.addEventListener('click', () => app.removeLastDrawing());
@@ -86,13 +173,23 @@ export function initUI(app) {
   };
   syncDrawButtons();
 
-  // Collapsible sidebar sections: clicking a heading folds it away.
+  // Collapsible sidebar sections: the heading's button folds it away. The
+  // button is what carries the click (and the keyboard: Enter/Space on an <h2>
+  // fire nothing, which locked keyboard users out of every pre-collapsed
+  // section), and setSectionCollapsed keeps aria-expanded in step.
   for (const section of document.querySelectorAll('#sidebar section')) {
     const h2 = section.querySelector('h2');
     if (!h2) continue;
-    h2.classList.add('collapse-toggle');
-    h2.addEventListener('click', () => section.classList.toggle('collapsed'));
+    const btn = sectionToggle(section) ?? h2;
+    btn.classList.add('collapse-toggle');
+    const toggle = () => setSectionCollapsed(section, !section.classList.contains('collapsed'));
+    btn.addEventListener('click', toggle);
+    // Clicks landing on the heading itself (its padding, or a scripted
+    // h2.click()) still fold, as they did when the h2 was the toggle.
+    if (btn !== h2) h2.addEventListener('click', (e) => { if (e.target === h2) toggle(); });
+    setSectionCollapsed(section, section.classList.contains('collapsed'));
   }
+  app.setSectionCollapsed = setSectionCollapsed;
 
   // ---------------------------------------------------------------- embrace
   // Close embrace implies the hand hold: enabling close switches hands on,
@@ -152,10 +249,46 @@ export function initUI(app) {
   redoBtn.addEventListener('click', () => app.redo());
   $('ground-btn').addEventListener('click', () => app.groundFeet());
   $('link-couple').addEventListener('change', (e) => { app.linkCouple = e.target.checked; });
-  for (const btn of document.querySelectorAll('#view-buttons button')) {
+  for (const btn of document.querySelectorAll('#view-buttons button[data-view]')) {
     btn.addEventListener('click', () => app.setView(btn.dataset.view));
   }
+  // The presets aim at the dancers now, but they still fix the distance; this
+  // is the one control that fits whatever is shown from wherever you are.
+  $('frame-btn').addEventListener('click', () => app.frameDancers());
+
+  // Assets that fell back to a stand-in (app.degraded, filled by main.js's
+  // loaders). The session is usable either way, but it is a DIFFERENT app —
+  // worded like the Muscles panel's "Muscle atlas unavailable in this session."
+  {
+    const note = $('degraded-note');
+    if (note && app.degraded?.length) {
+      note.textContent = app.degraded.join(' ');
+      note.hidden = false;
+    }
+  }
+
   $('photo-btn').addEventListener('click', () => app.capturePhoto());
+  const photoScale = $('photo-scale');
+  photoScale.addEventListener('change', () => app.setPhotoScale(Number(photoScale.value)));
+  app.setPhotoScale(Number(photoScale.value));
+
+  // Video format: ONE setting (studio.videoFormat) behind two controls — this
+  // one beside the photo resolution, and the clips section's own copy. It used
+  // to exist only inside the collapsed Movement-clips section while governing
+  // the A→B and Sequence ⏺ buttons too.
+  const videoFormat = $('video-format');
+  const clipFormat = $('clip-format');
+  const setVideoFormat = (value, from) => {
+    app.setVideoFormat(value);
+    if (from !== videoFormat) videoFormat.value = value;
+    if (from !== clipFormat) clipFormat.value = value;
+  };
+  videoFormat.addEventListener('change', () => setVideoFormat(videoFormat.value, videoFormat));
+  clipFormat.addEventListener('change', () => setVideoFormat(clipFormat.value, clipFormat));
+  setVideoFormat(videoFormat.value, null);
+  $('backdrop').addEventListener('change', (e) => app.setBackdrop(e.target.value));
+  const frameMode = $('frame-mode');
+  frameMode.addEventListener('change', () => app.setFrame(frameMode.value));
 
   // ---------------------------------------------------------------- layers
   // One dropdown, three mutually exclusive views. Muscles ride the skeleton
@@ -181,12 +314,224 @@ export function initUI(app) {
   });
   ['show-cog', 'show-support', 'show-couple-cog', 'show-dissoc'].forEach((id) => $(id).addEventListener('change', syncViz));
 
+  // ---------------------------------------------------------------- labels
+  // Anatomy callouts (labels.js). Authoring happens in the 3D view (Label mode)
+  // or via "Label highlighted"; this list edits text, flips a callout to the
+  // other column, and removes it.
+  const labelList = $('label-list');
+  const labelClear = $('label-clear');
+  const KIND_TAG = { bone: 'bone', muscle: 'muscle', joint: 'joint' };
+
+  function renderLabels() {
+    const rows = app.labels.list;
+    labelClear.disabled = rows.length === 0;
+    labelList.innerHTML = rows.length ? ''
+      : '<span class="muted">No labels yet.</span>';
+    for (const label of rows) {
+      const row = document.createElement('div');
+      row.className = 'pose-item label-item';
+      const tag = document.createElement('span');
+      tag.className = `label-kind ${KIND_TAG[label.kind]}`;
+      // The initial, not just the hue — the dot's colour was its only channel.
+      tag.textContent = (KIND_TAG[label.kind] ?? '?')[0].toUpperCase();
+      tag.title = `${label.kind} · ${label.figure.name}`;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = label.text;
+      input.title = 'Edit the callout text';
+      input.addEventListener('input', () => app.setLabelText(label.id, input.value));
+      const flip = document.createElement('button');
+      flip.textContent = '⇄';
+      flip.title = 'Move this callout to the other side of the figure';
+      flip.addEventListener('click', () => app.flipLabel(label.id));
+      const del = document.createElement('button');
+      del.textContent = '✕';
+      del.title = 'Remove this label';
+      del.addEventListener('click', () => app.removeLabel(label.id));
+      row.append(tag, input, flip, del);
+      labelList.appendChild(row);
+    }
+  }
+  // Typing in a label must not rebuild the list under the cursor.
+  const onLabelsChanged = () => {
+    if (labelList.contains(document.activeElement) && document.activeElement.tagName === 'INPUT'
+      && app.labels.list.length === labelList.querySelectorAll('.label-item').length) return;
+    renderLabels();
+  };
+  $('label-highlighted').addEventListener('click', () => {
+    const n = app.labelHighlighted();
+    if (!n) {
+      const why = 'Nothing to label — highlight a body part (Highlight section) or some muscles first, in the Skeleton or Muscles layer.';
+      labelList.innerHTML = `<span class="muted">${why}</span>`;
+      // This section can be collapsed, so the explanation would otherwise be
+      // written where the user cannot see it.
+      app.status(why, 'info');
+      return;
+    }
+    setSectionCollapsed($('labels-section'), false);
+    app.status(`Added ${n} label${n === 1 ? '' : 's'}.`, 'info');
+  });
+  labelClear.addEventListener('click', () => {
+    // Confirm only when there is something to lose (labels are persisted to
+    // localStorage the moment they change, so this wipes the saved copy too).
+    const n = app.labels.list.length;
+    if (n && !window.confirm(`Remove ${n} label${n === 1 ? '' : 's'}? This cannot be undone.`)) return;
+    app.clearLabels();
+    if (n) app.status(`Removed ${n} label${n === 1 ? '' : 's'}.`, 'info');
+  });
+  $('labels-visible').addEventListener('change', (e) => app.setLabelsVisible(e.target.checked));
+  const labelDetailBtns = [...document.querySelectorAll('#label-detail button')];
+  for (const btn of labelDetailBtns) {
+    btn.addEventListener('click', () => {
+      setActive(labelDetailBtns, (b) => b === btn);
+      app.setLabelDetail(btn.dataset.labelDetail);
+    });
+  }
+  const labelSize = $('label-size');
+  labelSize.addEventListener('input', () => {
+    $('label-size-val').textContent = `${(Number(labelSize.value) / 10).toFixed(1)}%`;
+    app.setLabelSize(Number(labelSize.value) / 1000);
+  });
+  renderLabels();
+
+  // A browser with no MediaRecorder cannot record at all (app.canRecord). Every
+  // ⏺ says so on its own tooltip and stays disabled, rather than looking live
+  // and console.warning when pressed.
+  const NO_RECORDER_TITLE = 'This browser has no video recorder (MediaRecorder). Use 📷 Save photo instead.';
+
+  // ---------------------------------------------------------------- clips
+  // Movement clips (studio.js + the MOVEMENTS table). Picking a movement puts
+  // one dancer on the clip stage; Exit restores the couple.
+  const clipMove = $('clip-move');
+  const clipPlay = $('clip-play');
+  const clipRecord = $('clip-record');
+  const clipExit = $('clip-exit');
+  const clipScrub = $('clip-scrub');
+  const clipFigBtns = [...document.querySelectorAll('#clip-fig button')];
+  const clipSideBtns = [...document.querySelectorAll('#clip-side button')];
+  let clipFig = 'leader';
+  let clipSide = 'R';
+  let clipBackdrop = null; // the backdrop the stage replaced, put back on exit
+  {
+    const none = document.createElement('option');
+    none.value = '';
+    none.textContent = 'Choose a movement…';
+    clipMove.appendChild(none);
+    const groups = new Map();
+    for (const m of app.studio.movements) {
+      if (!groups.has(m.group)) {
+        const og = document.createElement('optgroup');
+        og.label = m.group;
+        groups.set(m.group, og);
+        clipMove.appendChild(og);
+      }
+      const o = document.createElement('option');
+      o.value = m.id;
+      o.textContent = m.title;
+      groups.get(m.group).appendChild(o);
+    }
+  }
+  const clipOptions = () => ({
+    title: $('clip-title').checked,
+    angle: $('clip-angle').checked,
+    plane: $('clip-plane').checked,
+    movers: $('clip-movers').checked,
+    fade: $('clip-fade').checked,
+    autoFrame: $('clip-autoframe').checked,
+    pattern: $('clip-pattern').value,
+    stroke: Number($('clip-stroke').value) / 10,
+    hold: Number($('clip-hold').value) / 10,
+    loops: Number($('clip-loops').value),
+  });
+  const setClipLayer = () => {
+    $('layer-mode').value = $('clip-layer').value;
+    $('layer-mode').dispatchEvent(new Event('change'));
+  };
+  const enterClip = () => {
+    if (!clipMove.value) return;
+    const fresh = !app.studio.clipActive;
+    app.setClipOptions(clipOptions());
+    app.enterClip(clipMove.value, { figure: app[clipFig], side: clipSide });
+    if (fresh) {
+      // First step onto the stage: a clean slide look, unless already chosen.
+      setClipLayer();
+      if ($('backdrop').value === 'studio') {
+        clipBackdrop = 'studio';
+        $('backdrop').value = 'dark';
+        app.setBackdrop('dark');
+      }
+    }
+  };
+  clipMove.addEventListener('change', enterClip);
+  $('clip-layer').addEventListener('change', setClipLayer);
+  for (const btn of clipFigBtns) {
+    btn.addEventListener('click', () => {
+      clipFig = btn.dataset.fig;
+      setActive(clipFigBtns, (b) => b === btn);
+      if (app.studio.clipActive) enterClip();
+    });
+  }
+  for (const btn of clipSideBtns) {
+    btn.addEventListener('click', () => {
+      clipSide = btn.dataset.side;
+      setActive(clipSideBtns, (b) => b === btn);
+      if (app.studio.clipActive) enterClip();
+    });
+  }
+  for (const id of ['clip-title', 'clip-angle', 'clip-plane', 'clip-movers', 'clip-fade',
+    'clip-autoframe', 'clip-pattern', 'clip-stroke', 'clip-hold', 'clip-loops']) {
+    $(id).addEventListener('input', () => {
+      $('clip-stroke-val').textContent = `${(Number($('clip-stroke').value) / 10).toFixed(1)} s`;
+      $('clip-hold-val').textContent = `${(Number($('clip-hold').value) / 10).toFixed(1)} s`;
+      app.setClipOptions(clipOptions());
+    });
+  }
+  // #clip-format is wired beside #video-format in the View section — one
+  // setting, two controls that mirror each other.
+  clipPlay.addEventListener('click', () => app.playClip(!app.studio.clipPlaying));
+  clipRecord.addEventListener('click', () => app.recordClip());
+  clipExit.addEventListener('click', () => app.exitClip());
+  clipScrub.addEventListener('input', () => app.scrubClip(Number(clipScrub.value) / 1000));
+
+  function syncClip() {
+    const clip = app.studio.clip;
+    const busy = app.studio.busy;
+    $('clip-scrub-row').hidden = !clip;
+    clipPlay.disabled = !clip || busy;
+    clipRecord.disabled = !clip || busy || !app.canRecord;
+    if (!app.canRecord) clipRecord.title = NO_RECORDER_TITLE;
+    clipExit.disabled = !clip || busy;
+    clipPlay.textContent = clip?.playing && !busy ? '⏸ Pause' : '▶ Play';
+    clipRecord.textContent = clip?.arming ? '⏺ Preparing…' : busy ? '⏺ Recording…' : '⏺ Record';
+    if (clip) $('clip-name').textContent = clip.move.title;
+    else {
+      clipMove.value = '';
+      // The stage borrowed the backdrop; hand it back unless the user has since
+      // chosen another one themselves.
+      if (clipBackdrop && $('backdrop').value === 'dark') {
+        $('backdrop').value = clipBackdrop;
+        app.setBackdrop(clipBackdrop);
+      }
+      clipBackdrop = null;
+    }
+    // The stage switches the frame and hides the partner — mirror that in the
+    // controls that show those states.
+    frameMode.value = app.studio.frame;
+    setActive(showButtons, (b) => b.dataset.show === (app.shown ?? 'both'));
+  }
+  app.studio.onClipChanged = syncClip;
+  app.studio.onClipTick = (p, deg) => {
+    if (document.activeElement !== clipScrub) clipScrub.value = Math.round(p * 1000);
+    $('clip-angle-val').textContent = `${Math.round(deg)}°`;
+  };
+
   // ---------------------------------------------------------------- pins
   // Contact pins (see pins.js): the list mirrors app.pins; authoring happens
   // in the 3D view via the Pin-spots mode.
   const pinList = $('pin-list');
   const pinClear = $('pin-clear');
   const endName = (end) => JOINT_TITLES[end.node] || end.node;
+  let pinCount = app.pins.count(); // so a NEW pin can be announced, not just listed
 
   function renderPins() {
     const n = app.pins.count();
@@ -211,10 +556,28 @@ export function initUI(app) {
       note.className = 'muted';
       note.textContent = `First spot set on the ${pending.figure.name.toLowerCase()} (${endName(pending).toLowerCase()}) — now click the matching spot on the partner.`;
       pinList.appendChild(note);
+      // This section ships collapsed, so the instruction telling the user what
+      // to do NEXT was being rendered into invisible DOM. Open the section and
+      // put the same words on the status line, where a mid-authoring user is
+      // already looking (the marker is sitting on the dancer in front of them).
+      setSectionCollapsed($('pins-section'), false);
+      app.status(note.textContent, 'info');
+    } else if (n > pinCount) {
+      app.status(`Pin ${n} created — it holds through moves, steps and turns.`, 'info');
     }
+    pinCount = n;
     pinClear.disabled = !n;
   }
-  pinClear.addEventListener('click', () => app.clearPins());
+  pinClear.addEventListener('click', () => {
+    // Confirm only when there is something to lose, so the empty case (and the
+    // disabled button's own no-op) stays one click. A blocking dialog is the
+    // right tool here and nowhere else: releasing every pin is a decision, not
+    // a notification, and the status line cannot ask a question.
+    const n = app.pins.count();
+    if (n && !window.confirm(`Release ${n} contact pin${n === 1 ? '' : 's'}? This cannot be undone.`)) return;
+    app.clearPins();
+    if (n) app.status(`Released ${n} contact pin${n === 1 ? '' : 's'}.`, 'info');
+  });
   renderPins();
 
   // ---------------------------------------------------------------- highlight
@@ -222,27 +585,76 @@ export function initUI(app) {
   const highlightClear = $('highlight-clear');
   const highlighted = new Set();
 
+  // Each part carries its own highlight colour: the chip wears it while active
+  // and its swatch (shown only then) repicks it, so several parts lit at once
+  // stay tellable apart on a slide.
+  const chipRows = [];
+
+  const paintChip = (chip, swatch, part) => {
+    const on = highlighted.has(part.id);
+    const color = app.highlightColor(part.id);
+    chip.classList.toggle('active', on);
+    chip.style.background = on ? color : '';
+    chip.style.borderColor = on ? color : '';
+    chip.style.color = on ? readableInk(color) : '';
+    swatch.hidden = !on;
+    swatch.value = color;
+  };
+
   const syncHighlight = () => {
     app.setHighlight(highlighted);
     highlightClear.disabled = highlighted.size === 0;
+    for (const r of chipRows) paintChip(r.chip, r.swatch, r.part);
   };
+
   for (const part of BODY_PARTS) {
+    const wrap = document.createElement('span');
+    wrap.className = 'chip-wrap';
     const chip = document.createElement('button');
     chip.className = 'chip';
     chip.textContent = part.title;
+    const swatch = document.createElement('input');
+    swatch.type = 'color';
+    swatch.className = 'chip-color';
+    swatch.title = `Colour of the ${part.title.toLowerCase()} highlight`;
+    swatch.hidden = true;
+    swatch.value = part.color;
     chip.addEventListener('click', () => {
       if (highlighted.has(part.id)) highlighted.delete(part.id);
       else highlighted.add(part.id);
-      chip.classList.toggle('active', highlighted.has(part.id));
       syncHighlight();
     });
-    highlightChips.appendChild(chip);
+    swatch.addEventListener('input', () => {
+      app.setHighlightColor(part.id, swatch.value);
+      paintChip(chip, swatch, part);
+    });
+    wrap.append(chip, swatch);
+    chipRows.push({ part, chip, swatch });
+    highlightChips.appendChild(wrap);
   }
   highlightClear.addEventListener('click', () => {
     highlighted.clear();
-    highlightChips.querySelectorAll('.chip').forEach((c) => c.classList.remove('active'));
     syncHighlight();
   });
+
+  // Figure.setHighlight is a no-op on the clothed avatar (one continuous skin,
+  // userData.noHighlight) and the app STARTS in the Body layer — so a first
+  // click on "Torso" lit the chip and changed the 3D view by exactly nothing.
+  // Same nudge the Muscles panel already carries for its own layer (see
+  // syncMuscleNote below), kept in the same shape so the two stay consistent.
+  const highlightLayerNote = $('highlight-layer-note');
+  const syncHighlightNote = () => { highlightLayerNote.hidden = layerMode() !== 'body'; };
+  $('layer-mode').addEventListener('change', syncHighlightNote);
+  // Dispatch a real `change` rather than calling syncLayers directly, so every
+  // listener on the dropdown runs — this note, the Muscles note and the layers
+  // themselves. Setting .value and calling one of them by hand leaves the
+  // others stale (the Muscles link used to do exactly that).
+  const chooseLayer = (mode) => {
+    $('layer-mode').value = mode;
+    $('layer-mode').dispatchEvent(new Event('change'));
+  };
+  $('highlight-enable-layer').addEventListener('click', () => chooseLayer('skeleton'));
+  syncHighlightNote();
 
   // ---------------------------------------------------------------- muscles
   // Per-muscle controls: uncheck a belly to fade it out (transparent), or hit
@@ -331,11 +743,7 @@ export function initUI(app) {
   // The panel only shows through the Muscles layer — nudge the user to enable it.
   const syncMuscleNote = () => { muscleLayerNote.hidden = layerMode() === 'muscle'; };
   $('layer-mode').addEventListener('change', syncMuscleNote);
-  $('muscle-enable-layer').addEventListener('click', () => {
-    $('layer-mode').value = 'muscle';
-    syncLayers();
-    syncMuscleNote();
-  });
+  $('muscle-enable-layer').addEventListener('click', () => chooseLayer('muscle'));
   syncMuscleNote();
   renderMuscleList();
 
@@ -529,6 +937,25 @@ export function initUI(app) {
     jointPanel.appendChild(reset);
   }
 
+  // "Selected joint" is the 8th sidebar section: on a 1366×768 laptop it starts
+  // below the fold, and if the user has folded it away, clicking joints in the
+  // 3D view produced no visible feedback at all. Open it and bring it into view
+  // when the selection actually CHANGES — never on a re-render (renderJointPanel
+  // also runs on every pose change, and scrolling the sidebar mid-drag would be
+  // its own bug). `block: 'nearest'` means an already-visible panel does not
+  // move, so this costs nothing when the section is on screen.
+  let shownSelection = null;
+  function revealJointPanel() {
+    const sel = app.selected;
+    const key = sel ? `${sel.figure.name}:${sel.jointName}` : null;
+    if (key && key !== shownSelection) {
+      const section = $('joint-section');
+      setSectionCollapsed(section, false);
+      section.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+    shownSelection = key;
+  }
+
   function refreshJointValues() {
     for (const { input, valEl, node, axis } of sliderRefs) {
       if (document.activeElement === input) continue;
@@ -572,6 +999,38 @@ export function initUI(app) {
     </div>`;
   }
 
+  // Chest distance, with the reason it is not at the held contact distance.
+  // "Close embrace" pulls the chests together and body COLLISION refuses to
+  // let them through — that is deliberate (collision always wins), but the
+  // user sees chests apart with the box ticked and nothing saying why. When
+  // the pull is short AND the bodies are touching somewhere, name it: the
+  // couple is resting body-on-body, and the `title` says on what.
+  function chestLine(chestSep) {
+    const cm = `${(chestSep * 100).toFixed(1)} cm`;
+    let note = '';
+    let why = '';
+    if (app.embrace.close && chestSep > app.embrace.contactDistance() + 0.01
+      && app.bodyClearance() < 0.005) {
+      const [tight] = app.bodyContacts(1);
+      note = ' · resting body-on-body';
+      // The pair names come from the COLLIDERS table (joint names), never from
+      // the user or a file, so they interpolate into the attribute safely.
+      why = tight
+        ? ` title="Closest contact: ${tight.a} against ${tight.b} (${(tight.clearance * 100).toFixed(1)} cm). Collision stops the close-embrace pull here — the bodies are already touching."`
+        : ' title="Collision stops the close-embrace pull here — the bodies are already touching."';
+    }
+    return `<div class="stat-line"${why}><span>Chest distance</span><span class="v">${cm}${note}</span></div>`;
+  }
+
+  // "Hold embrace" is ticked but Embrace.maintainHands has let the closed-side
+  // arms go because the dancers are not facing each other (deliberate — see
+  // embrace.js). Without this line the checkbox claims to be holding something
+  // that is frozen mid-pose.
+  function embraceHoldLine() {
+    if (!app.embrace.hands || !app.embrace.heldPartially) return '';
+    return '<div class="stat-line" title="The closed-side arms only solve while the dancers roughly face each other; past about 70° their rest points sit behind the shoulder\'s range."><span>Embrace</span><span class="v off-balance">arms released — dancers not facing</span></div>';
+  }
+
   function updateStats({ a, b, couple }) {
     renderFootMap({ a, b });
     let html = '';
@@ -589,8 +1048,9 @@ export function initUI(app) {
           <h3><span class="dot" style="background:#ffe08a"></span>Couple</h3>
           <div class="stat-line"><span>Combined balance</span><span class="v">${balanceLine(couple.margin)}</span></div>
           <div class="stat-line"><span>COG separation</span><span class="v">${(sep * 100).toFixed(1)} cm</span></div>
-          <div class="stat-line"><span>Chest distance</span><span class="v">${(chestSep * 100).toFixed(1)} cm</span></div>
+          ${chestLine(chestSep)}
           <div class="stat-line"><span>Open-side hands</span><span class="v">${handLine}</span></div>
+          ${embraceHoldLine()}
         </div>`;
     }
     statsPanel.innerHTML = html;
@@ -623,9 +1083,9 @@ export function initUI(app) {
   const _fmW = new THREE.Vector3();
   const _fmT = new THREE.Vector3();
   // A sole corner counts as resting on the floor within this height — the same
-  // threshold footContactsBySide uses, so the print's contact patch and the 3D
-  // support outline agree.
-  const FLOOR_CONTACT = 0.035;
+  // threshold footContactsBySide uses (now one shared constant), so the print's
+  // contact patch and the 3D support outline can't disagree.
+  const FLOOR_CONTACT = FLOOR_CONTACT_FRAC;
 
   function renderFootMap(reps) {
     const dpr = window.devicePixelRatio || 1;
@@ -1106,13 +1566,25 @@ export function initUI(app) {
   const seqExport = $('seq-export');
   const interpRecord = $('interp-record');
 
-  // Both ⏺ buttons: armed when their chain can play, locked while a capture runs.
+  // Both ⏺ buttons: armed when their chain can play, locked while a capture
+  // runs. THREE states, not two — the H.264 encoder can take ~5.5 s to wake on
+  // a page's first recording (see warmUpMp4 in studio.js) and the button used
+  // to read "Recording…" through all of it while capturing nothing. The clip
+  // recorder already distinguished them; app.recording.arming is the same flag.
   function syncRecordButtons() {
-    const busy = !!app.recording;
-    interpRecord.disabled = busy || !(snaps.A && snaps.B);
-    seqRecord.disabled = busy || app.seqStates.length < 2;
-    interpRecord.textContent = busy ? '⏺ Recording…' : '⏺ Record';
-    seqRecord.textContent = busy ? '⏺ Recording…' : '⏺ Record video';
+    const job = app.recording;
+    const busy = !!job;
+    const arming = !!job?.arming;
+    const can = app.canRecord;
+    interpRecord.disabled = busy || !can || !(snaps.A && snaps.B);
+    seqRecord.disabled = busy || !can || app.seqStates.length < 2;
+    const label = (idle) => (arming ? '⏺ Preparing…' : busy ? '⏺ Recording…' : idle);
+    interpRecord.textContent = label('⏺ Record');
+    seqRecord.textContent = label('⏺ Record video');
+    if (!can) {
+      interpRecord.title = NO_RECORDER_TITLE;
+      seqRecord.title = NO_RECORDER_TITLE;
+    }
   }
 
   const setSeqLabel = (t) => {
@@ -1134,7 +1606,15 @@ export function initUI(app) {
     app.recordPlayback(app.seqStates, 'tangle-sequence');
   });
   $('seq-add').addEventListener('click', () => app.seqAdd());
-  seqClear.addEventListener('click', () => app.setSeqStates([]));
+  // Clearing destroys every keyframe AND the localStorage copy in one click,
+  // and the undo stack holds couple poses only, so nothing can bring them back.
+  // Ask — but only when there is something to lose.
+  seqClear.addEventListener('click', () => {
+    const n = app.seqStates.length;
+    if (n && !window.confirm(`Delete all ${n} keyframe${n === 1 ? '' : 's'}? This also clears the saved copy and cannot be undone.`)) return;
+    app.setSeqStates([]);
+    if (n) app.status(`Deleted ${n} keyframe${n === 1 ? '' : 's'}.`, 'info');
+  });
 
   function renderSequence() {
     const n = app.seqStates.length;
@@ -1187,9 +1667,19 @@ export function initUI(app) {
       if (!Array.isArray(states) || states.length < 2 || !states.every((s) => s && s.figures)) {
         throw new Error('not a sequence');
       }
+      // An import REPLACES whatever is on the timeline. The pose import right
+      // below this one has always taken a history snapshot first; this one did
+      // not, which made the two inconsistent in the same file.
+      const had = app.seqStates.length;
+      if (had && !window.confirm(`Replace the current ${had} keyframe${had === 1 ? '' : 's'} with the ${states.length} in this file?`)) {
+        e.target.value = '';
+        return;
+      }
+      app.pushHistory();
       app.setSeqStates(states);
+      app.status(`Loaded ${states.length} keyframes.`, 'info');
     } catch {
-      alert('Could not read that file as a sequence.');
+      app.status('Could not read that file as a sequence.', 'error');
     }
     e.target.value = '';
   });
@@ -1225,7 +1715,16 @@ export function initUI(app) {
     }
   }
   function saveLibrary(lib) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(lib));
+    // An unguarded write throws on a full quota (or in Safari private mode) and
+    // the exception escapes the click handler, so the list never re-renders and
+    // Save appears to do nothing at all. Report it and still redraw. Non-modal:
+    // an alert() here would interrupt a lesson to say something the user can
+    // only act on afterwards.
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(lib));
+    } catch {
+      app.status("Couldn't save — browser storage is full. Delete a saved pose or export to a file.", 'error');
+    }
     renderLibrary();
   }
   function renderLibrary() {
@@ -1235,7 +1734,12 @@ export function initUI(app) {
     for (const name of names) {
       const row = document.createElement('div');
       row.className = 'pose-item';
-      row.innerHTML = `<span class="name">${name}</span>`;
+      // textContent, never innerHTML: the name is free text from the Save field
+      // or `state.name` inside an imported JSON pose file, so interpolating it
+      // into markup runs whatever a third-party file cares to put there.
+      const nameEl = document.createElement('span');
+      nameEl.className = 'name';
+      nameEl.textContent = name;
       const load = document.createElement('button');
       load.textContent = 'Load';
       load.addEventListener('click', () => {
@@ -1244,13 +1748,25 @@ export function initUI(app) {
       });
       const del = document.createElement('button');
       del.textContent = '✕';
-      del.title = 'Delete';
+      del.title = 'Delete this saved pose';
       del.addEventListener('click', () => {
         const l = loadLibrary();
+        const removed = l[name];
         delete l[name];
         saveLibrary(l);
+        // A saved pose is not pose STATE, so Ctrl+Z cannot bring it back — it
+        // would restore the couple and leave the library entry gone. Offer the
+        // recovery where the loss happened instead of a dialog beforehand.
+        app.status(`Deleted the saved pose “${name}”.`, 'info', {
+          label: 'Undo',
+          run: () => {
+            const lib2 = loadLibrary();
+            lib2[name] = removed;
+            saveLibrary(lib2);
+          },
+        });
       });
-      row.append(load, del);
+      row.append(nameEl, load, del);
       poseList.appendChild(row);
     }
   }
@@ -1286,7 +1802,7 @@ export function initUI(app) {
       lib[state.name || file.name.replace(/\.json$/i, '')] = state;
       saveLibrary(lib);
     } catch {
-      alert('Could not read that file as a pose.');
+      app.status('Could not read that file as a pose.', 'error');
     }
     e.target.value = '';
   });
@@ -1306,8 +1822,16 @@ export function initUI(app) {
     div.querySelector('.cfg-h').addEventListener('change', (e) => {
       const cm = Math.min(210, Math.max(140, Number(e.target.value) || figure.height * 100));
       e.target.value = cm;
+      if (Math.abs(cm / 100 - figure.height) < 1e-6) return;
+      // Snapshot BEFORE the resize: applyCoupleState restores meta.heights, so
+      // undo puts the height back too. Without this, Ctrl+Z afterwards replayed
+      // the old pose onto the NEW height — a confusing half-undo. markEdit, so
+      // the embrace/collision pass knows whose partner should yield to a dancer
+      // that just changed size.
+      app.pushHistory();
       app.deselect();
       figure.setHeight(cm / 100);
+      app.markEdit(figure);
     });
     div.querySelector('.cfg-m').addEventListener('change', (e) => {
       const kg = Math.min(140, Math.max(35, Number(e.target.value) || figure.mass));
@@ -1323,6 +1847,7 @@ export function initUI(app) {
     onSelectionChanged() {
       renderJointPanel();
       syncJointPicker();
+      revealJointPanel();
     },
     onPoseChanged() {
       renderJointPanel();
@@ -1350,6 +1875,8 @@ export function initUI(app) {
     },
     // A drawing was added, removed, or cleared.
     onDrawingsChanged: syncDrawButtons,
+    // A label was added, removed, flipped or cleared.
+    onLabelsChanged,
     refreshJointValues,
     updateStats,
   };

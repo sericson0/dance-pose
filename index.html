@@ -9,7 +9,22 @@
 </head>
 <body>
   <div id="app">
-    <div id="viewport"></div>
+    <div id="viewport">
+      <!-- Static markup on purpose: the app awaits ~6 MB of anatomy GLBs at the
+           top of main.js before a single pixel is drawn, so a spinner built by a
+           module would itself arrive only after the wait. This one paints with
+           the first HTML; main.js removes it (#loading-overlay) once the scene,
+           the figures and the UI listeners are all live. Its z-index puts it
+           over the topbar and sidebar too — see style.css — so nothing dead is
+           clickable meanwhile. -->
+      <div id="loading-overlay">
+        <div class="loading-card">
+          <div class="spinner"></div>
+          <div class="loading-title">Loading anatomy…</div>
+          <div class="loading-sub">Skeleton, muscles and the two dancers — about 6 MB the first time.</div>
+        </div>
+      </div>
+    </div>
 
     <header id="topbar">
       <h1>TAngle</h1>
@@ -21,6 +36,13 @@
         <button data-mode="step" title="Click a dancer to take a walking step forward — keep clicking to walk. Arrow keys: ↑↓ step forward/back, ←→ turn. Turn on 'Move as couple' to walk the pair together.">Walk / step</button>
         <button data-mode="pin" title="Pin a spot on one dancer to a spot on the other: click the first spot, then the matching spot on the partner. Pinned spots stay together through moves, steps and turns — author a custom hold, or a parada's foot contact. Manage pins in the sidebar.">Pin spots</button>
         <button data-mode="draw" title="Draw teaching diagrams on the floor: pick Line / Arrow / Circle / Text, then click two points on the floor (Text: one click, then type the label). Esc cancels a half-drawn shape.">Draw</button>
+        <button data-mode="label" title="Name the anatomy: click a bone, muscle or joint to give it a callout label (click it again to remove it). Bones show in the Skeleton layer, muscles in the Muscles layer; joints can be labelled in any layer. Labels are saved into photos and videos. Manage them in the sidebar's Labels section.">Label</button>
+      </div>
+      <div id="label-tools" class="btn-group" hidden>
+        <button data-label-filter="auto" class="active" title="Label whatever is under the cursor — aim at a joint's centre to pick the joint rather than the bone">Auto</button>
+        <button data-label-filter="bone" title="Only pick bones">Bones</button>
+        <button data-label-filter="muscle" title="Only pick muscles">Muscles</button>
+        <button data-label-filter="joint" title="Only pick joints">Joints</button>
       </div>
       <div id="draw-tools" class="btn-group" hidden>
         <button data-tool="line" class="active" title="Two clicks: start and end">Line</button>
@@ -63,8 +85,8 @@
     </header>
 
     <aside id="sidebar">
-      <section>
-        <h2>View</h2>
+      <section id="view-section">
+        <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="view-section">View</button></h2>
         <div class="check-row">
           <label for="layer-mode">Layer</label>
           <select id="layer-mode" title="Body: the clothed avatar. Skeleton: bones only. Muscles: the main movers over the skeleton.">
@@ -82,18 +104,144 @@
           <label title="Draw each dancer's hip axis (their color) and shoulder axis (white) on the floor, with a wedge sweeping the twist between them — tango dissociation. Clearest in the Top view."><input type="checkbox" id="show-dissoc" /> Dissociation</label>
         </div>
         <div class="btn-row" id="view-buttons">
-          <button data-view="front" title="Look along the line of dance">Front</button>
-          <button data-view="side" title="Profile view — read posture and lean">Side</button>
+          <button data-view="front" title="Look along the line of dance (aimed at the dancers, wherever they have walked to)">Front</button>
+          <button data-view="side" title="Profile view — read posture and lean (aimed at the dancers, wherever they have walked to)">Side</button>
           <button data-view="top" title="Bird's eye — read foot placement and hip/shoulder rotation">Top</button>
           <button data-view="three" title="Default ¾ view">¾ view</button>
+          <button id="frame-btn" title="Zoom and aim the camera to fit the shown dancers in the frame, keeping the direction you are looking from">⤢ Frame dancers</button>
+        </div>
+        <div class="muted" id="degraded-note" hidden></div>
+        <div class="check-row">
+          <label for="backdrop" title="What is behind the dancers. Studio: the wooden floor. Clean dark / Clean white: a plain slide background with a soft floor shadow. Transparent: no background at all in saved PNG photos (videos fall back to clean dark).">Backdrop</label>
+          <select id="backdrop">
+            <option value="studio" selected>Studio floor</option>
+            <option value="dark">Clean dark</option>
+            <option value="light">Clean white</option>
+            <option value="transparent">Transparent (photos)</option>
+          </select>
+        </div>
+        <div class="check-row">
+          <label for="frame-mode" title="Slide frame letterboxes the view to 16:9 and renders it at exactly 1920×1080 — what you see is the frame a photo or video will contain.">Frame</label>
+          <select id="frame-mode">
+            <option value="window" selected>Fill window</option>
+            <option value="slide">16:9 slide (1080p)</option>
+          </select>
         </div>
         <div class="btn-row">
-          <button id="photo-btn" title="Save a PNG photo of the current 3D view (gizmos and drag handles hidden)">📷 Save photo</button>
+          <button id="photo-btn" title="Save a PNG photo of the current 3D view with its labels (gizmos and drag handles hidden)">📷 Save photo</button>
+          <select id="photo-scale" title="Photo resolution, as a multiple of the view's own (2× the 16:9 slide frame = 4K)">
+            <option value="1">1×</option>
+            <option value="2" selected>2×</option>
+            <option value="3">3×</option>
+          </select>
+        </div>
+        <!-- One video format for every ⏺ in the app (movement clips, A→B and the
+             sequence all record through studio.videoFormat). It used to live only
+             inside the collapsed Movement-clips section while governing all
+             three; the clips copy mirrors this one. -->
+        <div class="check-row">
+          <label for="video-format" title="The format every ⏺ Record button writes. MP4 (H.264) plays in PowerPoint, Keynote and Beamer's multimedia/media9; WebM is smaller but PowerPoint will not play it.">Video format</label>
+          <select id="video-format">
+            <option value="mp4" selected>MP4</option>
+            <option value="webm">WebM</option>
+          </select>
         </div>
       </section>
 
-      <section>
-        <h2>Embrace</h2>
+      <section class="collapsed" id="labels-section">
+        <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="labels-section">Labels</button></h2>
+        <div class="muted">Name bones, muscles and joints for slides. Use the <b>Label</b> mode to click structures, or highlight a body part / muscles and label them all at once. Text is editable; labels are saved into photos and videos.</div>
+        <div class="check-row">
+          <label title="How much anatomy a new label names. Simple: one everyday name per body part or joint — 'Foot', 'Hip'. Detailed: every bone and muscle, named anatomically. Labels you already made keep their text.">Detail</label>
+          <div class="btn-group" id="label-detail">
+            <button data-label-detail="simple" title="Everyday names: click anywhere on a foot and get one 'Foot' callout; joints read 'Knee', 'Hip'">Simple</button>
+            <button data-label-detail="full" class="active" title="Anatomical names: every bone and muscle individually — 'Calcaneus', 'Rectus femoris', 'Knee joint'">Detailed</button>
+          </div>
+        </div>
+        <div class="btn-row">
+          <button id="label-highlighted" title="Add a label for everything the Highlight and Muscles panels currently pick out (small bones are grouped: 'Ribs', 'Carpal bones' …)">Label highlighted</button>
+          <button id="label-clear" disabled>Clear labels</button>
+        </div>
+        <div class="check-row">
+          <label><input type="checkbox" id="labels-visible" checked /> Show labels</label>
+        </div>
+        <div class="slider-row">
+          <div class="lbl"><span title="Label text height as a share of the frame height — the same on screen, in a 1080p video and in a 4K photo">Text size</span><span class="val" id="label-size-val">2.6%</span></div>
+          <input type="range" id="label-size" min="16" max="50" step="1" value="26" />
+          <div class="range-hint"><span>small</span><span>large (back of the room)</span></div>
+        </div>
+        <div id="label-list"></div>
+      </section>
+
+      <section class="collapsed" id="clips-section">
+        <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="clips-section">Movement clips</button></h2>
+        <div class="muted">Short looping videos of single joint movements for slides. Pick a movement: one dancer steps onto a clean stage, the camera frames the joint, and the overlays you tick are drawn in. Orbit freely to reframe. Your couple's pose returns when you exit.</div>
+        <div class="row">
+          <div id="clip-fig" class="btn-group" title="Which dancer demonstrates">
+            <button data-fig="leader" class="active">Leader</button>
+            <button data-fig="follower">Follower</button>
+          </div>
+          <div id="clip-side" class="btn-group" title="Which side moves (for trunk and neck: which way it bends or turns)">
+            <button data-side="L">Left</button>
+            <button data-side="R" class="active">Right</button>
+          </div>
+        </div>
+        <div class="row">
+          <select id="clip-move" title="The movement to demonstrate"></select>
+        </div>
+        <div class="row">
+          <select id="clip-layer" title="What the dancer is shown as. Prime movers only exist in the Muscles layer.">
+            <option value="body">Body</option>
+            <option value="skeleton">Skeleton</option>
+            <option value="muscle" selected>Muscles</option>
+          </select>
+          <select id="clip-pattern" title="Out and back: neutral → end range → neutral (loops seamlessly). Full sweep: also plays the opposite movement, e.g. flexion then extension.">
+            <option value="loop" selected>Out and back</option>
+            <option value="sweep">Full sweep (both ways)</option>
+          </select>
+        </div>
+        <div class="check-row">
+          <label title="Large movement name plus plane, axis and range"><input type="checkbox" id="clip-title" checked /> Title</label>
+          <label title="A protractor arc at the joint with the live angle; the dashed arc is the full range"><input type="checkbox" id="clip-angle" checked /> Angle + arc</label>
+          <label title="The plane the movement happens in and the axis it turns about, drawn through the joint"><input type="checkbox" id="clip-plane" checked /> Plane &amp; axis</label>
+        </div>
+        <div class="check-row">
+          <label title="Light up and name the muscles that produce the movement (Muscles layer)"><input type="checkbox" id="clip-movers" checked /> Prime movers</label>
+          <label title="Fade every other muscle so the prime movers stand alone"><input type="checkbox" id="clip-fade" /> Fade others</label>
+          <label title="Re-aim the camera at each movement. Untick to keep your own framing."><input type="checkbox" id="clip-autoframe" checked /> Auto-frame</label>
+        </div>
+        <div class="slider-row">
+          <div class="lbl"><span>Stroke time</span><span class="val" id="clip-stroke-val">2.0 s</span></div>
+          <input type="range" id="clip-stroke" min="8" max="50" step="1" value="20" />
+        </div>
+        <div class="slider-row">
+          <div class="lbl"><span title="Pause at end range so the audience can read the angle">Hold at end range</span><span class="val" id="clip-hold-val">1.0 s</span></div>
+          <input type="range" id="clip-hold" min="0" max="30" step="1" value="10" />
+        </div>
+        <div class="slider-row" id="clip-scrub-row" hidden>
+          <div class="lbl"><span id="clip-name">—</span><span class="val" id="clip-angle-val">0°</span></div>
+          <input type="range" id="clip-scrub" min="0" max="1000" step="1" value="0" />
+        </div>
+        <div class="btn-row">
+          <button id="clip-play" disabled>▶ Play</button>
+          <button id="clip-record" disabled title="Play the clip once from neutral and download it as a video (1920×1080 in the slide frame)">⏺ Record</button>
+          <select id="clip-format" title="MP4 (H.264) plays in PowerPoint, Keynote and Beamer's multimedia/media9; WebM is smaller but PowerPoint will not play it">
+            <option value="mp4" selected>MP4</option>
+            <option value="webm">WebM</option>
+          </select>
+          <select id="clip-loops" title="How many passes to record">
+            <option value="1" selected>×1</option>
+            <option value="2">×2</option>
+            <option value="3">×3</option>
+          </select>
+        </div>
+        <div class="btn-row">
+          <button id="clip-exit" disabled title="Leave the clip stage and put your couple back as they were">Exit clip stage</button>
+        </div>
+      </section>
+
+      <section id="embrace-section">
+        <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="embrace-section">Embrace</button></h2>
         <div class="check-row">
           <label title="Keep the arm frame through any movement: the leader's left hand joins the follower's right palm to palm (open side, his palm facing her and hers facing him; the elbows hang and the hands join at collarbone height — raise the clasp for a higher salon frame), his right palm stays on her back and her left palm on his upper arm (closed side).">
             <input type="checkbox" id="embrace-hands" /> Hold embrace (arms)
@@ -125,7 +273,7 @@
       </section>
 
       <section class="collapsed" id="pins-section">
-        <h2>Contact pins</h2>
+        <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="pins-section">Contact pins</button></h2>
         <div class="muted">Hold a spot on one dancer against a spot on the other through any move — his palm on her back, foot against foot for a parada. Author them with the <b>Pin spots</b> mode: click the first spot, then the matching spot on the partner. The partner of whoever you edit adapts: a pinned arm or leg re-solves to keep the contact, a torso spot pulls the whole dancer along.</div>
         <div id="pin-list"></div>
         <div class="btn-row">
@@ -133,8 +281,12 @@
         </div>
       </section>
 
-      <section class="collapsed">
-        <h2>Highlight</h2>
+      <section class="collapsed" id="highlight-section">
+        <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="highlight-section">Highlight</button></h2>
+        <div class="muted">Click a part to light it up and fade the rest. Each part has its own colour — click the swatch beside an active part to change it.</div>
+        <div class="muted" id="highlight-layer-note" hidden>
+          Highlights only show on the bones: switch to the <button id="highlight-enable-layer" class="linkish">Skeleton layer</button> to see them (the clothed body is one continuous skin).
+        </div>
         <div id="highlight-chips" class="chip-row"></div>
         <div class="btn-row">
           <button id="highlight-clear" disabled>Clear highlight</button>
@@ -142,7 +294,7 @@
       </section>
 
       <section class="collapsed" id="muscle-section">
-        <h2>Muscles</h2>
+        <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="muscle-section">Muscles</button></h2>
         <div class="muted" id="muscle-layer-note" hidden>
           Turn on the <button id="muscle-enable-layer" class="linkish">Muscles layer</button> to see these.
         </div>
@@ -155,7 +307,7 @@
       </section>
 
       <section id="joint-section">
-        <h2>Selected joint</h2>
+        <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="joint-section">Selected joint</button></h2>
         <div class="row" id="joint-picker">
           <div id="joint-fig-toggle" class="btn-group" title="Which dancer the joint grid targets">
             <button data-role="leader" class="active">Leader</button>
@@ -166,13 +318,13 @@
         <div id="joint-panel" class="muted">Click a joint on a figure — or pick one above — to select it.</div>
       </section>
 
-      <section>
-        <h2>Balance &amp; angles</h2>
+      <section id="balance-section">
+        <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="balance-section">Balance &amp; angles</button></h2>
         <div id="stats-panel"></div>
       </section>
 
       <section id="footmap-section">
-        <h2>Foot map</h2>
+        <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="footmap-section">Foot map</button></h2>
         <div class="row">
           <div id="footmap-fig" class="btn-group" title="Whose foot to map">
             <button data-fig="leader" class="active">Leader</button>
@@ -188,8 +340,8 @@
         <div id="footmap-note" class="muted"></div>
       </section>
 
-      <section class="collapsed">
-        <h2>Compare poses</h2>
+      <section class="collapsed" id="compare-section">
+        <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="compare-section">Compare poses</button></h2>
         <div class="btn-row">
           <button id="snap-a">Set A</button>
           <button id="snap-b">Set B</button>
@@ -208,13 +360,13 @@
         </div>
         <div class="btn-row">
           <button id="interp-play" disabled title="Animate the couple from pose A to pose B">▶ Play A→B</button>
-          <button id="interp-record" disabled title="Play A→B while recording the 3D view, then download it as a .webm video">⏺ Record</button>
+          <button id="interp-record" disabled title="Play A→B while recording the 3D view, then download it as a video (MP4 or WebM — set the format in the View section)">⏺ Record</button>
         </div>
         <div id="compare-panel" class="muted">Snapshot two poses to see joint-angle and COG changes.</div>
       </section>
 
       <section class="collapsed" id="sequence-section">
-        <h2>Sequence</h2>
+        <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="sequence-section">Sequence</button></h2>
         <div class="muted">Chain keyframes into a whole figure (a giro is 4+ poses): pose the couple, add a keyframe, repeat — then scrub or play the movement.</div>
         <div class="btn-row">
           <button id="seq-add" title="Append the current couple pose as a keyframe">+ Add keyframe</button>
@@ -228,7 +380,7 @@
         </div>
         <div class="btn-row">
           <button id="seq-play" disabled title="Animate the couple through every keyframe">▶ Play</button>
-          <button id="seq-record" disabled title="Play the sequence while recording the 3D view, then download it as a .webm video">⏺ Record video</button>
+          <button id="seq-record" disabled title="Play the sequence while recording the 3D view, then download it as a video (MP4 or WebM — set the format in the View section)">⏺ Record video</button>
         </div>
         <div class="btn-row">
           <button id="seq-export" disabled title="Download the sequence as a JSON file">Export file</button>
@@ -237,8 +389,8 @@
         </div>
       </section>
 
-      <section>
-        <h2>Poses</h2>
+      <section id="poses-section">
+        <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="poses-section">Poses</button></h2>
         <div class="row">
           <select id="preset-select"></select>
           <button id="preset-apply">Apply</button>
@@ -255,13 +407,19 @@
         </div>
       </section>
 
-      <section class="collapsed">
-        <h2>Dancers</h2>
+      <section class="collapsed" id="dancers-section">
+        <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="dancers-section">Dancers</button></h2>
         <div id="figure-config"></div>
       </section>
     </aside>
 
-    <div id="hint">Click a joint to pose · Drag limb: the toes caress the floor · Move hips slides the body over planted feet · Arrow keys nudge whatever is selected (hold to move · PageUp/Down = twist or up/down) · right-drag to orbit · scroll to zoom</div>
+    <!-- The app's one non-modal notice region (app.status in main.js): joint
+         limits, out-of-reach handles, failed saves/imports. DOM chrome, so it
+         is never part of an exported photo or video (those composite the GL and
+         overlay canvases only). Sits above #hint and wears the same pill. -->
+    <div id="status-line" role="status" aria-live="polite" hidden></div>
+
+    <div id="hint">Click a joint to pose · Drag limb: the toes caress the floor · Move hips slides the body over planted feet · Arrow keys nudge whatever is selected (hold to move · PageUp/Down = twist or up/down) · left-drag to orbit · right-drag to pan · scroll to zoom</div>
   </div>
   <script type="module" src="/src/main.js"></script>
 </body>

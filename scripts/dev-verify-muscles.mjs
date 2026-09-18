@@ -155,7 +155,12 @@ const twist = await page.evaluate(() => {
       else { botDisp += d; botN++; }
     }
     return {
-      name: sm.mesh.userData.muscleName, side: cx >= 0 ? 'R' : 'L', cx: +cx.toFixed(3),
+      // The belly's own side tag, not the sign of its WORLD x: the dancer does
+      // not stand at x = 0 (the preset places the couple), so a world-x test
+      // called both copies 'R' and the L/R asymmetry check below had nothing
+      // to compare.
+      name: sm.mesh.userData.muscleName, side: sm.mesh.userData.muscleSide ?? (cx >= 0 ? 'R' : 'L'),
+      cx: +cx.toFixed(3),
       topDisp: +(topDisp / Math.max(topN, 1)).toFixed(4),
       botDisp: +(botDisp / Math.max(botN, 1)).toFixed(4),
       topDZ: +(topDZ / Math.max(topN, 1)).toFixed(4),

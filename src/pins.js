@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { JOINTS, JOINT_TITLES } from './skeletonDef.js';
+import { JOINTS, JOINT_TITLES, legChain, armChain } from './skeletonDef.js';
 import { solveTwoBone } from './ik.js';
 
 // User-authored contact constraints: a spot on one dancer pinned to a spot on
@@ -30,7 +30,31 @@ const LEG = /^(?:hip|knee|ankle|toes|toe)_(L|R)$/;
 
 // A pin end's marker + the line between the two ends when they can't close.
 const END_COLOR = 0x69d2a2;
-const STRAINED_COLOR = 0xe0a45f;
+// "Anatomy says no": the app's single amber for a constraint that could not be
+// met — a strained pin, a joint at its limit, a drag handle the limb cannot
+// reach. main.js and style.css (--strain) share it, so one colour means one
+// thing everywhere.
+export const STRAIN_COLOR = 0xe0a45f;
+
+// The strain line itself: a segment drawn between what was ASKED FOR and what
+// anatomy actually delivered. Factored out of ContactPins.updateVisuals (which
+// still drives it exactly as before) so the out-of-reach drag handles in
+// main.js draw the same picture rather than inventing a second one.
+export function makeStrainLine() {
+  return new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
+    new THREE.LineBasicMaterial({ color: STRAIN_COLOR, transparent: true, opacity: 0.9 }),
+  );
+}
+
+// Point a strain line at its two ends (world space).
+export function setStrainLine(line, a, b) {
+  const pts = line.geometry.attributes.position;
+  pts.setXYZ(0, a.x, a.y, a.z);
+  pts.setXYZ(1, b.x, b.y, b.z);
+  pts.needsUpdate = true;
+  line.geometry.computeBoundingSphere();
+}
 
 const _spot = new THREE.Vector3();
 const _target = new THREE.Vector3();
@@ -106,10 +130,7 @@ export class ContactPins {
       new THREE.SphereGeometry(0.014, 12, 8),
       new THREE.MeshBasicMaterial({ color: END_COLOR, transparent: true, opacity: 0.9 }),
     );
-    const line = new THREE.Line(
-      new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
-      new THREE.LineBasicMaterial({ color: STRAINED_COLOR, transparent: true, opacity: 0.9 }),
-    );
+    const line = makeStrainLine();
     const viz = { a: mkBall(), b: mkBall(), line };
     this.group.add(viz.a, viz.b, viz.line);
     this.pins.push({ leader: leaderEnd, follower: followerEnd, viz });
@@ -179,9 +200,7 @@ export class ContactPins {
       const leg = arm ? null : end.node.match(LEG);
       if (!arm && !leg) continue;
       const side = (arm || leg)[1];
-      const chain = arm
-        ? { root: `shoulder_${side}`, mid: `elbow_${side}`, effector: `wrist_${side}`, hingeSign: -1 }
-        : { root: `hip_${side}`, mid: `knee_${side}`, effector: `ankle_${side}`, hingeSign: 1 };
+      const chain = arm ? armChain(side) : legChain(side);
       this.endWorld(role === 'leader' ? 'follower' : 'leader', pin, _target);
       // The spot is READ back through the frame it was STORED in (surfaceNode);
       // the effector stays a rig node because that is what the IK actually
@@ -219,14 +238,8 @@ export class ContactPins {
       const gap = a.distanceTo(b);
       const strained = gap > 0.02;
       pin.viz.line.visible = strained;
-      if (strained) {
-        const pts = pin.viz.line.geometry.attributes.position;
-        pts.setXYZ(0, a.x, a.y, a.z);
-        pts.setXYZ(1, b.x, b.y, b.z);
-        pts.needsUpdate = true;
-        pin.viz.line.geometry.computeBoundingSphere();
-      }
-      const color = strained ? STRAINED_COLOR : END_COLOR;
+      if (strained) setStrainLine(pin.viz.line, a, b);
+      const color = strained ? STRAIN_COLOR : END_COLOR;
       pin.viz.a.material.color.setHex(color);
       pin.viz.b.material.color.setHex(color);
     }

@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import {
   MASS_SEGMENTS, FOOT_CORNERS_L, FOOT_CORNERS_R, TOE_CORNERS_L, TOE_CORNERS_R,
+  FLOOR_CONTACT_FRAC,
 } from './skeletonDef.js';
 
 const _a = new THREE.Vector3();
@@ -21,7 +22,7 @@ export function computeCOG(figure, target = new THREE.Vector3()) {
 }
 
 // World-space sole corners of feet that are touching the floor, per foot.
-export function footContactsBySide(figure, threshold = 0.035) {
+export function footContactsBySide(figure, threshold = FLOOR_CONTACT_FRAC) {
   const bySide = { L: [], R: [] };
   figure.group.updateMatrixWorld(true);
   // Prefer a figure's heel-adjusted corners (see Figure.#applyHeel) so a heeled

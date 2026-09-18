@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import {
   JOINTS, JOINT_BY_NAME, DEG, clampAngle, FOOT_CORNERS_L, FOOT_CORNERS_R,
-  TOE_CORNERS_L, TOE_CORNERS_R, PART_OF_NODE,
+  TOE_CORNERS_L, TOE_CORNERS_R, PART_OF_NODE, PART_COLOR,
 } from './skeletonDef.js';
 import { buildSkeleton, buildMuscles } from './anatomy.js';
 import { LIMB_BASES, reverseWinding, BODY_RETARGET, normBoneName } from './skeletonMesh.js';
@@ -18,6 +18,7 @@ const _floorPt = new THREE.Vector3();
 const MUSCLE_HL_COLOR = 0xffce4a;
 const MUSCLE_HL_EMISSIVE = 0xffb020;
 const MUSCLE_HIDDEN_OPACITY = 0.06;
+const WHITE = new THREE.Color(0xffffff);
 
 // Centroid and smallest-variance axis (≈ the flat normal of a slab-like cloud,
 // e.g. a palm or a sole) of a set of points, via power iteration on
@@ -165,7 +166,7 @@ const _fingerQ = new THREE.Quaternion();
 const _handV = new THREE.Vector3(); // scratch for the hand-mesh measurements
 
 export class Figure {
-  constructor({ name, height = 1.72, mass = 70, color = 0x4d8fd1, skin = 0xd9a68a, skeleton = null, muscles = null, body = null, bodyKey = null, heelRise = 0, soleScale = null }) {
+  constructor({ name, height = 1.72, mass = 70, color = 0x4d8fd1, skin = 0xd9a68a, skeleton = null, muscles = null, body = null, bodyKey = null, heelRise = 0, moldedHeel = 0, soleScale = null, footNarrow = 1 }) {
     this.name = name;
     this.height = height;
     this.mass = mass;
@@ -173,10 +174,18 @@ export class Figure {
     // rigCalibration.js / #assertCalibration). Avatar-keyed ('man'/'woman')
     // because each Biped bind pose retargets differently; null skips the check.
     this.bodyKey = bodyKey;
-    // Heel height as a fraction of stature: raises the ankle (and everything the
-    // heel lifts) so a heeled avatar's foot sits natively on the floor instead
-    // of being squashed flat, and the skeletal foot pitches to match.
+    // FAKE heel for a genuinely FLAT-shoed avatar, as a fraction of stature:
+    // raises the ankle (and everything the heel lifts) so the foot sits heel-up
+    // on the floor instead of squashed flat, and pitches BOTH the skeleton and
+    // the clothed foot to match. Mutually exclusive with moldedHeel.
     this.heelRise = heelRise;
+    // REAL molded heel, as a fraction of stature, for an avatar whose shoe mesh
+    // ALREADY carries a heel (the woman avatar). The clothed shoe stands in its
+    // own heel with NO help — the ankle is not raised, the corners already sit on
+    // the floor, and the clothed foot is left alone — so this only pitches the
+    // bare SKELETON foot up at the heel to sit inside the shoe, and sizes the
+    // heel wedge. Mutually exclusive with heelRise. See #applyHeel.
+    this.moldedHeel = moldedHeel;
     // The sagittal pitch (degrees) #pitchHeeledFoot tilts the skeletal foot up at
     // the heel — 0 for a flat figure. The frame gate (dev-verify-frames) allows
     // the foot midline to sit this far off the shoe's flat sole; see measureAxes.
@@ -187,6 +196,12 @@ export class Figure {
     // shoe (the woman's heeled shoe is shorter in height-fractions). `front`
     // scales everything ahead of the ankle toward it; `width` scales laterally.
     this.soleScale = { front: 1, width: 1, ...(soleScale || {}) };
+    // Lateral squeeze (<1) of the BARE skeletal foot toward its own midline, for a
+    // figure whose avatar wears a shoe narrower than the atlas foot (the follower's
+    // heeled shoe): the foot fit matches the shoe's length + direction but NOT its
+    // width, so the atlas foot's 5th-metatarsal/little-toe edge otherwise pokes out
+    // past the shoe in skeleton/muscle view. See #narrowFoot. 1 = no squeeze.
+    this.footNarrow = footNarrow;
     this.color = color;
     this.skin = skin;
     this.skeletonMesh = skeleton; // parsed atlas bones, or null → procedural bones
@@ -251,16 +266,27 @@ export class Figure {
   #build() {
     const H = this.height;
 
-    // Joint hierarchy. A heeled figure lifts its ankles (and, riding them, the
-    // toes) so the raised heel — not a squashed-flat sole — is what stands on
-    // the floor; the extra height propagates up the closed leg chain.
+    // Joint hierarchy. ANY heeled figure raises its RIG ankle node (and, riding
+    // them, the toes) by the heel height: a real heel lifts the ankle joint off
+    // the floor, and this is the ankle the biomechanics (COG, de Leva masses),
+    // the balance corners and dancer-vs-dancer collision all read — so a heeled
+    // foot must sit above a flat one or the couple's interleaved feet collide
+    // where they shouldn't. The extra height propagates up the closed leg chain.
+    //   FAKE heel (heelLift, flat shoe): the ATLAS seats + the retargeted body
+    //   foot ride up with it too (see #buildAtlasNodes / #buildMeshBody), so the
+    //   flat shoe is pitched into a heel shape.
+    //   MOLDED heel (moldedHeel, real heeled shoe): only the RIG ankle rises; the
+    //   atlas seats and the body foot stay DOWN so the shoe — which already
+    //   carries its heel — grounds natively instead of floating en-pointe.
     this._heelLift = this.heelRise * H;
+    this._moldedHeel = this.moldedHeel * H;
+    const rigLift = this._heelLift || this._moldedHeel; // rig ankle raise (either heel)
     for (const def of JOINTS) {
       const node = new THREE.Object3D();
       node.name = `${this.name}:${def.name}`;
       node.position.set(def.offset[0] * H, def.offset[1] * H, def.offset[2] * H);
-      if (this._heelLift && (def.name === 'ankle_L' || def.name === 'ankle_R')) {
-        node.position.y += this._heelLift; // toes/toe are children → ride along
+      if (rigLift && (def.name === 'ankle_L' || def.name === 'ankle_R')) {
+        node.position.y += rigLift; // toes/toe are children → ride along
       }
       node.userData = { figure: this, jointName: def.name, def };
       this.nodes[def.name] = node;
@@ -330,9 +356,14 @@ export class Figure {
     // De-splay the skeletal hands/feet onto the clothed body's orientation so
     // the three layers coincide at the extremities (see #alignEndpointGeometry).
     if (this.skeletonMesh && this.bodyMesh) this.#alignEndpointGeometry();
-    // A heeled figure: pitch the skeletal foot down onto the floor and relocate
-    // its balance corners to match the raised, pitched heeled foot.
-    if (this._heelLift && this.skeletonMesh) this.#applyHeel();
+    // A heeled figure: pitch the skeletal foot up at the heel so the bare bones
+    // sit inside the shoe, draw the wedge, and (fake heel only) relocate the
+    // balance corners to the raised, pitched foot.
+    if ((this._heelLift || this._moldedHeel) && this.skeletonMesh) this.#applyHeel();
+    // Squeeze the bare skeletal foot laterally into a shoe narrower than the atlas
+    // foot (the foot analog of the hand desplay), so the little toe stops poking
+    // out past the shoe. Post-fit, so the frozen calibration is unaffected.
+    if (this.footNarrow !== 1 && this.skeletonMesh) this.#narrowFoot(this.footNarrow);
     this.setLayers({ skeleton: false, body: true, muscle: false });
     // Tripwire: warn (don't block) if the live calibration has drifted from the
     // frozen snapshot in rigCalibration.js. The hard gate is dev-verify-calibration.mjs.
@@ -422,10 +453,10 @@ export class Figure {
     // (see userData.boneRanges below) — landmarks.js selects verts by bone, and
     // a merged mesh with no name map would only be addressable per node.
     const groups = new Map();
-    const stash = (nodeName, material, geom, name) => {
+    const stash = (nodeName, material, geom, name, side) => {
       const key = `${nodeName}|${material}`;
       if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push({ geom, name });
+      groups.get(key).push({ geom, name, side });
     };
 
     for (const b of bones) {
@@ -451,7 +482,9 @@ export class Figure {
         const X = node.matrixWorld.clone().invert().multiply(this.group.matrixWorld).multiply(T);
         g.applyMatrix4(X);
         if (mirror) reverseWinding(g);
-        stash(nodeName, b.material, g, b.name);
+        // `side` (null for an unpaired axial bone) lets labels.js name a bone
+        // without its atlas ".r" tag and tell the mirrored copy from the source.
+        stash(nodeName, b.material, g, b.name, b.paired ? (mirror ? 'L' : 'R') : null);
       }
     }
 
@@ -466,7 +499,7 @@ export class Figure {
       let start = 0;
       for (const p of parts) {
         const count = p.geom.attributes.position.count;
-        boneRanges.push({ name: p.name, start, count });
+        boneRanges.push({ name: p.name, start, count, side: p.side });
         start += count;
       }
       parts.forEach((p) => p.geom.dispose());
@@ -559,12 +592,16 @@ export class Figure {
     const resolve = (base, side) => (LIMB_BASES.has(base) ? `${base}_${side}` : base);
 
     this.muscleMesh.muscles.forEach((m, i) => {
-      // Each belly owns its material (its left/right copies share it), so the
-      // Muscles panel can recolour or fade one belly without touching the rest.
-      const material = (i % 2 ? this.materials.muscleA : this.materials.muscleB).clone();
+      const baseMat = i % 2 ? this.materials.muscleA : this.materials.muscleB;
       // Every shipped belly is right-side: place it (Tpos) and mirror to the
       // left (Tneg). The node side follows the copy's side.
       for (const [side, T, mirror] of [['R', Tpos, false], ['L', Tneg, true]]) {
+        // Each belly COPY owns its material, so the Muscles panel can recolour
+        // or fade one belly without touching the rest AND a sided body-part
+        // highlight can light the left leg's bellies without the right's (the
+        // two copies used to share one material, so whichever side was styled
+        // last won and both legs showed it).
+        const material = baseMat.clone();
         const nodeName = resolve(m.node, side);
         // Ride the same atlas limb sub-tree as the bones (see #seatNode) so a
         // belly stays welded to the bone it lies on when the joint bends,
@@ -582,7 +619,8 @@ export class Figure {
           g.applyMatrix4(T);
           if (mirror) reverseWinding(g);
           const rideName = m.ride ? resolve(m.ride, side) : nodeName;
-          this.#addSkinnedMuscle(g, node, insNode, material, m.label, rideName, m.spread);
+          this.#addSkinnedMuscle(g, node, insNode, material, m.label, rideName, m.spread)
+            .userData.muscleSide = side;
         } else {
           // Rigid: bake into the node's local frame and hang it there.
           const g = m.geometry.clone();
@@ -591,6 +629,7 @@ export class Figure {
           if (mirror) reverseWinding(g);
           const mesh = new THREE.Mesh(g, material);
           mesh.userData.muscleName = m.label;
+          mesh.userData.muscleSide = side;
           mesh.userData.isMuscle = true;
           mesh.userData.muscleBaseColor = material.color.getHex();
           this.addMesh(nodeName, mesh, 'muscle', true, this.atlasNodes[nodeName] || null);
@@ -996,10 +1035,22 @@ export class Figure {
     // position each bone is snapped/aligned to; the offset from its rig node is
     // baked into the bone's local matrix so posing still pivots about the node.
     const atlas = this.calibration.rest; // the single neutral rest (computed in #build)
-    const target = (name) => {
+    const targetBase = (name) => {
       const p = atlas.get(name) || rest[name];
       return this._heelLift && HEEL_NODES.has(name) && atlas.has(name)
         ? p.clone().setY(p.y + this._heelLift) : p;
+    };
+    // Shoe stand-height lift (filled below once bones are known): our ankle node
+    // sits at the anthropometric malleolus (~7 cm), but the avatar's shoe bone
+    // sits ~10 cm up, so dropping it onto our ankle sinks the sole ~3 cm and the
+    // squash below flattens the whole shoe (toe box included) to compensate.
+    // Instead, raise the shoe's ankle so it stands at its natural height (the
+    // calf stretches to meet it, the squash relaxes toward 1); `targetBase` stays
+    // the true node position so the origin offset carries the lift.
+    const shoeLift = {}; // ankle joint name -> lift (m)
+    const target = (name) => {
+      const p = targetBase(name);
+      return shoeLift[name] ? p.clone().setY(p.y + shoeLift[name]) : p;
     };
 
     const avatar = cloneSkinned(src.scene);
@@ -1022,6 +1073,20 @@ export class Figure {
     let sideFor = { l: '_L', r: '_R' };
     const lThigh = boneByName.get('bip01lthigh');
     if (lThigh && (bindPos(lThigh).x > 0) !== (rest.hip_L.x > 0)) sideFor = { l: '_R', r: '_L' };
+
+    // How far to raise each shoe so it stands at (near) its natural height: the
+    // amount that would bring the foot squash `lam` to SHOE_STAND (1 = no squash
+    // at all, the shoe stands full height above a taller-than-skeletal ankle;
+    // lower keeps some squash but sits the shoe closer to the skeletal foot).
+    const SHOE_STAND = 1.0;
+    for (const s of ['l', 'r']) {
+      const footBone = boneByName.get(`bip01${s}foot`);
+      const ankleName = `ankle${sideFor[s]}`;
+      if (!footBone) continue;
+      const sink = bindPos(footBone).y * s0 - targetBase(ankleName).y; // sole sink if placed rigidly
+      shoeLift[ankleName] = Math.max(0, SHOE_STAND * (bindPos(footBone).y * s0) - targetBase(ankleName).y);
+      if (sink <= 0) shoeLift[ankleName] = 0; // already heeled / no sink → leave alone
+    }
 
     // Expand the retarget table to both sides and resolve alignment rotations
     // (inherit entries reuse an earlier bone's rotation, e.g. foot ← calf).
@@ -1059,9 +1124,10 @@ export class Figure {
         alignR.set(boneName, R);
         // Snap the bone origin to the atlas joint, expressed in the PARENT node's
         // rest frame. An atlas seat node already sits at the atlas joint (heel
-        // lift included — target() and the seat agree), so the offset is zero;
-        // a rig node (torso) carries the rig→atlas delta.
-        const seatRest = this.atlasNodes[jointName] ? target(jointName) : rest[jointName];
+        // lift included — targetBase() and the seat agree), so the offset is zero
+        // unless a shoe lift raises the target above its node; a rig node (torso)
+        // carries the rig→atlas delta.
+        const seatRest = this.atlasNodes[jointName] ? targetBase(jointName) : rest[jointName];
         const originDelta = target(jointName).clone().sub(seatRest);
         plans.set(bone, { node, jointName, q, rotBind, R, axialLen, originDelta, jointY: target(jointName).y, squash: !!tpl.squash });
       }
@@ -1078,8 +1144,9 @@ export class Figure {
       if (p.squash && p.q.y * s0 > 1e-4) {
         // Vertical squash so the sole reaches exactly y = 0 at rest: the bind
         // sole sits q.y below the bone; our joint sits jointY above the floor.
-        // A heeled figure raises its ankle to the shoe's natural sole depth, so
-        // lam → 1 and the heel is preserved instead of flattened.
+        // With the shoe stand-height lift above, jointY is raised to (near) the
+        // shoe's natural sole depth, so lam → SHOE_STAND (1 = no flatten at all,
+        // the toe box keeps its shape); a heeled figure was already there.
         const lam = THREE.MathUtils.clamp(p.jointY / (p.q.y * s0), 0.3, 1);
         local.premultiply(m.makeScale(1, lam, 1));
       }
@@ -1340,40 +1407,51 @@ export class Figure {
   // draw a translucent outline of the shoe for the skeleton/muscle views (where
   // the shoe itself is hidden).
   #applyHeel() {
-    // Floor corners: drop back to the shoe sole. The ankle raise floated them by
-    // heelLift; the shoe still contacts heel-block + ball flat on the floor, so
-    // just lower each corner by heelRise (fraction of height) — no pitch. Bases
-    // on this figure's soleScale-fitted corners (built in #build), not the raw
-    // shared tables.
-    const drop = (corners) => corners.map(([x, y, z]) => [x, y - this.heelRise, z]);
+    // Height of the heel the skeletal foot pitches into and the wedge draws:
+    // the FAKE lift for a flat shoe, else the MOLDED heel of a real heeled shoe.
+    const lift = this._heelLift || this._moldedHeel;
+    const heelFrac = this.heelRise || this.moldedHeel; // same height as a stature fraction
+    // Either heel raised the RIG ankle node (see #build), floating the balance
+    // corners; the shoe still contacts heel-block + ball flat on the floor, so
+    // lower each corner by the heel fraction to put them back on the sole. Bases
+    // on this figure's soleScale-fitted corners (built in #build).
+    const drop = (corners) => corners.map(([x, y, z]) => [x, y - heelFrac, z]);
     this.footCorners = { _L: drop(this.footCorners._L), _R: drop(this.footCorners._R) };
     this.toeCorners = { _L: drop(this.toeCorners._L), _R: drop(this.toeCorners._R) };
-    this.#pitchHeeledFoot();
-    for (const side of ['_L', '_R']) this.#buildHeelOutline(side);
+    // Pitch the bare skeleton foot into the heel. Also pitch the CLOTHED foot for
+    // a fake heel (its flat shoe has no heel of its own); a molded shoe already
+    // carries one, so leave the clothed foot alone or it would double-count.
+    this.#pitchHeeledFoot(lift, !!this._heelLift);
+    for (const side of ['_L', '_R']) this.#buildHeelOutline(side, lift);
   }
 
-  // Pitch a heeled figure's foot heel-up — BOTH the bare skeleton and the
-  // clothed body — so it sits in the heeled shoe the way a real foot does:
-  // calcaneus lifted onto the heel, forefoot on the floor, breaking at the MTP,
-  // instead of lying flat with the heel on the ground.
+  // Pitch a heeled figure's foot heel-up so it sits in the shoe the way a real
+  // foot does: calcaneus lifted onto the heel, forefoot on the floor, breaking
+  // at the MTP, instead of lying flat with the heel on the ground.
   //
-  // The heel is a FAKE: both avatars ship FLAT shoes, and a figure is "heeled"
-  // only by #build raising its ankle node by heelLift. Left alone, each layer
-  // fakes the heel differently and they disagree — the mannequin's heel reads
-  // higher than the skeleton's. The skeleton starts flat: its endpoint axis fit
-  // (ENDPOINT_FITS, mode 'axis') lands it on the shoe's OUTER sole (flat on the
-  // floor) while the ankle node rides heelLift up, so the leg meets the foot
-  // heelLift above the bones. The BODY doesn't fit — its foot bones just ride the
-  // raised ankle+toe nodes RIGIDLY (no ball-pitch), so the flat shoe stretches
-  // heel-up instead of tilting cleanly and the toe box deforms (pinched/drooped).
+  // `lift` is the heel height (figure-local metres); `pitchBody` says whether the
+  // clothed foot needs pitching too. Two callers:
   //
-  // Both are fixed by the SAME rotation about the ball (the MTP / toes joint) by
-  // atan2(heelLift, run): it rotates only the ankle-region mesh / the foot bone
-  // (bip01*foot) — lifting its ankle end up to the raised ankle node — while the
-  // phalanges (toes mesh) / toe bone (bip01*toe0), which ride the toes node, stay
-  // flat in the toe box, so the break falls at the MTP as in a real heeled shoe.
-  // The foot bone rides the same atlas ankle node as the skeleton mesh, so the
-  // identical transform lands both layers on one heel.
+  //  - FAKE heel (heelLift): both this avatar's shoe is FLAT and its ankle node
+  //    was raised by heelLift, so BOTH layers need the pitch. The skeleton's
+  //    endpoint axis fit (ENDPOINT_FITS, mode 'axis') lands it flat on the shoe's
+  //    OUTER sole while the ankle rides heelLift up, leaving the leg meeting the
+  //    foot heelLift above the bones. The BODY's foot bones just rode the raised
+  //    ankle rigidly (no ball-pitch), so the flat shoe stretched heel-up and the
+  //    toe box deformed. pitchBody = true fixes both.
+  //  - MOLDED heel: the shoe mesh already carries the heel and the ankle was NOT
+  //    raised, so the CLOTHED foot already stands correctly — pitching it too
+  //    would double-count the heel (the old en-pointe float). Only the bare
+  //    SKELETON, which the axis fit still lands flat on the outer sole, needs the
+  //    pitch to climb inside the shoe. pitchBody = false.
+  //
+  // The pitch is one rotation about the ball (the MTP / toes joint) by
+  // atan2(lift, run): it rotates the ankle-region mesh / the foot bone
+  // (bip01*foot) — lifting its ankle end — while the phalanges (toes mesh) / toe
+  // bone (bip01*toe0), which ride the toes node, stay flat in the toe box, so the
+  // break falls at the MTP as in a real heeled shoe. The foot bone rides the same
+  // atlas ankle node as the skeleton mesh, so the identical transform lands both
+  // layers on one heel.
   //
   // Baked into each matrix ONCE (they ride their node rigidly, so the pitch holds
   // through any pose) and COMPOSED with — never overwrites — the fit matrix
@@ -1381,7 +1459,7 @@ export class Figure {
   // matrix outright would erase the fit/retarget on exactly the foot that needs
   // it. Runs after the calibration is recorded, so the frozen snapshot (and
   // dev-verify-calibration) is unaffected — no re-bake needed.
-  #pitchHeeledFoot() {
+  #pitchHeeledFoot(lift, pitchBody) {
     this.group.updateMatrixWorld(true);
     const gInv = this.group.matrixWorld.clone().invert();
     const local = (name) => this.#seatNode(name).getWorldPosition(new THREE.Vector3()).applyMatrix4(gInv);
@@ -1392,8 +1470,8 @@ export class Figure {
       const run = ball.z - ankle.z; // horizontal ball→ankle distance
       if (run < 1e-4) continue;
       // Heel-up rotation about the figure-local lateral (X) axis that lifts the
-      // foot's ankle end by heelLift over that run — back up to the raised node.
-      const theta = Math.atan2(this._heelLift, run);
+      // foot's ankle end by `lift` over that run.
+      const theta = Math.atan2(lift, run);
       this.heelPitchDeg = THREE.MathUtils.radToDeg(theta); // both sides equal
 
       const pitch = new THREE.Matrix4()
@@ -1408,18 +1486,55 @@ export class Figure {
         mesh.matrixAutoUpdate = false;
         mesh.matrix.copy(pl.clone().invert().multiply(pitch).multiply(pl).multiply(mesh.matrix));
       }
-      // Pitch the CLOTHED foot the same way. The body's flat shoe was faking its
-      // heel only by riding the raised ankle node rigidly (no ball-pitch), so it
-      // tilted more than the skeleton's block and deformed the toe box. The foot
-      // bone (bip01*foot) rides the same atlas ankle node as the skeleton mesh,
-      // so the identical about-the-ball pitch lands it on the same heel; the toe
-      // bone (bip01*toe0) rides the toes node and is left flat, so the shoe now
-      // breaks at the MTP like a real heeled shoe instead of stretching.
-      const footBone = this.jointBone && this.jointBone[`ankle${side}`];
+      // Pitch the CLOTHED foot the same way (fake heel only — a molded shoe
+      // already carries its heel). The foot bone (bip01*foot) rides the same
+      // atlas ankle node as the skeleton mesh, so the identical about-the-ball
+      // pitch lands it on the same heel; the toe bone (bip01*toe0) rides the toes
+      // node and is left flat, so the shoe breaks at the MTP instead of stretching.
+      const footBone = pitchBody && this.jointBone && this.jointBone[`ankle${side}`];
       if (footBone && footBone.parent) {
         const pl = gInv.clone().multiply(footBone.parent.matrixWorld);
         footBone.matrixAutoUpdate = false;
         footBone.matrix.copy(pl.clone().invert().multiply(pitch).multiply(pl).multiply(footBone.matrix));
+      }
+    }
+  }
+
+  // Narrow the BARE skeletal foot laterally (toward its own sagittal midline) so
+  // it sits inside a shoe narrower than the atlas foot — the foot analog of the
+  // hand desplay (#handDesplayRotations tucks the splayed atlas fingers into the
+  // glove). The foot's endpoint fit (ENDPOINT_FITS, mode 'axis') matches the
+  // shoe's LENGTH and DIRECTION but NOT its WIDTH, so a figure whose avatar wears
+  // a narrow shoe (the follower's heeled shoe) has its 5th-metatarsal / little-toe
+  // edge poke out past the shoe in skeleton / muscle view (measured ~1 cm at the
+  // ball). `factor` (<1) scales x about each foot's own sagittal plane (the ankle
+  // node's x), narrowing the ankle-region (metatarsals) AND toes meshes together.
+  //
+  // Like #pitchHeeledFoot: the figure-frame squeeze is re-expressed in each mesh's
+  // parent-node frame and COMPOSED with — never overwriting — the fit / heel-pitch
+  // matrix already on the mesh, and it runs AFTER the calibration is recorded, so
+  // the frozen snapshot (and dev-verify-calibration) is unaffected — no re-bake.
+  // The squeeze is perpendicular to the foot's midline, so the foot's aim and
+  // length (what the frame gate checks) are untouched. Skeleton + muscle only;
+  // the clothed shoe is already the right width.
+  #narrowFoot(factor) {
+    this.group.updateMatrixWorld(true);
+    const gInv = this.group.matrixWorld.clone().invert();
+    const m = new THREE.Matrix4();
+    for (const side of ['_L', '_R']) {
+      const cx = this.#seatNode(`ankle${side}`).getWorldPosition(new THREE.Vector3())
+        .applyMatrix4(gInv).x; // foot's sagittal plane (figure-local)
+      const squeeze = new THREE.Matrix4().makeTranslation(cx, 0, 0)
+        .multiply(m.makeScale(factor, 1, 1))
+        .multiply(new THREE.Matrix4().makeTranslation(-cx, 0, 0));
+      for (const layer of ['skeleton', 'muscle']) {
+        for (const mesh of this.layerMeshes[layer]) {
+          const jn = this.#nodeNameOf(mesh);
+          if (jn !== `ankle${side}` && jn !== `toes${side}`) continue;
+          const pl = gInv.clone().multiply(mesh.parent.matrixWorld);
+          mesh.matrixAutoUpdate = false;
+          mesh.matrix.copy(pl.clone().invert().multiply(squeeze).multiply(pl).multiply(mesh.matrix));
+        }
       }
     }
   }
@@ -1429,10 +1544,10 @@ export class Figure {
   // floor at rest and rides the foot when it is posed. Shown only when the body
   // avatar is hidden (skeleton / muscle views), where it stands in for the shoe
   // the bones are wearing. Built from this figure's fitted sole corners, so it
-  // tracks the balance footprint and any soleScale change for free.
-  #buildHeelOutline(side) {
+  // tracks the balance footprint and any soleScale change for free. `hl` is the
+  // wedge height (the fake heelLift or the real molded heel).
+  #buildHeelOutline(side, hl) {
     const H = this.height;
-    const hl = this._heelLift;
     const ankleNode = this.nodes[`ankle${side}`];
     const toesNode = this.nodes[`toes${side}`];
     if (!ankleNode || !toesNode) return;
@@ -1744,30 +1859,55 @@ export class Figure {
 
   // ------------------------------------------------------------- highlight
   // Highlight the given body parts (Set of BODY_PARTS ids): their meshes get
-  // an emissive glow, everything else goes ghost-translucent. Works on every
-  // layer because materials are swapped per mesh, not per layer.
+  // an emissive glow IN THAT PART'S COLOUR, everything else goes
+  // ghost-translucent. Works on every layer because materials are swapped per
+  // mesh, not per layer.
 
-  #highlightVariant(base, kind) {
+  // Each (base material, colour) pair gets its own cloned variant, cached — a
+  // part recoloured from the Highlight panel must not restyle the material of
+  // every other part sharing that base.
+  #highlightVariant(base, kind, color = null) {
     this._hlCache ??= new Map();
-    let pair = this._hlCache.get(base);
-    if (!pair) {
-      const lit = base.clone();
-      lit.emissive = new THREE.Color(0xcc8a22);
-      lit.emissiveIntensity = 0.45;
-      lit.transparent = false;
-      lit.opacity = 1;
-      const dim = base.clone();
-      dim.transparent = true;
-      dim.opacity = 0.13;
-      dim.depthWrite = false;
-      pair = { lit, dim };
-      this._hlCache.set(base, pair);
+    let byKey = this._hlCache.get(base);
+    if (!byKey) this._hlCache.set(base, byKey = new Map());
+    const key = kind === 'lit' ? `lit|${color}` : 'dim';
+    let mat = byKey.get(key);
+    if (!mat) {
+      mat = base.clone();
+      if (kind === 'lit') {
+        const c = new THREE.Color(color);
+        mat.emissive = c.clone();
+        mat.emissiveIntensity = 0.45;
+        // Bone is near-white, so an emissive glow alone washes every hue out to
+        // the same pale cream — tint the diffuse colour too, and the parts stay
+        // tellable apart.
+        if (mat.color) mat.color = mat.color.clone().lerp(c, 0.5);
+        mat.transparent = false;
+        mat.opacity = 1;
+      } else {
+        mat.transparent = true;
+        mat.opacity = 0.13;
+        mat.depthWrite = false;
+      }
+      byKey.set(key, mat);
     }
-    return pair[kind];
+    return mat;
   }
 
-  setHighlight(parts) {
+  // The colour a part lights in: the user's pick (Highlight panel) if it has
+  // one, else the part's own default from BODY_PARTS.
+  #partColor(part) {
+    return this.highlightColors?.get(part) ?? PART_COLOR[part] ?? '#cc8a22';
+  }
+
+  // `colors`: Map/object of part id → hex, or null/omitted to keep the current
+  // choices (the common case — toggling which parts are lit).
+  setHighlight(parts, colors = undefined) {
     this.highlightParts = parts && parts.size ? new Set(parts) : null;
+    if (colors !== undefined) {
+      this.highlightColors = colors
+        ? new Map(colors instanceof Map ? colors : Object.entries(colors)) : null;
+    }
     this.#applyHighlight();
     this.#applyMuscleStyle(); // muscles dim/light with the body-part highlight too
   }
@@ -1798,18 +1938,29 @@ export class Figure {
       if (!mesh.userData.isMuscle) continue;
       const label = mesh.userData.muscleName;
       let state;
+      let partColor = null; // set only when the body-part highlight is what lights it
       if (hidden && hidden.has(label)) state = 'hidden';
-      else if (lit && lit.has(label)) state = 'lit';
+      // A bare label lights both sides; `${label}|L` / `|R` lights one (the
+      // movement clips light only the moving side's prime movers).
+      else if (lit && (lit.has(label) || lit.has(`${label}|${mesh.userData.muscleSide}`))) state = 'lit';
       else if (parts) {
         const jointName = this.#jointNameOf(mesh);
         const part = jointName ? PART_OF_NODE[jointName] : null;
         state = parts.has(part) ? 'lit' : 'dim';
+        if (state === 'lit') partColor = this.#partColor(part);
       } else state = 'normal';
 
       const mat = mesh.material;
       if (state === 'lit') {
-        mat.color.setHex(MUSCLE_HL_COLOR);
-        mat.emissive.setHex(MUSCLE_HL_EMISSIVE);
+        if (partColor) {
+          // The belly takes the part's hue, lightened so it still reads as flesh
+          // over the bones, with the pure hue as its glow.
+          mat.emissive.set(partColor);
+          mat.color.set(partColor).lerp(WHITE, 0.45);
+        } else {
+          mat.color.setHex(MUSCLE_HL_COLOR);
+          mat.emissive.setHex(MUSCLE_HL_EMISSIVE);
+        }
         mat.emissiveIntensity = 0.5;
         mat.transparent = false; mat.opacity = 1; mat.depthWrite = true;
       } else {
@@ -1842,7 +1993,9 @@ export class Figure {
       // joint they belong to explicitly; everything else walks up to its node.
       const jointName = this.#jointNameOf(o);
       const part = jointName ? PART_OF_NODE[jointName] : null;
-      o.material = this.#highlightVariant(base, parts.has(part) ? 'lit' : 'dim');
+      o.material = parts.has(part)
+        ? this.#highlightVariant(base, 'lit', this.#partColor(part))
+        : this.#highlightVariant(base, 'dim');
     });
   }
 
@@ -1867,13 +2020,26 @@ export class Figure {
     }
   }
 
+  // Pull a joint back inside its anatomical range. Returns HOW FAR it had to
+  // move — the largest per-axis |before − after|, in radians, or 0 if the pose
+  // was already legal. That return is the only trace a clamp leaves: without
+  // it a limb simply stops and the app looks broken rather than anatomical.
+  // The per-frame solvers (solveTwoBone, flattenFoot, groundPlantedLeg,
+  // pivotHips, the embrace) clamp constantly as part of converging and ignore
+  // it; only the direct user-edit paths in main.js report it.
   clampJoint(name) {
     const def = JOINT_BY_NAME[name];
-    if (!def || !def.limits) return;
+    if (!def || !def.limits) return 0;
     const r = this.nodes[name].rotation;
-    r.x = clampAngle(r.x, def.limits.x);
-    r.y = clampAngle(r.y, def.limits.y);
-    r.z = clampAngle(r.z, def.limits.z);
+    let worst = 0;
+    for (const ax of ['x', 'y', 'z']) {
+      const before = r[ax];
+      const after = clampAngle(before, def.limits[ax]);
+      if (after === before) continue;
+      r[ax] = after;
+      worst = Math.max(worst, Math.abs(after - before));
+    }
+    return worst;
   }
 
   getPose() {
