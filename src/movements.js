@@ -65,7 +65,12 @@ const BICEPS = ['Biceps brachii', 'Long head of biceps brachii', 'Short head of 
 const TRICEPS = ['Triceps brachii', 'Long head of triceps brachii', 'Lateral head of triceps brachii', 'Medial head of triceps brachii'];
 const HAMSTRINGS = ['Hamstrings', 'Long head of biceps femoris', 'Semitendinosus', 'Semimembranosus', 'Short head of biceps femoris'];
 const QUADS = ['Quadriceps', 'Rectus femoris', 'Vastus lateralis', 'Vastus medialis', 'Vastus intermedius'];
-const GASTROC = ['Gastrocnemius', 'Lateral head of gastrocnemius', 'Medial head of gastrocnemius'];
+// The calf acts on the ankle THROUGH its tendon: the bellies now ride the femur
+// and cross the knee (their real origin), and the Achilles spans the ankle, so
+// the callout has to cover the whole muscle-tendon unit or an ankle clip would
+// highlight only the half that cannot move there.
+const GASTROC = ['Gastrocnemius', 'Lateral head of gastrocnemius', 'Medial head of gastrocnemius',
+  'Calcaneal tendon'];
 const ILIOPSOAS = ['Iliopsoas', 'Iliacus', 'Psoas major'];
 const ADDUCTORS = ['Adductors', 'Adductor longus', 'Adductor magnus', 'Adductor brevis'];
 const RHOMBOIDS = ['Rhomboids', 'Rhomboid major', 'Rhomboid minor'];
@@ -79,6 +84,17 @@ export const MOVEMENTS = [
   { id: 'sh_ext', group: 'Shoulder', title: 'Shoulder extension', plane: 'sagittal', frame: 'arm', pair: 'sh_flex',
     drive: [{ joint: 'shoulder', axis: 'x', to: 45 }],
     movers: ['Latissimus dorsi', 'Teres major', ['Deltoid (posterior)', 'Deltoid'], ['Triceps (long head)', 'Long head of triceps brachii']] },
+  // NOTE — scapulohumeral rhythm is NOT modelled here: the arm abducts 170° over
+  // a scapula that does not move, so the trapezius and serratus this row names
+  // are doing nothing visible even though they are now correctly seated on the
+  // blade. Adding `{ joint: 'scapula', axis: 'z', to: 20 }` was tried and
+  // reverted: it makes dev-verify-studio read the row as moving the WRONG WAY on
+  // both sides (score -0.111), because that check measures the marker's swing
+  // about the PRIMARY joint's own axis and a second joint turning in the same
+  // plane corrupts it. The opposite sign is not the answer either — the left
+  // side's scapula z range is [-12, 25], so -20 is out of range and would trip
+  // the limit test instead. Fixing this means teaching the direction check about
+  // multi-joint drives in one plane first.
   { id: 'sh_abd', group: 'Shoulder', title: 'Shoulder abduction', plane: 'frontal', frame: 'arm', pair: 'sh_add',
     drive: [{ joint: 'shoulder', axis: 'z', to: 170 }],
     movers: [['Deltoid (middle)', 'Deltoid'], 'Supraspinatus', 'Trapezius', 'Serratus anterior'] },
@@ -213,7 +229,11 @@ export const MOVEMENTS = [
   { id: 'to_ext', group: 'Ankle & foot', title: 'Toe extension (MTP)', plane: 'sagittal', frame: 'foot', pair: 'to_flex',
     base: FOOT_UP, marker: { node: 'toes', axis: 'z' },
     drive: [{ joint: 'toes', axis: 'x', to: -70 }],
-    movers: ['Extensor hallucis longus', 'Extensor digitorum longus'] },
+    // The bellies sit up the shank and stop at the ankle; only their long
+    // TENDONS cross the MTP, so the callout has to include them or this clip
+    // highlights nothing that can move (see the `ankle` group in MUSCLE_NODE).
+    movers: [['Extensor digitorum longus', 'Extensor digitorum longus', 'Extensor digitorum longus tendons'],
+      'Extensor hallucis longus'] },
   { id: 'to_flex', group: 'Ankle & foot', title: 'Toe flexion (MTP)', plane: 'sagittal', frame: 'foot', pair: 'to_ext',
     base: FOOT_UP, marker: { node: 'toes', axis: 'z' },
     drive: [{ joint: 'toes', axis: 'x', to: 35 }],

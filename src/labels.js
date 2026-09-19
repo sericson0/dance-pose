@@ -38,7 +38,21 @@ export const JOINT_LABELS_SIMPLE = {
 };
 
 // Callout text for atlas muscle names that read oddly once "muscle" is dropped.
-const MUSCLE_TEXT = { 'Rectus abdominal': 'Rectus abdominis' };
+// The atlas's own labels, shortened to what a callout should say. The long
+// tendons are shipped because a belly alone stops short of the joint it acts
+// across (see MUSCLE_NODE in skeletonMesh.js), but their atlas names are
+// descriptions rather than names.
+const MUSCLE_TEXT = {
+  'Rectus abdominal': 'Rectus abdominis',
+  'Quadriceps common tendon and patellar ligament': 'Patellar tendon',
+  'Calcaneal tendon': 'Calcaneal tendon (Achilles)',
+  'Common tendon of biceps brachii': 'Biceps tendon',
+  'Common tendon of triceps brachii': 'Triceps tendon',
+  'Common tendon of biceps femoris': 'Biceps femoris tendon',
+  'Semimembranosus muscle tendon': 'Semimembranosus tendon',
+  'Pes anserinus common tendon': 'Pes anserinus',
+  'Extensor digitorum longus tendons': 'Extensor digitorum longus tendons',
+};
 
 // Kind → accent colour (the anchor dot and the pill's edge bar).
 export const KIND_COLORS = { bone: '#e6d9b8', muscle: '#e0645f', joint: '#5b9bd5' };

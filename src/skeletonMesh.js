@@ -84,6 +84,14 @@ export function classifyBone(rawName) {
 const MUSCLE_NODE = new Map(Object.entries({
   // Thigh + hip → hip.
   hip: [
+    // Long tendons of the thigh, shipped for the same reason as the Achilles:
+    // the quadriceps bellies stop 5-7 cm ABOVE the knee joint line (and 2-4 cm
+    // above the top of the patella), so without the quadriceps/patellar unit
+    // there is nothing spanning the knee and the group had to be stretched
+    // across the gap to reach the shin.
+    'Quadriceps common tendon and patellar ligament.r',
+    'Common tendon of biceps femoris.r', 'Semimembranosus muscle tendon.r',
+    'Pes anserinus common tendon.r',
     'Rectus femoris.r', 'Vastus lateralis muscle.r', 'Vastus medialis muscle.r',
     'Vastus intermedius muscle.r', 'Sartorius muscle.r', 'Gracilis muscle.r',
     'Adductor longus.r', 'Adductor brevis.r', 'Adductor magnus.r', 'Pectineus muscle.r',
@@ -91,17 +99,42 @@ const MUSCLE_NODE = new Map(Object.entries({
     'Iliacus muscle.r', 'Psoas major.r', 'Piriformis muscle.r',
     'Long head of biceps femoris.r', 'Short head of biceps femoris.r',
     'Semitendinosus muscle.r', 'Semimembranosus muscle.r',
+    // Gastrocnemius originates on the FEMORAL CONDYLES, so it rides the femur
+    // and crosses the KNEE — the joint it was previously not modelled across at
+    // all. It sat on `knee` (the tibia) with an ankle insert, which welded its
+    // femoral head to the shin: measured, that origin slid 108 mm off the
+    // condyles at 145° of flexion and 80 mm at only 90°, so it was wrong in
+    // every bent-knee tango pose, not just the clip. Two nodes cannot express a
+    // two-joint muscle, but they no longer have to: the CALCANEAL TENDON is now
+    // shipped and spans the ankle, which is exactly the division of labour the
+    // real unit has.
+    'Lateral head of gastrocnemius.r', 'Medial head of gastrocnemius.r',
   ],
   // Shank + foot movers → knee (holds the tibia/fibula).
   knee: [
-    'Lateral head of gastrocnemius.r', 'Medial head of gastrocnemius.r', 'Soleus muscle.r',
+    // The Achilles. Without it the calf ended ~13 cm short of the ankle pivot,
+    // which is both a visible bare-bone gap down the back of the shin and the
+    // reason the triceps surae had no tissue on the far side of the joint to
+    // anchor with. A tendon is the part of the unit that actually crosses, so
+    // shipping it is what lets the belly stay put and the TENDON do the moving.
+    'Calcaneal tendon.r',
+    'Soleus muscle.r',
     'Tibialis anterior muscle.r', 'Tibialis posterior muscle.r',
     'Fibularis longus muscle.r', 'Fibularis brevis muscle.r',
     'Extensor digitorum longus.r', 'Extensor hallucis longus.r',
     'Flexor digitorum longus.r', 'Flexor hallucis longus.r',
   ],
+  // Foot → ankle. The long toe-extensor tendons are the only part of the
+  // digital chain that crosses the MTP, and a belly can only span two joints
+  // here, so the MUSCLE stays knee→ankle and its TENDON rides ankle→toes. That
+  // is what makes the toe clips show something moving: before, the toes rotated
+  // 70° inside tendons that stopped dead at the ankle.
+  ankle: [
+    'Extensor digitorum longus tendons.r',
+  ],
   // Upper arm → shoulder.
   shoulder: [
+    'Common tendon of biceps brachii.r', 'Common tendon of triceps brachii.r',
     'Deltoid muscle.r', 'Long head of biceps brachii.r', 'Short head of biceps brachii.r',
     'Brachialis muscle.r', 'Coracobrachialis muscle.r',
     'Long head of triceps brachii.r', 'Lateral head of triceps brachii.r',
@@ -112,10 +145,22 @@ const MUSCLE_NODE = new Map(Object.entries({
     'Brachioradialis muscle.r', 'Anconeus muscle.r', 'Supinator.r', 'Pronator quadratus.r',
     'Flexor carpi radialis.r', 'Extensor digitorum.r',
   ],
-  // Shoulder girdle + rotator cuff + trunk → chest.
+  // Trunk-anchored arm muscles → chest. Only the two that really do originate
+  // on the axial skeleton: pectoralis major (sternum, clavicle, ribs) and
+  // latissimus dorsi (thoracolumbar fascia, spine, iliac crest).
   chest: [
-    'Pectoralis major.r', 'Pectoralis minor muscle.r', 'Trapezius muscle.r',
-    'Latissimus dorsi.r', 'Serratus anterior muscle.r',
+    'Pectoralis major.r', 'Latissimus dorsi.r',
+  ],
+  // Shoulder girdle sheets + rotator cuff → the SCAPULA. Every one of these
+  // attaches to the shoulder blade, and `scapula_L/R` is a real rig joint that
+  // four movement clips drive — but they all used to ride `chest`, so the blade
+  // slid out from under motionless muscle and the girdle clips animated none of
+  // the prime movers their own callouts name (measured: 0.0 mm world motion for
+  // all five sheets, 44-83 mm of cuff detachment at only ±25° of scapular
+  // travel). The sheets insert toward `chest` (their axial origin), the cuff
+  // toward `shoulder` (its humeral insertion) — see MUSCLE_INSERT.
+  scapula: [
+    'Trapezius muscle.r', 'Serratus anterior muscle.r', 'Pectoralis minor muscle.r',
     'Rhomboid major muscle.r', 'Rhomboid minor muscle.r',
     'Supraspinatus muscle.r', 'Infraspinatus muscle.r',
     'Teres major muscle.r', 'Teres minor muscle.r', 'Subscapularis muscle.r',
@@ -144,6 +189,17 @@ const TRUNK_SHEETS = new Set([
   'Internal abdominal oblique muscle.r',
 ].map(norm));
 
+// Girdle sheets now RIDE the scapula (so the blade carries them), but they are
+// back/chest-wall muscles and must keep highlighting with the Torso part. Without
+// this they would follow their node into `arm_L`/`arm_R` (PART_OF_NODE maps
+// scapula_* to the arm), so "Highlight torso" would lose the trapezius and
+// "Highlight left arm" would light the whole upper back. The rotator cuff is
+// deliberately NOT here: it is a shoulder muscle and belongs with the arm.
+const GIRDLE_SHEETS = new Set([
+  'Trapezius muscle.r', 'Serratus anterior muscle.r', 'Pectoralis minor muscle.r',
+  'Rhomboid major muscle.r', 'Rhomboid minor muscle.r',
+].map(norm));
+
 // A muscle crosses one (or two) joints, so it deforms as those joints move:
 // vertices near the primary (`node`) attachment follow that bone, vertices near
 // the far attachment follow the `insert` bone, and the belly stretches/bends
@@ -155,10 +211,18 @@ const MUSCLE_INSERT = new Map(Object.entries({
   // Thigh muscles reaching the shank (quadriceps, sartorius, gracilis,
   // hamstrings) → they follow the knee at their distal end.
   knee: [
+    // The thigh's long tendons cross the knee to the tibia, which is exactly
+    // what their bellies do not reach.
+    'Quadriceps common tendon and patellar ligament.r',
+    'Common tendon of biceps femoris.r', 'Semimembranosus muscle tendon.r',
+    'Pes anserinus common tendon.r',
     'Rectus femoris.r', 'Vastus lateralis muscle.r', 'Vastus medialis muscle.r',
     'Vastus intermedius muscle.r', 'Sartorius muscle.r', 'Gracilis muscle.r',
     'Long head of biceps femoris.r', 'Short head of biceps femoris.r',
     'Semitendinosus muscle.r', 'Semimembranosus muscle.r',
+    // Gastrocnemius crosses the KNEE (femoral origin → shank); the Achilles
+    // above carries its ankle half.
+    'Lateral head of gastrocnemius.r', 'Medial head of gastrocnemius.r',
   ],
   // Hip muscles anchored to the pelvis/sacrum above the joint (adductors,
   // glutes, iliopsoas, piriformis) → their proximal end follows the pelvis.
@@ -171,7 +235,8 @@ const MUSCLE_INSERT = new Map(Object.entries({
   // → their distal end follows the ankle. Gastrocnemius is the classic
   // two-joint muscle: it rides the knee and inserts across the ankle.
   ankle: [
-    'Lateral head of gastrocnemius.r', 'Medial head of gastrocnemius.r', 'Soleus muscle.r',
+    'Calcaneal tendon.r',
+    'Soleus muscle.r',
     'Tibialis anterior muscle.r', 'Tibialis posterior muscle.r',
     'Fibularis longus muscle.r', 'Fibularis brevis muscle.r',
     'Extensor digitorum longus.r', 'Extensor hallucis longus.r',
@@ -180,6 +245,7 @@ const MUSCLE_INSERT = new Map(Object.entries({
   // Upper-arm muscles reaching the forearm (biceps/triceps/brachialis) → distal
   // end follows the elbow, so the biceps stretches as the elbow flexes.
   elbow: [
+    'Common tendon of biceps brachii.r', 'Common tendon of triceps brachii.r',
     'Long head of biceps brachii.r', 'Short head of biceps brachii.r', 'Brachialis muscle.r',
     'Long head of triceps brachii.r', 'Lateral head of triceps brachii.r',
     'Medial head of triceps brachii.r',
@@ -190,9 +256,20 @@ const MUSCLE_INSERT = new Map(Object.entries({
   // torso flexes or twists over the pelvis (the pelvis node it rides is the near
   // end; the twist itself lives at the chest joint).
   chest: [
-    'Deltoid muscle.r', 'Coracobrachialis muscle.r',
+    // The girdle sheets run from the blade to the axial skeleton: trapezius and
+    // the rhomboids to the spine/occiput, serratus anterior and pectoralis minor
+    // to the ribs. Riding `scapula` and inserting toward `chest` is what lets
+    // them actually shorten when the blade elevates, protracts or retracts.
+    'Trapezius muscle.r', 'Serratus anterior muscle.r', 'Pectoralis minor muscle.r',
+    'Rhomboid major muscle.r', 'Rhomboid minor muscle.r',
     'Rectus abdominal muscle.r', 'External abdominal oblique muscle.r',
     'Internal abdominal oblique muscle.r',
+  ],
+  // Deltoid (acromion, lateral clavicle, scapular spine) and coracobrachialis
+  // (coracoid process) are anchored to the BLADE, not the ribcage — they ride
+  // the humerus and reach back to the scapula.
+  scapula: [
+    'Deltoid muscle.r', 'Coracobrachialis muscle.r',
   ],
   // Muscles crossing the glenohumeral joint from the trunk side (pectoralis
   // major, latissimus, rotator cuff, teres) plus the elbow muscles anchored on
@@ -205,6 +282,8 @@ const MUSCLE_INSERT = new Map(Object.entries({
   ],
   // Forearm muscles crossing to the hand → distal end follows the wrist.
   wrist: ['Flexor carpi radialis.r', 'Extensor digitorum.r'],
+  // The long toe-extensor tendons cross the MTP onto the phalanges.
+  toes: ['Extensor digitorum longus tendons.r'],
 }).flatMap(([node, names]) => names.map((name) => [norm(name), node])));
 
 // Map an atlas muscle name → { node, insert? } — the joint it rides plus, for a
@@ -219,6 +298,7 @@ export function classifyMuscle(rawName) {
   // Trunk sheets get the full-length spread skin and highlight with the Torso
   // part even though they ride the pelvis node.
   if (TRUNK_SHEETS.has(n)) return { node, insert, spread: true, ride: 'spine' };
+  if (GIRDLE_SHEETS.has(n)) return { node, insert, ride: 'spine' };
   return insert ? { node, insert } : { node };
 }
 

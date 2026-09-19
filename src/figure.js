@@ -695,6 +695,18 @@ export class Figure {
       // The muscle spans the deeper (child) of its two joints. Pick the crossed
       // joint pivot, the home-bone axis to measure along, and how the distal-side
       // weight maps onto "blend toward nodeB".
+      // The two branches measure along DIFFERENT axes on purpose, and it is not
+      // an inconsistency — it was tried as one and is much worse. For a belly
+      // riding nodeA's bone and crossing down to nodeB (child === nodeB), the
+      // a→b line IS that bone. Switching it to the crossed joint's distal bone
+      // breaks every trunk→limb muscle, because a hanging limb runs PARALLEL to
+      // the torso: measured along the humerus, latissimus's lumbar origin
+      // projects further "distal" (+189 mm) than its own humeral insertion, so
+      // 71% of the sheet — the iliac end — welded itself to the arm. Along a→b
+      // (chest→shoulder, mediolateral) the lateral-most vertices really are the
+      // humeral insertion. A NEGATIVE sMax here means the belly stops short of
+      // the pivot, which the transition window below handles; it does not mean
+      // the axis is wrong.
       const child = this.#deeperJointNode(nodeA, nodeB);
       let cross, home, distalIsB;
       if (child === nodeB) {
@@ -719,16 +731,56 @@ export class Figure {
         if (s < sMin) sMin = s;
         if (s > sMax) sMax = s;
       }
+      // How much flesh actually sits on each side of the pivot. Tissue reaching
+      // less than REACH past it is a sliver, not an attachment: pectineus clears
+      // the hip by 1.7 mm, and treating that as its proximal anchor collapsed
+      // the band to 1.4 mm — a knife edge that let the whole muscle ride the
+      // femur while the weight range still READ a healthy 0..1. So a belly is
+      // only "straddling" on a side it genuinely reaches.
+      const REACH = 0.02 * boneLen;
+      const hasDistal = sMax > REACH;
+      const hasProx = sMin < -REACH;
       // Transition half-width: a fraction of the bone, but never wider than the
       // shorter side reaches, so the short tendon side saturates to full weight
       // (otherwise it never fully commits to its bone and tears away at the joint).
       let band = 0.16 * boneLen;
-      if (sMax > 1e-5) band = Math.min(band, 0.85 * sMax);
-      if (sMin < -1e-5) band = Math.min(band, -0.85 * sMin);
+      if (hasDistal) band = Math.min(band, 0.85 * sMax);
+      if (hasProx) band = Math.min(band, -0.85 * sMin);
       band = Math.max(band, 1e-4);
-      // Pass 2: smoothstep across the joint, mapped to "blend toward nodeB".
+      // Where the transition window SITS. It belongs at the joint — a muscle's
+      // flesh is rigid on its bone and only the crossing tendon deforms — and
+      // stays there whenever the belly has real flesh both sides, so a normally
+      // seated belly is bit-identical to before. When it does NOT straddle, the
+      // window must slide onto the geometry: narrowing alone cannot help,
+      // because a band centred on the pivot has nothing to narrow TOWARD. That
+      // was the single cause behind 44 of 106 bellies never saturating — the
+      // quadriceps stop ~7 cm short of the knee (the atlas ships no patellar
+      // tendon) and the calf ~13 cm short of the ankle (no Achilles), so every
+      // vertex fell on one side of the ramp at weight 0 and the group stayed
+      // welded to the wrong bone through a 145° bend; the adductors are the same
+      // failure mirrored, starting ~2 cm BELOW the hip and capping at 0.28.
+      // Sliding puts the belly's last `band` of tissue onto the far bone, which
+      // is where its tendon would have run had the atlas shipped one.
+      // A slid window must also FIT the belly: parked against one end, a window
+      // wider than the belly runs off the other, and that end never reaches full
+      // weight either (piriformis, a short strap, came out at 0..0.745 — its
+      // sacral origin only three-quarters committed to the pelvis). Half the
+      // belly's own span is the widest that can saturate both ends.
+      const half = Math.max(0.5 * (sMax - sMin), 1e-4);
+      let c = 0;
+      if (!hasDistal && !hasProx) {                                 // tiny belly astride it
+        c = 0.5 * (sMin + sMax);
+        band = half;
+      } else if (!hasDistal) {                                      // stops short of the joint
+        band = Math.min(band, half);
+        c = Math.min(0, sMax - band);
+      } else if (!hasProx) {                                        // starts past the joint
+        band = Math.min(band, half);
+        c = Math.max(0, sMin + band);
+      }
+      // Pass 2: smoothstep across the window, mapped to "blend toward nodeB".
       for (let i = 0; i < count; i++) {
-        const t = THREE.MathUtils.clamp((sArr[i] + band) / (2 * band), 0, 1);
+        const t = THREE.MathUtils.clamp((sArr[i] - c + band) / (2 * band), 0, 1);
         const distal = t * t * (3 - 2 * t);
         weight[i] = distalIsB ? distal : 1 - distal;
       }
@@ -762,12 +814,23 @@ export class Figure {
   // Figure-local direction from a joint to its distal child joint(s), i.e. along
   // the bone it carries; null if it has no joint children. Used as the home-bone
   // axis when a muscle's belly rides this joint's own bone.
+  // Two kinds of child carry a jointName but are NOT the next bone down, and
+  // averaging them in corrupts the length this returns:
+  //   - the node's OWN pick sphere, which sits at zero offset and so halves the
+  //     mean (shoulder_R read a 151 mm humerus for a 303 mm bone, and that fed
+  //     straight into `band = 0.16 * boneLen`);
+  //   - the parallel ATLAS node of a seated limb joint, which duplicates a child
+  //     the rig tree already contributes (rig pelvis carries both hips twice).
+  // So count only real joint children from the SAME tree as `node`.
   #distalBoneDir(node, gInv) {
     const here = new THREE.Vector3().setFromMatrixPosition(node.matrixWorld).applyMatrix4(gInv);
+    const wantAtlas = node.userData?.isAtlas === true;
     const acc = new THREE.Vector3();
     let n = 0;
     for (const ch of node.children) {
       if (!ch.userData || !ch.userData.jointName) continue;
+      if (ch.userData.isPick) continue;
+      if ((ch.userData.isAtlas === true) !== wantAtlas) continue;
       acc.add(new THREE.Vector3().setFromMatrixPosition(ch.matrixWorld).applyMatrix4(gInv));
       n++;
     }
