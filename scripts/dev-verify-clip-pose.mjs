@@ -29,7 +29,6 @@ await page.goto(BASE, { waitUntil: 'networkidle0', timeout: 30000 });
 await new Promise((r) => setTimeout(r, 2500));
 const problems = [];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const R2D = 180 / Math.PI;
 
 // A pose fingerprint built from joints the hip-flexion row does NOT drive, so
 // anything that survives is the user's pose rather than the movement's doing.
