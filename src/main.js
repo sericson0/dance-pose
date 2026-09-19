@@ -2674,6 +2674,9 @@ Object.assign(app, {
 
   // ---------------------------------------------------------- movement clips
   enterClip(moveId, opts) { return studio.enterClip(moveId, opts); },
+  // Reset the dancer in the open clip to the anatomical position (the clip
+  // otherwise keeps whatever pose they were in — see studio.enterClip).
+  clipAnatomical() { return studio.clipAnatomical(); },
   exitClip() { studio.exitClip(); },
   playClip(on = true) { studio.playClip(on); },
   scrubClip(p) { studio.scrubClip(p); },

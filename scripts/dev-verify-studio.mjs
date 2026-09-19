@@ -387,7 +387,14 @@ const semantics = await page.evaluate(() => {
   };
   for (const move of app.studio.movements) {
     for (const side of ['L', 'R']) {
-      app.enterClip(move.id, { figure: app.leader, side });
+      // anatomical: true is required here, not incidental. A clip now KEEPS
+      // the pose the dancer was in (so a movement can be shown inside a real
+      // tango position), but every range and direction in the MOVEMENTS table
+      // is DEFINED from the anatomical position — "pronation turns the palm
+      // down" is a claim about that neutral stance. Measured from an embrace
+      // instead, the starting pose pollutes the direction and rows that are
+      // perfectly correct read as moving the wrong way.
+      app.enterClip(move.id, { figure: app.leader, side, anatomical: true });
       const clip = app.studio.clip;
       app.scrubClip(0);
       const a = snap(app.leader, side);

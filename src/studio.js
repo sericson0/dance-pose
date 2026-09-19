@@ -607,12 +607,17 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
   studio.clipOptions = {
     title: true, angle: true, plane: true, movers: true, fade: false,
     autoFrame: true, pattern: 'loop', stroke: 2.0, hold: 1.0, loops: 1,
+    // Reset the dancer to the anatomical position on entering a clip. Default
+    // off — see enterClip.
+    anatomical: false,
   };
 
   // Enter (or switch) the clip: one dancer alone at the origin in the neutral
   // stance, the partner hidden, constraints and balance visuals suspended (see
   // main.js `studio.clipActive`). The scene as it was is put back by exitClip.
-  studio.enterClip = (moveId, { figure = app.leader, side = 'R' } = {}) => {
+  studio.enterClip = (moveId, {
+    figure = app.leader, side = 'R', anatomical = studio.clipOptions.anatomical,
+  } = {}) => {
     const move = MOVEMENT_BY_ID[moveId];
     if (!move) return false;
     if (studio.busy) return false;
@@ -634,11 +639,31 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
       for (const f of app.figures) for (const s of f.pickSpheres) s.visible = false;
     }
     app.setVisibleFigures(figure === app.leader ? 'leader' : 'follower');
-    figure.group.position.set(0, 0, 0);
-    figure.group.rotation.set(0, 0, 0);
-    figure.resetPose();
-    figure.setJointDegrees(NEUTRAL);
-    const clip = { figure, side, opts, baseMove: move, move, t: 0, playing: studio.clip?.playing ?? false };
+    // The textbook neutral stance at the origin — the anatomical position every
+    // range of motion is defined from. OFF by default: a teacher showing what
+    // hip flexion looks like INSIDE a cruzada wants the pose they built, not a
+    // dancer who snaps to a T-pose the moment the clip opens. The ⟲ button (and
+    // studio.clipOptions.anatomical) asks for it explicitly.
+    //
+    // Keeping the pose stays honest because nothing downstream assumes neutral:
+    // `drive` targets are absolute angles, and the angle readout measures the
+    // marker's swing since the pose the clip OPENED on (clip.baseAngles, just
+    // below), so it reports the movement actually made from here.
+    if (anatomical) {
+      figure.group.position.set(0, 0, 0);
+      figure.group.rotation.set(0, 0, 0);
+      figure.resetPose();
+      figure.setJointDegrees(NEUTRAL);
+    }
+    const clip = {
+      figure, side, opts, baseMove: move, move, t: 0, anatomical,
+      playing: studio.clip?.playing ?? false,
+    };
+    // The row's own test position (elbow at 90° for shoulder rotation, the leg
+    // carried forward for hip adduction) is applied EITHER WAY: it is part of
+    // the movement's definition, touches only the joints that movement needs,
+    // and the marker, arc and plane are all defined against it. Most rows have
+    // no `base` at all, so this is a no-op for them.
     setDegrees(figure, move.base ?? {}, side);
     // Base angle of every joint any segment drives (both halves of a sweep).
     clip.baseAngles = {};
@@ -661,6 +686,20 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
     if (clip.playing) freezeLabels(clip); else labels.unfreeze();
     studio.onClipChanged?.();
     return true;
+  };
+
+  // Put the dancer into the anatomical position without leaving the clip. It
+  // re-enters the same movement with the neutral stance applied, so the base
+  // angles, the timeline, the shot points and the framing are all rebuilt
+  // against it rather than left describing the pose that has just been thrown
+  // away. One-way on purpose: the pose it replaced is the user's, and
+  // exitClip's saved state is what brings that back.
+  studio.clipAnatomical = () => {
+    const clip = studio.clip;
+    if (!clip || studio.busy) return false;
+    return studio.enterClip(clip.baseMove.id, {
+      figure: clip.figure, side: clip.side, anatomical: true,
+    });
   };
 
   studio.exitClip = () => {

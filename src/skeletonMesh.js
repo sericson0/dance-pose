@@ -40,8 +40,15 @@ export function classifyBone(rawName) {
   }
   if (has('sacrum', 'coccyx', 'hipbone')) return { node: 'pelvis', material };
 
-  if (has('femur')) return { node: 'hip', material };
-  if (has('tibia', 'fibula', 'patella')) return { node: 'knee', material };
+  // The patella rides the FEMUR, not the shin. It is a sesamoid in the
+  // quadriceps tendon that glides in the femoral trochlear groove, so it stays
+  // with the thigh as the knee bends — it does NOT swing round with the tibia.
+  // Grouped with tibia/fibula it slid ~1.8 cm off the distal femur and turned
+  // ~22° inside the femur's own frame through knee flexion, which is what made
+  // the knee cap visibly slide in the hip-flexion clip (that row drives the
+  // knee to 110° alongside the hip). Measured by scripts/dev-verify-knee.mjs.
+  if (has('femur', 'patella')) return { node: 'hip', material };
+  if (has('tibia', 'fibula')) return { node: 'knee', material };
   // Foot phalanges hang from the toes (MTP) joint; everything mid-foot and
   // proximal (tarsals, metatarsals) rides the ankle. Check foot before hand.
   if (has('fingeroffoot')) return { node: 'toes', material };

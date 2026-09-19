@@ -496,6 +496,7 @@ export function initUI(app) {
   const clipPlay = $('clip-play');
   const clipRecord = $('clip-record');
   const clipExit = $('clip-exit');
+  const clipAnatomical = $('clip-anatomical');
   const clipScrub = $('clip-scrub');
   const clipFigBtns = [...document.querySelectorAll('#clip-fig button')];
   const clipSideBtns = [...document.querySelectorAll('#clip-side button')];
@@ -581,6 +582,11 @@ export function initUI(app) {
   clipPlay.addEventListener('click', () => app.playClip(!app.studio.clipPlaying));
   clipRecord.addEventListener('click', () => app.recordClip());
   clipExit.addEventListener('click', () => app.exitClip());
+  // The clip keeps whatever pose the dancer was in; this is the way TO the
+  // textbook neutral stance, not back from it (Exit restores the couple).
+  clipAnatomical.addEventListener('click', () => {
+    if (app.clipAnatomical()) app.status('Dancer moved to the anatomical position.', 'info');
+  });
   clipScrub.addEventListener('input', () => app.scrubClip(Number(clipScrub.value) / 1000));
 
   function syncClip() {
@@ -591,6 +597,8 @@ export function initUI(app) {
     clipRecord.disabled = !clip || busy || !app.canRecord;
     if (!app.canRecord) clipRecord.title = NO_RECORDER_TITLE;
     clipExit.disabled = !clip || busy;
+    // Already neutral: nothing left to reset.
+    clipAnatomical.disabled = !clip || busy || !!clip.anatomical;
     clipPlay.textContent = clip?.playing && !busy ? '⏸ Pause' : '▶ Play';
     clipRecord.textContent = clip?.arming ? '⏺ Preparing…' : busy ? '⏺ Recording…' : '⏺ Record';
     if (clip) $('clip-name').textContent = clip.move.title;
