@@ -385,6 +385,94 @@ const semantics = await page.evaluate(() => {
     // taken before the render loop's floor clamp has lifted the body).
     tg_releve: (a, b) => (b.ankle.y - b.toes.y) - (a.ankle.y - a.toes.y),
   };
+  // Every test above is a DISPLACEMENT proxy for a rotation — "abduction takes
+  // the elbow out to the side" — and a displacement only tracks its rotation
+  // through the first quadrant: an arm abducted 179° has its elbow back over
+  // the shoulder it started under, and the proxy reads ~0. So the direction is
+  // read over the first DIR_DEG of the arc (or over all of it, for a row whose
+  // whole range is shorter than that), where the sign is unambiguous and every
+  // proxy is near its steepest.
+  // That is also what makes these tests honest about a row driving SEVERAL
+  // joints in one plane: coupled joints all push the same way at the start,
+  // whereas at the end range the scapulohumeral row's own scapula slides the
+  // shoulder ~1 cm medially and drags a CORRECT row's score negative
+  // (measured: −0.0076, against +0.0041 for the arm alone — the old
+  // end-of-stroke sample was passing by a hair, on a row whose proxy flips
+  // outright at 181°).
+  const DIR_DEG = 20;
+
+  // The readout's expected end range, MULTI-JOINT rows included. The readout
+  // measures one marker's swing about one axis, so a drive counts only if it
+  // turns that whole marker about that same axis. Rotating joint J moves node X
+  // only when J is a STRICT ancestor of X, which sorts every drive into three:
+  //   rigid  J carries BOTH ends of the marker (an ancestor of the pair, or the
+  //          end the other one pivots about), so the marker swings by exactly
+  //          J's angle and the angles ADD — the scapulohumeral case, where the
+  //          scapula carries the whole arm and shoulder 150 + scapula 20 is the
+  //          same 170° of arm-on-trunk elevation the shoulder used to give
+  //          alone.
+  //   lever  J moves one end about a centre that is NOT the other end (a joint
+  //          between them, the chest inside spine→neck). The marker still
+  //          swings, but by less than J's angle, so no sum is exact and the row
+  //          keeps its exemption.
+  //   none   J sits below both ends, or is an end pivoting about itself (the
+  //          knee inside hip→knee) — it cannot move the marker at all.
+  // Before this, a second drive exempted a row from the range check outright,
+  // so a coupled row could advertise one range and play another.
+  const Q = app.leader.group.quaternion.constructor;
+  const E = app.leader.group.rotation.constructor;
+  const jointName = (f, j, s) => (f.nodes[j] ? j : `${j}_${s}`);
+  const isAnc = (j, x) => { for (let p = x.parent; p; p = p.parent) if (p === j) return true; return false; };
+  const carries = (j, x) => j === x || isAnc(j, x);
+  // The world axis this joint turns about, from three's XYZ Euler order — the
+  // same rule studio.js's axisWorld uses, re-derived here rather than read off
+  // the clip, so the expectation stays independent of what the app measured.
+  const jointAxis = (node, axis) => {
+    const out = v(axis === 'x' ? 1 : 0, axis === 'y' ? 1 : 0, axis === 'z' ? 1 : 0);
+    if (axis === 'y') out.applyEuler(new E(node.rotation.x, 0, 0));
+    else if (axis === 'z') out.applyQuaternion(node.quaternion);
+    return out.applyQuaternion(node.parent.getWorldQuaternion(new Q())).normalize();
+  };
+  const markerEnds = (f, move, s) => {
+    const mk = move.marker;
+    if (mk && !Array.isArray(mk)) { const n = f.nodes[jointName(f, mk.node, s)]; return [n, n]; }
+    const from = f.nodes[jointName(f, mk ? mk[0] : move.drive[0].joint, s)];
+    // The default marker runs to the distal joint: the child that IS a rig
+    // joint node, never the pick sphere or the atlas twin that share its name.
+    const to = mk ? f.nodes[jointName(f, mk[1], s)]
+      : from?.children.find((c) => c.userData?.jointName && f.nodes[c.userData.jointName] === c);
+    return [from, to];
+  };
+  const expectedRange = (f, move, s, clip) => {
+    const [from, to] = markerEnds(f, move, s);
+    if (!from || !to) return null;
+    const axis0 = move.axisFig
+      ? v(move.axisFig === 'x' ? 1 : 0, move.axisFig === 'y' ? 1 : 0, move.axisFig === 'z' ? 1 : 0)
+        .applyQuaternion(f.group.getWorldQuaternion(new Q())).normalize()
+      : jointAxis(f.nodes[jointName(f, move.drive[0].joint, s)], move.drive[0].axis);
+    // Later drives win, exactly as poseClip applies them (the relevé drives one
+    // ankle twice, by limb base and by name).
+    const drives = new Map();
+    for (const d of move.drive) drives.set(`${jointName(f, d.joint, s)}.${d.axis}`, d);
+    let sum = 0;
+    for (const [key, d] of drives) {
+      const name = key.slice(0, key.lastIndexOf('.'));
+      const node = f.nodes[name];
+      if (!carries(node, from) || !carries(node, to)) {
+        if (isAnc(node, from) || isAnc(node, to)) return null; // lever arm
+        continue;                                             // cannot move it
+      }
+      const deg = s === 'R' && d.axis !== 'x' ? -d.to : d.to;  // rows are left-handed
+      const delta = deg / (180 / Math.PI) - (clip.baseAngles[name]?.[d.axis] ?? 0);
+      const dot = jointAxis(node, d.axis).dot(axis0);
+      // Skew to the measured axis: it tilts the marker out of the plane the
+      // readout works in, so the angles no longer simply add.
+      if (Math.abs(delta) > 1e-6 && Math.abs(dot) < 0.999) return null;
+      sum += delta * dot;
+    }
+    return Math.abs(sum) * 180 / Math.PI;
+  };
+
   for (const move of app.studio.movements) {
     for (const side of ['L', 'R']) {
       // anatomical: true is required here, not incidental. A clip now KEEPS
@@ -396,18 +484,32 @@ const semantics = await page.evaluate(() => {
       // perfectly correct read as moving the wrong way.
       app.enterClip(move.id, { figure: app.leader, side, anatomical: true });
       const clip = app.studio.clip;
-      app.scrubClip(0);
-      const a = snap(app.leader, side);
-      app.scrubClip((clip.segs[0].t1 + 0.05) / clip.duration);
-      const b = snap(app.leader, side);
+      const seg = clip.segs[0];
+      const at = (u) => {
+        app.scrubClip((seg.t0 + u * (seg.t1 - seg.t0)) / clip.duration);
+        return snap(app.leader, side);
+      };
+      const a = at(0);
+      // Step out until the primary joint has turned DIR_DEG (read off the node
+      // itself, so a clamp cannot inflate it), or the stroke runs out. The
+      // stroke is eased, so a time fraction is not an angle fraction.
+      const d0 = move.drive[0];
+      const n0 = jointName(app.leader, d0.joint, side);
+      const base0 = clip.baseAngles[n0]?.[d0.axis] ?? 0;
+      let b = null;
+      for (let k = 1; k <= 8 && !b; k++) {
+        const s = at(k / 8);
+        const swung = Math.abs(app.leader.nodes[n0].rotation[d0.axis] - base0) * 180 / Math.PI;
+        if (swung >= DIR_DEG || k === 8) b = s;
+      }
       const test = TESTS[move.id];
       const score = test ? test(a, b, side === 'R' ? 1 : -1) : null;
-      // Single-joint swings: the readout's end range must equal the table's.
-      const d0 = move.drive[0];
-      const single = move.drive.length === 1 && !move.marker;
-      const to = side === 'R' && d0.axis !== 'x' ? -d0.to : d0.to; // rows are left-handed
-      const want = single ? Math.abs(to - (clip.baseAngles[`${d0.joint}_${side}`]?.[d0.axis] ?? 0) * 180 / Math.PI) : null;
-      out.push({ id: move.id, side, score, tested: !!test, end: Math.abs(clip.motion.end) * 180 / Math.PI, want });
+      at(0); // the range geometry is read off the base pose, like axisWorld
+      out.push({
+        id: move.id, side, score, tested: !!test,
+        end: Math.abs(clip.motion.end) * 180 / Math.PI,
+        want: expectedRange(app.leader, move, side, clip),
+      });
     }
   }
   return out;
@@ -419,7 +521,11 @@ for (const s of wrongWay) problems.push(`${s.id} (${s.side}) moves the WRONG WAY
 for (const s of semantics) {
   if (s.want !== null && Math.abs(s.end - s.want) > 1.5) problems.push(`${s.id} (${s.side}) readout ends at ${s.end.toFixed(1)}°, table says ${s.want.toFixed(1)}°`);
 }
-console.log(`--- clip semantics: ${semantics.length} movement×side checks, ${wrongWay.length} wrong-way`);
+const ranged = semantics.filter((s) => s.want !== null);
+const weakest = semantics.filter((s) => s.tested).reduce((w, s) => (Math.abs(s.score) < Math.abs(w.score) ? s : w));
+console.log(`--- clip semantics: ${semantics.length} movement×side checks, ${wrongWay.length} wrong-way,`
+  + ` ${ranged.length} range-checked (${[...new Set(semantics.filter((s) => s.want === null).map((s) => s.id))].join(', ') || 'none'} exempt),`
+  + ` weakest direction ${weakest.id} ${weakest.score.toFixed(4)}`);
 
 // Lifecycle: enter from a couple pose, play, exit → everything back.
 await page.evaluate(() => { window.__app.exitClip(); window.__app.applyPreset(1); window.__app.setVisibleFigures('both'); window.__app.setView('three'); });

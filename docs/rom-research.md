@@ -159,6 +159,21 @@ upward rotation driven as a fraction of shoulder elevation. That is a real featu
 separate change from retuning limits, and it would invalidate the frozen rig
 calibration.
 
+**Update — the rhythm is now modelled in the abduction CLIP** (`sh_abd` in
+`movements.js`), which needs neither a limit change nor a re-bake: the clip drives
+scapula elevation alongside the shoulder, splitting the same 170° complex total
+(shoulder 150 + scapula 20) instead of adding to it. That keeps every reason above
+intact — the limits still carry complex ROM, so `ik.js`, `embrace.js` and the
+authored presets are untouched, and nothing couples the rig itself. It only makes
+the girdle's share *visible* where the lesson is about it, so the trapezius and
+serratus the row names are doing something. The general coupling (a rig-level
+rhythm that would shrug the shoulders on a high clasp) is still the open feature.
+
+Two limits of the clip version, both in the row's comment: the rig's scapula `z`
+tops out at 25°, so 20° of a 170° total is well short of the real ~2:1 ratio; and
+only abduction is coupled, because the scapula's elevation axis is skew to sagittal
+flexion.
+
 ---
 
 ## Risks when applying

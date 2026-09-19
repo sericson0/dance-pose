@@ -130,7 +130,7 @@ export class Labels {
   find(key) { return this.items.find((l) => l.key === key) || null; }
 
   #add(item) {
-    const label = { id: this._id++, force: null, temp: false, ...item };
+    const label = { id: this._id++, force: null, color: null, temp: false, ...item };
     this.items.push(label);
     this.#emit();
     return label;
@@ -177,12 +177,43 @@ export class Labels {
     return part?.rep ? part : null;
   }
 
+  byId(id) { return this.items.find((l) => l.id === id) || null; }
+
   // Force a label into the other column (null = automatic).
   flip(id, currentSide) {
-    const l = this.items.find((x) => x.id === id);
+    const l = this.byId(id);
     if (!l) return;
-    l.force = (l.force ?? currentSide) === 'left' ? 'right' : 'left';
+    this.setSide(id, (l.force ?? currentSide) === 'left' ? 'right' : 'left');
+  }
+
+  // Put a label in a chosen column ('left' | 'right', null = automatic). The
+  // drag in the 3D view calls this on every pointermove, so it reports whether
+  // anything actually changed and only then emits — `onChange` re-renders the
+  // sidebar list and writes localStorage, which is not a per-move cost.
+  setSide(id, side) {
+    const l = this.byId(id);
+    const force = side === 'left' || side === 'right' ? side : null;
+    if (!l || l.force === force) return false;
+    l.force = force;
+    // A clip pins every callout's column while it plays (see freeze), which
+    // would swallow the move until the clip ended. Moving one on purpose is a
+    // decision about the slide, so it updates the pinned copy too.
+    const fz = this.frozen?.get(id);
+    if (fz && force) fz.side = force;
     this.#emit();
+    return true;
+  }
+
+  // A colour for THIS callout, beating its kind's default (null restores it).
+  // Used for the structures that have no colour of their own to take — a bone
+  // or a joint. A muscle callout is recoloured through the BELLY instead
+  // (Figure.setMuscleColor), so the two keep reading as one thing.
+  setColor(id, hex) {
+    const l = this.byId(id);
+    if (!l) return false;
+    l.color = hex || null;
+    this.#emit();
+    return true;
   }
 
   addJoint(figure, jointName, { text, temp = false } = {}) {
@@ -288,6 +319,20 @@ export class Labels {
     return best;
   }
 
+  // The callout's accent: its kind's colour, unless the structure itself has
+  // been given one — a muscle recoloured in the view (Figure.setMuscleColor)
+  // carries that colour into its pill's edge bar and anchor dot, so the callout
+  // and the belly it names read as one thing. The leader line's DASH still
+  // carries the kind, which is what survives greyscale and colour blindness.
+  accentColor(label) {
+    if (label.color) return label.color; // the more specific pick wins
+    if (label.kind === 'muscle') {
+      const own = label.figure.muscleColor?.(label.name);
+      if (own) return own;
+    }
+    return KIND_COLORS[label.kind];
+  }
+
   anchorWorld(label, out = new THREE.Vector3()) {
     if (label.kind === 'joint') return label.figure.surfacePos(label.joint, out);
     return this.#vertexWorld(label.mesh, label.vertex, out);
@@ -359,7 +404,7 @@ export class Labels {
       const key = `${roleOf(figure)}|muscle|${mesh.userData.muscleName}|${mesh.userData.muscleSide ?? 'C'}`;
       const had = this.find(key);
       return {
-        kind: 'muscle', figure, existing: had,
+        kind: 'muscle', figure, existing: had, name: mesh.userData.muscleName, mesh,
         text: had?.text ?? MUSCLE_TEXT[mesh.userData.muscleName] ?? mesh.userData.muscleName,
         toggle: () => (had ? (this.remove(had.id), null) : this.addMuscle(figure, mesh, { vertex, camera })),
       };
@@ -492,7 +537,7 @@ export class Labels {
   toJSON() {
     return this.list.map((l) => ({
       fig: roleOf(l.figure), kind: l.kind, text: l.text, force: l.force,
-      joint: l.joint, name: l.name, side: l.side, vertex: l.vertex,
+      joint: l.joint, name: l.name, side: l.side, vertex: l.vertex, color: l.color,
     }));
   }
 
@@ -512,7 +557,9 @@ export class Labels {
           if (range) { label = this.addBone(figure, mesh, range, { vertex: r.vertex, text: r.text }); break; }
         }
       }
-      if (label && r.force) label.force = r.force;
+      if (!label) continue;
+      if (r.force) label.force = r.force;
+      if (r.color) label.color = r.color;
     }
   }
 
@@ -552,7 +599,12 @@ export class Labels {
 
   // Place every shown label: returns [{ label, side, x, y, yFrac, ax, ay, w }].
   // `top` reserves room for the clip title. All px.
-  layout(ctx, camera, w, h, { top = 0, right = 0 } = {}) {
+  //
+  // `record` marks the LIVE overlay pass. An export redraws everything at its
+  // own resolution through the same code, so anything kept for the pointer to
+  // hit-test against has to come from the pass the user is actually looking at
+  // — the same rule studio.titleBox follows.
+  layout(ctx, camera, w, h, { top = 0, right = 0, record = false } = {}) {
     const font = this.size * h;
     const rowH = font * 1.75;
     const pad = font * 0.9;
@@ -574,6 +626,9 @@ export class Labels {
 
     const b = this.figureBounds(camera, w, h);
     const mid = (b.l + b.r) / 2;
+    // The figure's own midline is what the automatic side-of-the-anchor rule
+    // uses below, so a drag decides the same way the layout would.
+    if (record) this.mid = mid;
     const wUse = w - right; // `right` px are covered (the sidebar, in window frame)
     const slots = Math.max(1, Math.floor((h - top - pad * 2) / rowH));
     for (const p of placed) {
@@ -659,6 +714,7 @@ export class Labels {
   draw(ctx, camera, w, h, theme, opts = {}) {
     if (!this.visible) return [];
     const placed = this.layout(ctx, camera, w, h, opts);
+    const record = !!opts.record;
     const font = this.size * h;
     const lineW = Math.max(1.5, font * 0.085);
     ctx.font = `600 ${font}px "Segoe UI", system-ui, sans-serif`;
@@ -684,12 +740,17 @@ export class Labels {
       ctx.setLineDash([]);
       ctx.fillStyle = theme.halo;
       ctx.beginPath(); ctx.arc(p.ax, p.ay, font * 0.3, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = KIND_COLORS[p.label.kind];
+      ctx.fillStyle = this.accentColor(p.label);
       ctx.beginPath(); ctx.arc(p.ax, p.ay, font * 0.2, 0, Math.PI * 2); ctx.fill();
     }
-    for (const p of placed) drawPill(ctx, p.label.text, p.x, p.y, font, theme, {
-      align: p.side === 'left' ? 'right' : 'left', accent: KIND_COLORS[p.label.kind],
-    });
+    for (const p of placed) {
+      const box = drawPill(ctx, p.label.text, p.x, p.y, font, theme, {
+        align: p.side === 'left' ? 'right' : 'left', accent: this.accentColor(p.label),
+      });
+      // The pill the pointer can grab is the one that was drawn, not one
+      // re-derived from the layout's own text measurement.
+      if (record) p.box = { ...box, top: p.y - box.height / 2 };
+    }
     return placed;
   }
 }

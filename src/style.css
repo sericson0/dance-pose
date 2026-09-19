@@ -269,6 +269,14 @@ button:disabled:hover { border-color: var(--border-ctl); }
 }
 .muscle-hl { flex: none; padding: 2px 8px; font-size: 10.5px; }
 .muscle-hl.active { background: #8a6215; border-color: #c9962e; color: #fff; }
+
+/* The colour picker a click on a lit muscle in the 3D view opens. It has to be
+   a RENDERED element for the browser to show a picker at all, so it is parked
+   under the cursor at zero size rather than display:none. */
+.floating-picker {
+  position: fixed; left: 50%; top: 50%; width: 1px; height: 1px;
+  padding: 0; border: none; background: none; opacity: 0; pointer-events: none;
+}
 button.linkish {
   background: none; border: none; padding: 0; font-size: inherit;
   color: var(--accent); text-decoration: underline; cursor: pointer;

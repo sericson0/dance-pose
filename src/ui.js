@@ -425,6 +425,11 @@ export function initUI(app) {
       // The initial, not just the hue — the dot's colour was its only channel.
       tag.textContent = (KIND_TAG[label.kind] ?? '?')[0].toUpperCase();
       tag.title = `${label.kind} · ${label.figure.name}`;
+      // A recoloured callout carries its colour here as well as on the slide,
+      // so the list reads as the same set of things the slide shows — whether
+      // the colour came from its belly or was picked on the callout itself.
+      const own = label.color ?? (label.kind === 'muscle' ? app.muscleColor(label.name) : null);
+      if (own) tag.style.background = own;
       const input = document.createElement('input');
       input.type = 'text';
       input.value = label.text;
@@ -762,6 +767,90 @@ export function initUI(app) {
   const muscleLayerNote = $('muscle-layer-note');
   const hiddenMuscles = new Set();
   const litMuscles = new Set();
+  const muscleColors = new Map(); // atlas label → the colour the user gave it
+  // What a lit belly looks like until someone picks a colour (MUSCLE_HL_COLOR
+  // in figure.js) — the swatch has to open on something.
+  const MUSCLE_HL_DEFAULT = '#ffce4a';
+  const muscleSwatches = new Map(); // label → its row's colour input
+  // The panel's look survives a reload. A colour picked for a belly is authored
+  // work — it is what ties a lit muscle to the callout naming it on a slide —
+  // and a refresh mid-lesson used to throw the whole set away, the same loss
+  // the pose library and the sequence are already saved against. Slides still
+  // capture the look too (getViewState); this is the running state, so the
+  // colours are there on the next load without having to save a slide first.
+  const MUSCLE_KEY = 'tangoPoseStudio.muscleLook.v1';
+  // Restoring writes through the very handlers that save; nothing persists
+  // until the stored look has been applied (as the sidebar layout does).
+  let muscleLookReady = false;
+  function saveMuscleLook() {
+    if (!muscleLookReady) return;
+    try {
+      localStorage.setItem(MUSCLE_KEY, JSON.stringify({
+        colors: [...muscleColors], lit: [...litMuscles], hidden: [...hiddenMuscles],
+        tint: Number(muscleTint.value),
+      }));
+    } catch { /* full / private mode */ }
+  }
+
+  // One place a muscle's colour changes, whichever control asked: the panel's
+  // swatch or a click on the belly itself in a clip (app.ui.pickMuscleColor).
+  // Takes one label or several, because a clip's callout names a group of
+  // bellies and the colour belongs to the callout.
+  const applyMuscleColor = (labels, hex) => {
+    for (const label of [labels].flat()) {
+      muscleColors.set(label, hex);
+      app.setMuscleColor(label, hex);
+      const sw = muscleSwatches.get(label);
+      if (sw) sw.value = hex;
+    }
+    saveMuscleLook();
+    renderLabels(); // the callout list's kind tag wears the colour too
+  };
+
+  // The picker a click (or a double-click on a callout) in the 3D view opens.
+  // It is a real, rendered input — a display:none one has no picker to show —
+  // parked under the cursor at zero size, so the swatch appears where the user
+  // clicked. One input serves every customer; `pickTarget` is who gets the
+  // colour, cleared by nothing because opening again simply replaces it.
+  const floatingPicker = document.createElement('input');
+  floatingPicker.type = 'color';
+  floatingPicker.className = 'floating-picker';
+  floatingPicker.setAttribute('aria-hidden', 'true');
+  floatingPicker.tabIndex = -1;
+  document.body.appendChild(floatingPicker);
+  let pickTarget = null;
+  floatingPicker.addEventListener('input', () => pickTarget?.(floatingPicker.value));
+  const openPicker = (initial, what, onPick, x, y) => {
+    pickTarget = onPick;
+    floatingPicker.value = initial;
+    if (x !== null && x !== undefined) {
+      floatingPicker.style.left = `${x}px`;
+      floatingPicker.style.top = `${y}px`;
+    }
+    app.status(`Pick a colour for ${what}.`, 'info');
+    if (floatingPicker.showPicker) floatingPicker.showPicker();
+    else floatingPicker.click();
+  };
+
+  const pickMuscleColor = (labels, x = null, y = null) => {
+    const group = [labels].flat();
+    if (!group.length) return;
+    openPicker(muscleColors.get(group[0]) ?? MUSCLE_HL_DEFAULT, group.join(' + '),
+      (hex) => applyMuscleColor(group, hex), x, y);
+  };
+
+  // A callout that names a bone or a joint: the colour is the CALLOUT's, since
+  // there is no belly to carry it (a muscle callout goes through the belly
+  // above, so the two keep matching). It opens on the accent the pill is
+  // already wearing — its kind's colour until someone picks one.
+  const pickLabelColor = (id, x = null, y = null) => {
+    const label = app.labels.byId(id);
+    if (!label) return;
+    openPicker(app.labelAccent(id) ?? '#ffffff', label.text, (hex) => {
+      app.setLabelColor(id, hex);
+      renderLabels(); // the list's kind tag wears it too
+    }, x, y);
+  };
 
   const MUSCLE_REGION = {
     chest: 'Chest & back', shoulder: 'Upper arm', elbow: 'Forearm',
@@ -784,6 +873,7 @@ export function initUI(app) {
       (a, b) => MUSCLE_REGION_ORDER.indexOf(a) - MUSCLE_REGION_ORDER.indexOf(b));
     muscleList.className = '';
     muscleList.innerHTML = '';
+    muscleSwatches.clear();
     for (const node of nodes) {
       const group = document.createElement('div');
       group.className = 'muscle-group';
@@ -801,6 +891,7 @@ export function initUI(app) {
         cb.addEventListener('change', () => {
           if (cb.checked) hiddenMuscles.delete(label); else hiddenMuscles.add(label);
           app.setMuscleHidden(hiddenMuscles);
+          saveMuscleLook();
         });
         lbl.append(cb, document.createTextNode(` ${label}`));
         const hl = document.createElement('button');
@@ -808,13 +899,26 @@ export function initUI(app) {
         hl.textContent = 'highlight';
         hl.title = 'Highlight this muscle';
         hl.classList.toggle('active', litMuscles.has(label));
+        // Its own colour, so several bellies lit at once stay tellable apart —
+        // and so does each one's callout (see Labels.accentColor). Shown only
+        // while the muscle is lit, like the Highlight panel's part swatches.
+        const sw = document.createElement('input');
+        sw.type = 'color';
+        sw.className = 'chip-color';
+        sw.title = `Colour of the ${label} highlight`;
+        sw.hidden = !litMuscles.has(label);
+        sw.value = muscleColors.get(label) ?? MUSCLE_HL_DEFAULT;
+        sw.addEventListener('input', () => applyMuscleColor(label, sw.value));
+        muscleSwatches.set(label, sw);
         hl.addEventListener('click', () => {
           if (litMuscles.has(label)) litMuscles.delete(label); else litMuscles.add(label);
           hl.classList.toggle('active', litMuscles.has(label));
+          sw.hidden = !litMuscles.has(label);
           app.setMuscleLit(litMuscles);
           muscleClearHl.disabled = litMuscles.size === 0;
+          saveMuscleLook();
         });
-        row.append(lbl, hl);
+        row.append(lbl, hl, sw);
         group.appendChild(row);
       }
       muscleList.appendChild(group);
@@ -824,19 +928,56 @@ export function initUI(app) {
   $('muscle-show-all').addEventListener('click', () => {
     hiddenMuscles.clear();
     app.setMuscleHidden(hiddenMuscles);
+    saveMuscleLook();
     renderMuscleList();
   });
   $('muscle-hide-all').addEventListener('click', () => {
     for (const m of (app.muscles || [])) hiddenMuscles.add(m.label);
     app.setMuscleHidden(hiddenMuscles);
+    saveMuscleLook();
     renderMuscleList();
   });
+  // How much of a picked colour a belly takes. 100% (the default) renders the
+  // swatch's colour exactly; lower mixes it back toward the muscle's own flesh
+  // tone, for a tinted rather than painted look.
+  const muscleTint = $('muscle-tint');
+  const syncMuscleTint = () => {
+    $('muscle-tint-val').textContent = `${muscleTint.value}%`;
+    app.setMuscleTint(Number(muscleTint.value) / 100);
+    saveMuscleLook();
+  };
+  muscleTint.addEventListener('input', syncMuscleTint);
   muscleClearHl.addEventListener('click', () => {
     litMuscles.clear();
     app.setMuscleLit(litMuscles);
     muscleClearHl.disabled = true;
+    saveMuscleLook();
     renderMuscleList();
   });
+
+  // Put the stored look back. The colours go on whether or not their belly is
+  // lit right now — lighting it again has to find the colour it was given, not
+  // the default amber. A muscle GLB that failed to load leaves every set empty
+  // and this a no-op, so a degraded session still starts cleanly.
+  function restoreMuscleLook() {
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(MUSCLE_KEY)); } catch { saved = null; }
+    if (saved) {
+      for (const [label, hex] of saved.colors ?? []) {
+        muscleColors.set(label, hex);
+        app.setMuscleColor(label, hex);
+      }
+      for (const label of saved.lit ?? []) litMuscles.add(label);
+      for (const label of saved.hidden ?? []) hiddenMuscles.add(label);
+      if (saved.tint != null) muscleTint.value = saved.tint;
+      syncMuscleTint();
+      app.setMuscleLit(litMuscles);
+      app.setMuscleHidden(hiddenMuscles);
+      muscleClearHl.disabled = litMuscles.size === 0;
+    }
+    muscleLookReady = true;
+  }
+  restoreMuscleLook();
 
   // The panel only shows through the Muscles layer — nudge the user to enable it.
   const syncMuscleNote = () => { muscleLayerNote.hidden = layerMode() === 'muscle'; };
@@ -2042,7 +2183,10 @@ export function initUI(app) {
     labels: app.labels.toJSON(),
     labelsVisible: $('labels-visible').checked,
     highlight: { parts: [...highlighted], colors: [...(app.highlightColors ?? [])] },
-    muscles: { hidden: [...hiddenMuscles], lit: [...litMuscles] },
+    muscles: {
+      hidden: [...hiddenMuscles], lit: [...litMuscles],
+      colors: [...muscleColors], tint: Number(muscleTint.value),
+    },
   });
 
   // Put a captured view back. A state with no `view` block is a pose-only file
@@ -2090,9 +2234,20 @@ export function initUI(app) {
       for (const m of v.muscles.hidden ?? []) hiddenMuscles.add(m);
       litMuscles.clear();
       for (const m of v.muscles.lit ?? []) litMuscles.add(m);
+      // A colour dropped from the slide goes back to the default amber, or a
+      // belly recoloured since would keep a colour this slide never had.
+      for (const label of muscleColors.keys()) app.setMuscleColor(label, null);
+      muscleColors.clear();
+      for (const [label, hex] of v.muscles.colors ?? []) {
+        muscleColors.set(label, hex);
+        app.setMuscleColor(label, hex);
+      }
+      muscleTint.value = v.muscles.tint ?? 100;
+      syncMuscleTint();
       app.setMuscleHidden(hiddenMuscles);
       app.setMuscleLit(litMuscles);
       muscleClearHl.disabled = litMuscles.size === 0;
+      saveMuscleLook(); // the slide's look is now the running look
       renderMuscleList();
     }
     if (v.camera?.pos && v.camera?.target) {
@@ -2149,6 +2304,10 @@ export function initUI(app) {
     onDrawingsChanged: syncDrawButtons,
     // A label was added, removed, flipped or cleared.
     onLabelsChanged,
+    // A lit muscle was clicked in the 3D view, or a callout double-clicked:
+    // open the colour picker under the cursor.
+    pickMuscleColor,
+    pickLabelColor,
     refreshJointValues,
     updateStats,
   };

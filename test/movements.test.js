@@ -73,6 +73,26 @@ test('every target and test position is inside the joint limits (nothing gets cl
   }
 });
 
+test('a coupled row SPLITS the range it advertises and never exceeds it', () => {
+  // Joints coupled in one plane ADD (scapulohumeral rhythm: the scapula
+  // carries the arm), so a row driving several of them has to say what the
+  // total is — `complex` — or the two halves drift apart silently. Driving the
+  // scapula on top of a 170° shoulder instead of splitting it swings the arm
+  // 190°, past the vertical and down the far side, and every per-joint limit
+  // still passes. The total is bounded by the PRIMARY joint's own limits
+  // because that is where this rig keeps complex ROM rather than
+  // glenohumeral-only ROM (docs/rom-research.md).
+  for (const m of MOVEMENTS) {
+    if (m.complex === undefined) continue;
+    const { joint, axis } = m.drive[0];
+    const sum = m.drive.filter((d) => d.axis === axis).reduce((t, d) => t + d.to, 0);
+    assert.equal(sum, m.complex, `${m.id}: ${axis} drives sum to ${sum}°, advertised ${m.complex}°`);
+    const [lo, hi] = JOINT_BY_NAME[leftName(joint)].limits[axis];
+    assert.ok(m.complex >= lo && m.complex <= hi,
+      `${m.id}: complex ${m.complex}° is outside ${joint}.${axis} limits [${lo}, ${hi}]`);
+  }
+});
+
 test('a full sweep never drives the same joint axis from two different bases', () => {
   // Both halves share one base-angle table, so a pair may only be swept when
   // their test positions agree — buildTimeline checks this; here we make sure

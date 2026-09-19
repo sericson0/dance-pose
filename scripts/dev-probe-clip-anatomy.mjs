@@ -123,6 +123,18 @@ await page.evaluate(() => {
 
   T.dist = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]);
 
+  // Of a skinned belly's two joints, the one it actually crosses: the deeper
+  // (child) of the pair, which is the same rule Figure.#addSkinnedMuscle uses to
+  // place the weight band. Read off the rig hierarchy by name, so it holds for
+  // the seated atlas nodes the muscles hang from too.
+  T.crossedJoint = (aName, bName) => {
+    const fig = app.leader;
+    const A = fig.nodes[aName], B = fig.nodes[bName];
+    if (!A || !B) return bName;
+    for (let n = A.parent; n; n = n.parent) if (n === B) return aName;
+    return bName;
+  };
+
   // Bone clouds keyed by the joint node each merged skeleton mesh is seated on.
   T.boneClouds = (stride) => {
     const fig = app.leader;
@@ -229,7 +241,20 @@ const audit = await page.evaluate(() => {
       }
       const frac = Math.min(distal, prox) / Math.max(vs.length, 1);
       if (frac < 0.08) continue;                       // does not really span it
-      const handled = mu.sm && (mu.nodeA === j || mu.nodeB === j);
+      // A muscle handles joint j only if j is the joint its skin actually
+      // CROSSES — the deeper (child) of its two nodes. Accepting any endpoint
+      // match, as this did, hid a whole side of the table: a belly skinned
+      // hip->knee counted as "handling" the hip, although every vertex of its
+      // pelvic origin was welded rigidly to the femur with nothing modelling
+      // the hip at all.
+      //
+      // Do NOT read this section as covering that case, though — it is a SPAN
+      // test, not an attachment test, and its thresholds (8% of verts each side
+      // of the pivot, 20 mm deadband) are too coarse for a compact origin.
+      // Measured: with the pre-fix table restored it still did not name
+      // sartorius at the hip, whose origin was being dragged 169 mm off the
+      // pelvis. The CONTACT section below is the one that catches that class.
+      const handled = mu.sm && T.crossedJoint(mu.nodeA, mu.nodeB) === j;
       if (handled) continue;
       rows.push({
         joint: j, muscle: mu.name, side: mu.side,
@@ -238,6 +263,54 @@ const audit = await page.evaluate(() => {
         distalFrac: +(distal / vs.length).toFixed(3),
       });
     }
+  }
+  app.studio.exitClip();
+  return rows;
+});
+
+// --------------------------------------------------------------- contact audit
+// Is each skinned belly actually TOUCHING both bones it is skinned between?
+// This is the attachment question the span audit above cannot answer, and it is
+// the one that catches a belly being dragged across a gap: skinning welds the
+// far weight band to a bone, so if that bone is nowhere near the belly, the
+// joint tows the band and the belly tears. Measured on the shipped table this
+// named the whole quadriceps group at once — 66-81 mm from a shin they were
+// skinned to, while their common tendon sits 0.7 mm off it.
+// Static (rest pose only), so it costs one measurement no matter how many clips
+// are run.
+const contact = await page.evaluate(() => {
+  const app = window.__app, T = window.__probe;
+  const fig = app.leader;
+  app.studio.enterClip('sh_flex', { figure: fig, side: 'R', anatomical: true });
+  app.studio.scrubClip(0);
+  fig.group.updateMatrixWorld(true);
+  fig.updateMuscleSkin();
+  const gInv = fig.group.matrixWorld.clone().invert();
+
+  const clouds = {};
+  for (const [k, v] of Object.entries(T.boneClouds(3))) clouds[k] = T.thin(v, 1500);
+  const near = (p, cloud) => {
+    let best = Infinity;
+    for (const q of cloud) {
+      const d = (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 + (p[2] - q[2]) ** 2;
+      if (d < best) best = d;
+    }
+    return Math.sqrt(best);
+  };
+  const rows = [];
+  for (const sm of fig._skinMuscles) {
+    if (sm.mesh.userData.muscleSide === 'L') continue;   // the mirror says the same
+    const a = sm.nodeA.userData.jointName, b = sm.nodeB.userData.jointName;
+    const vs = T.localVerts(sm.mesh, gInv, 11);
+    const gap = (j) => {
+      const cloud = clouds[j];
+      if (!cloud?.length) return null;
+      let best = Infinity;
+      for (const v of vs) { const d = near(v, cloud); if (d < best) best = d; }
+      return best;
+    };
+    const ga = gap(a), gb = gap(b);
+    rows.push({ name: sm.mesh.userData.muscleName, a, b, ga, gb });
   }
   app.studio.exitClip();
   return rows;
@@ -442,6 +515,19 @@ for (const m of sat) {
   const verdict = m.maxW < 0.02 ? 'NEVER follows nodeB at all'
     : m.maxW < 0.6 ? 'insertion end only partly follows nodeB' : 'slightly short of full commit';
   console.log(`  ${m.name} [${m.side}] ${m.span}: weights ${m.minW}..${m.maxW} — ${verdict}`);
+}
+
+// A belly is allowed to stop a little shy of the bone (fascia, cartilage, the
+// atlas's own trimming); 25 mm is the line between "attached" and "skinned to
+// something it cannot reach". On the fixed table every crossing unit clears it.
+const CONTACT_MM = 25;
+console.log(`\n=== contact audit: is a belly actually TOUCHING both bones it is skinned between? ===`);
+const loose = contact.filter((r) => Math.max(r.ga ?? 0, r.gb ?? 0) > CONTACT_MM / 1000)
+  .sort((x, y) => Math.max(y.ga, y.gb) - Math.max(x.ga, x.gb));
+console.log(`  ${loose.length} of ${contact.length} bellies are skinned to a bone they never reach (> ${CONTACT_MM} mm)`);
+for (const r of loose) {
+  const mm = (v) => (v === null ? ' n/a' : `${(v * 1000).toFixed(1)}mm`);
+  console.log(`  ${r.name}: ${r.a} ${mm(r.ga)}, ${r.b} ${mm(r.gb)}  <- the far band is towed across that gap`);
 }
 
 console.log(`\n=== static audit: muscles spanning a driven joint they are NOT skinned across ===`);

@@ -83,6 +83,8 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
     photoScale: 1,       // photo export multiplier (2 = 4K from the slide frame)
     videoFormat: 'mp4',  // 'mp4' (H.264 — PowerPoint / Beamer) | 'webm'
     hover: null,         // { text, x, y, remove } label-mode cursor preview (CSS px)
+    titlePos: null,      // dragged title placement: { x, y } FRACTIONS of the frame
+    titleBox: null,      // where the title last drew, canvas px (the drag target)
     recorder: null,
     clip: null,          // the active movement clip (see enterClip)
     onClipTick: null,    // UI callback: (progress 0..1, angleDeg)
@@ -159,7 +161,11 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
     // In the window frame the sidebar covers the canvas's right edge; keep the
     // callouts out from under it (the slide frame already sits beside it).
     const right = studio.frame === 'window' ? sidebarWidth() * (w / (gl.clientWidth || w)) : 0;
-    studio.lastLayout = labels.draw(ctx, camera, w, h, theme, { top, right });
+    // Only the live pass is kept: an export redraws the same callouts at its own
+    // resolution, and the pointer hit-tests against what is on screen.
+    const record = ctx === hudCtx;
+    const placed = labels.draw(ctx, camera, w, h, theme, { top, right, record });
+    if (record) studio.lastLayout = placed;
     if (studio.hover && ctx === hudCtx) {
       const k = w / (gl.clientWidth || w); // CSS px → canvas px
       const font = labels.size * h * 0.8;
@@ -379,10 +385,36 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
     return figure.surfacePos(to, out).sub(figure.surfacePos(from, _b));
   }
 
+  // The frame a movement's angle is measured IN: the nearest ancestor of the
+  // primary joint that this clip does NOT drive — the segment the movement
+  // happens ON (the thigh for knee extension, the chest for shoulder abduction,
+  // whose own scapula IS driven and must keep counting toward the swing).
+  //
+  // The angle has to be relative to that segment, because a clip now opens in
+  // whatever pose the dancer was already in and the user goes on posing from
+  // there. Measured against a world direction frozen at prepare time, carrying
+  // the hip back 75° to show knee extension out of a real tango position read
+  // as 75° of knee movement before the knee had moved at all — and then
+  // subtracted from the range, so the full 100° extension quoted 30°.
+  function refNode(clip, move) {
+    const { figure, side } = clip;
+    const driven = new Set(move.drive.map((d) => sided(d.joint, side)));
+    let n = figure.nodes[sided(move.drive[0].joint, side)]?.parent;
+    while (n?.parent && driven.has(n.userData?.jointName)) n = n.parent;
+    return n ?? figure.group;
+  }
+
   // Measure the marker's swing about the axis since neutral → clip.angle (rad,
   // unwrapped so a 179° abduction doesn't flip sign at ±180).
   function measure(clip) {
     const m = clip.motion;
+    // Re-derive the motion frame from the reference segment, so the axis, the
+    // zero direction and the arc drawn on them all turn WITH the limb when a
+    // joint upstream is posed. During the clip itself the reference node is by
+    // definition not driven, so this reproduces the frozen frame exactly.
+    m.axis.copy(m.axisRef).applyQuaternion(m.axisRefNode.getWorldQuaternion(_q)).normalize();
+    m.u0.copy(m.u0Ref).applyQuaternion(m.refNode.getWorldQuaternion(_q));
+    m.u0.addScaledVector(m.axis, -m.u0.dot(m.axis)).normalize();
     markerWorld(clip, clip.move, _a).addScaledVector(m.axis, -_a.dot(m.axis));
     if (_a.lengthSq() < 1e-10) return;
     _a.normalize();
@@ -405,6 +437,14 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
     axisWorld(clip, move, m.axis);
     const len = markerWorld(clip, move, _a).length();
     m.u0.copy(_a).addScaledVector(m.axis, -_a.dot(m.axis)).normalize();
+    // Hold the frame in the reference segment's OWN coordinates; `measure`
+    // rebuilds the world axis and zero direction from there every tick.
+    m.refNode = refNode(clip, move);
+    // An axisFig row names a FIGURE-frame axis on purpose (a relevé turns about
+    // the ball of the foot, not the ankle), so that one keeps the figure.
+    m.axisRefNode = move.axisFig ? figure.group : m.refNode;
+    m.axisRef = m.axis.clone().applyQuaternion(m.axisRefNode.getWorldQuaternion(_q).invert());
+    m.u0Ref = m.u0.clone().applyQuaternion(m.refNode.getWorldQuaternion(_q).invert());
     const H = figure.height;
     m.radius = Array.isArray(move.marker) || !move.marker
       ? THREE.MathUtils.clamp(len * 0.72, 0.05 * H, 0.17 * H) : 0.12 * H;
@@ -505,9 +545,9 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
     dir.normalize();
     fitCameraToPoints(pts, dir, {
       pad: 0.07 * figure.height,       // flesh around the joint centres
-      fillY: opts.title ? 0.76 : 0.88, // keep the top clear for the title
+      fillY: opts.title ? 0.82 : 0.88, // a line of headroom for the title
       fillX: opts.movers ? 0.46 : 0.8, // …and the sides for the callout columns
-      lower: opts.title ? 0.09 : 0,    // sit the subject under the title block
+      lower: opts.title ? 0.05 : 0,    // sit the subject under the title block
     });
   }
 
@@ -634,6 +674,7 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
         spheres: app.figures.map((f) => f.pickSpheres.map((s) => s.visible)),
       };
       orbit.minDistance = 0.3;
+      studio.titlePos = null; // a fresh stage starts with the title above the dancer
       studio.setFrame('slide');
       // Pick spheres are click targets, not anatomy — keep them out of the shot.
       for (const f of app.figures) for (const s of f.pickSpheres) s.visible = false;
@@ -707,6 +748,9 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
     if (!studio.clip || !s || studio.busy) return;
     studio.clip = null;
     studio.saved = null;
+    studio.titlePos = null;
+    studio.titleBox = null;
+    titleGrab = null;
     labels.clear({ temp: true });
     labels.unfreeze();
     labels.boundsPoints = null;
@@ -821,11 +865,165 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
     if (!clip) return;
     measure(clip);
     updatePlaneViz();
-    studio.onClipTick?.(clip.t / clip.duration, Math.abs(clip.motion.angle) / DEG);
+    studio.onClipTick?.(clip.t / clip.duration, romShow(clip.motion.angle / DEG, clip.motion.end / DEG));
   };
 
   // ------------------------------------------------------- the clip overlay
-  const titleBottom = (h) => (studio.clip?.opts.title ? h * 0.155 : 0);
+  // Room the callout columns must leave for the title — and ONLY while the
+  // title is up in the frame's top band. The title now sits with the dancer
+  // (see titleOrigin) and can be dragged anywhere, so reserving a fixed strip
+  // across the top would waste a fifth of the slide on a title that is no
+  // longer there. Measured from the block the last frame actually drew.
+  const titleBottom = (h) => {
+    const b = studio.titleBox;
+    if (!studio.clip?.opts.title || !b) return 0;
+    return b.top < h * 0.22 ? b.top + b.height : 0;
+  };
+
+  // Where the title block goes: the spot the user dragged it to, else just
+  // above the subject. Pinned in the frame's corner it ends up stranded away
+  // from the anatomy it names on a wide slide, so the default hangs it over the
+  // top of the shot's own points, centred on their horizontal span.
+  function titleOrigin(w, h, blockH) {
+    const pos = studio.titlePos;
+    if (pos) return { cx: pos.x * w, top: pos.y * h };
+    let [x0, x1, y0] = [Infinity, -Infinity, Infinity];
+    for (const pt of studio.clip?.shot ?? []) {
+      _b.copy(pt).project(camera);
+      if (_b.z > 1) continue;
+      const x = (_b.x * 0.5 + 0.5) * w;
+      x0 = Math.min(x0, x);
+      x1 = Math.max(x1, x);
+      y0 = Math.min(y0, (-_b.y * 0.5 + 0.5) * h);
+    }
+    const clamp = THREE.MathUtils.clamp;
+    if (!(x0 < x1)) return { cx: w / 2, top: h * 0.045 };
+    return {
+      cx: clamp((x0 + x1) / 2, w * 0.18, w * 0.82),
+      top: clamp(y0 - blockH - h * 0.035, h * 0.02, h - blockH - h * 0.02),
+    };
+  }
+
+  // ------------------------------------------------------- dragging the title
+  // studio owns the block; main.js owns the pointer events. Coordinates in are
+  // CSS px relative to the canvas; the placement is stored as a FRACTION of the
+  // frame, so it survives a resize and lands in the same spot in a 4K export.
+  let titleGrab = null;
+  const toCanvas = (x, y) => ({
+    x: x * (hud.width / (gl.clientWidth || hud.width)),
+    y: y * (hud.height / (gl.clientHeight || hud.height)),
+  });
+
+  studio.titleHit = (cssX, cssY) => {
+    const b = studio.titleBox;
+    if (!b || !studio.clip?.opts.title) return false;
+    const p = toCanvas(cssX, cssY);
+    const pad = hud.height * 0.012;
+    return p.x >= b.left - pad && p.x <= b.left + b.width + pad
+      && p.y >= b.top - pad && p.y <= b.top + b.height + pad;
+  };
+
+  studio.beginTitleDrag = (cssX, cssY) => {
+    if (!studio.titleHit(cssX, cssY)) return false;
+    const p = toCanvas(cssX, cssY);
+    const b = studio.titleBox;
+    titleGrab = { dx: p.x - (b.left + b.width / 2), dy: p.y - b.top };
+    return true;
+  };
+
+  studio.dragTitleTo = (cssX, cssY) => {
+    if (!titleGrab) return false;
+    const p = toCanvas(cssX, cssY);
+    const clamp = THREE.MathUtils.clamp;
+    studio.titlePos = {
+      x: clamp((p.x - titleGrab.dx) / hud.width, 0.06, 0.94),
+      y: clamp((p.y - titleGrab.dy) / hud.height, 0.01, 0.94),
+    };
+    return true;
+  };
+
+  studio.endTitleDrag = () => { titleGrab = null; };
+  studio.titleDragging = () => !!titleGrab;
+
+  // ---------------------------------------------------- dragging a callout
+  // A callout can be moved to the other side of the figure by dragging its
+  // pill, and double-clicking one opens a colour picker (main.js owns both
+  // gestures; this is the geometry). The columns are the whole point of the
+  // margin layout — it is the one arrangement that never overlaps itself or
+  // the anatomy — so a drag chooses a SIDE, it does not place the pill freely.
+  let labelGrab = null;
+
+  studio.labelHit = (cssX, cssY) => {
+    if (!labels.visible || !studio.lastLayout) return null;
+    const p = toCanvas(cssX, cssY);
+    const pad = hud.height * 0.006;
+    // Last drawn is topmost, and the columns never overlap, so the first hit
+    // in reverse order is the one the user sees.
+    for (let i = studio.lastLayout.length - 1; i >= 0; i--) {
+      const b = studio.lastLayout[i].box;
+      if (!b) continue;
+      if (p.x >= b.left - pad && p.x <= b.left + b.width + pad
+        && p.y >= b.top - pad && p.y <= b.top + b.height + pad) return studio.lastLayout[i];
+    }
+    return null;
+  };
+
+  studio.beginLabelDrag = (cssX, cssY) => {
+    const hit = studio.labelHit(cssX, cssY);
+    if (!hit) return false;
+    labelGrab = { id: hit.label.id, from: toCanvas(cssX, cssY), moved: false };
+    return true;
+  };
+
+  // Follows the cursor by COLUMN: past the figure's midline the callout lands
+  // in that column and stays there (`force`), which is what the sidebar's ⇄
+  // button does one step at a time. A press that never travels is a click (a
+  // double-click, most likely), so it must not pin the label where it already
+  // sits — hence the threshold.
+  studio.dragLabelTo = (cssX, cssY) => {
+    if (!labelGrab) return false;
+    const p = toCanvas(cssX, cssY);
+    const travel = Math.hypot(p.x - labelGrab.from.x, p.y - labelGrab.from.y);
+    if (!labelGrab.moved && travel < hud.height * 0.01) return false;
+    labelGrab.moved = true;
+    const mid = labels.mid ?? hud.width / 2;
+    return labels.setSide(labelGrab.id, p.x < mid ? 'left' : 'right');
+  };
+
+  // Returns the id of the callout that was actually moved, else null.
+  studio.endLabelDrag = () => {
+    const id = labelGrab?.moved ? labelGrab.id : null;
+    labelGrab = null;
+    return id;
+  };
+  studio.labelDragging = () => !!labelGrab;
+  // Hand the title back to its default spot above the dancer.
+  studio.resetTitlePos = () => { studio.titlePos = null; };
+
+  // A movement is quoted at the textbook's granularity, not the rig's measured
+  // decimal: 10° steps for a large arc, 5° for a small one. The end of the
+  // stroke always reads the full range ROUNDED UP — hip flexion measures 117°
+  // on this rig and is a 120° movement — so the clip agrees with the MOVEMENTS
+  // table it was authored from.
+  const romStep = (endDeg) => (Math.abs(endDeg) >= 30 ? 10 : 5);
+  // Rounding UP has to forgive a fraction of a degree, or a movement that
+  // measures a hair over a round number (elbow flexion comes back as 70.0000…)
+  // is quoted a whole step too high.
+  const ROM_EPS = 0.5;
+  const romEnd = (endDeg) => {
+    const step = romStep(endDeg);
+    return Math.max(step, Math.ceil((Math.abs(endDeg) - ROM_EPS) / step) * step);
+  };
+  // What the live readout shows on the way there: the same steps, and the end
+  // value itself once the stroke is within half a step of the end range (so the
+  // hold reads the movement's full range, never 117 under a 120 title).
+  function romShow(deg, endDeg) {
+    const step = romStep(endDeg);
+    const end = romEnd(endDeg);
+    if (Math.abs(deg) >= Math.abs(endDeg) - step / 2) return end;
+    return Math.min(end, Math.round(Math.abs(deg) / step) * step);
+  }
+  studio.romEnd = romEnd;
 
   function project(v, w, h, out) {
     _b.copy(v).project(camera);
@@ -902,7 +1100,7 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
       ctx.beginPath(); ctx.arc(p.x, p.y, lw * 1.6, 0, Math.PI * 2); ctx.fill();
       // The readout rides the middle of the swept angle, just outside the arc.
       at(m.angle / 2, m.radius * 1.5, p);
-      drawPill(ctx, `${Math.round(Math.abs(m.angle) / DEG)}°`, p.x, p.y, base * 1.35, theme, { align: 'center', weight: 700 });
+      drawPill(ctx, `${romShow(m.angle / DEG, m.end / DEG)}°`, p.x, p.y, base * 1.35, theme, { align: 'center', weight: 700 });
     }
 
     if (opts.plane) {
@@ -932,18 +1130,33 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
     }
 
     if (opts.title) {
-      const x = h * 0.045;
+      // The movement's NAME, and nothing else: the plane and its axis are
+      // captioned on the plane visual itself and the degrees are on the angle
+      // pill, so repeating them here was a strap line of numbers between the
+      // audience and the anatomy.
       const big = h * 0.052;
-      ctx.textAlign = 'left';
+      const small = h * 0.026;
+      const sub = move.subtitle ?? '';
+      const blockH = big * 1.12 + (sub ? small * 1.7 : 0);
+      const { cx, top } = titleOrigin(w, h, blockH);
+      ctx.textAlign = 'center';
       ctx.textBaseline = 'alphabetic';
       ctx.font = `700 ${big}px "Segoe UI", system-ui, sans-serif`;
-      haloText(ctx, move.title, x, h * 0.088, theme.text, theme, big * 0.16);
-      const small = h * 0.026;
-      ctx.font = `500 ${small}px "Segoe UI", system-ui, sans-serif`;
-      const rom = `0–${Math.round(Math.abs(m.end) / DEG)}°`;
-      const sub = [move.subtitle, plane.title, plane.axis.toLowerCase(), rom].filter(Boolean).join('  ·  ');
-      haloText(ctx, sub, x, h * 0.088 + small * 1.7, theme.sub, theme, small * 0.22);
-    }
+      const wTitle = ctx.measureText(move.title).width;
+      haloText(ctx, move.title, cx, top + big, theme.text, theme, big * 0.16);
+      let wSub = 0;
+      if (sub) {
+        ctx.font = `500 ${small}px "Segoe UI", system-ui, sans-serif`;
+        wSub = ctx.measureText(sub).width;
+        haloText(ctx, sub, cx, top + big + small * 1.7, theme.sub, theme, small * 0.22);
+      }
+      // Only the LIVE overlay records the box: it is the drag target, in the
+      // hud's own pixels, and an export redraws the same block at its own size.
+      if (ctx === hudCtx) {
+        const bw = Math.max(wTitle, wSub);
+        studio.titleBox = { left: cx - bw / 2, top, width: bw, height: blockH };
+      }
+    } else if (ctx === hudCtx) studio.titleBox = null;
     return titleBottom(h);
   }
 

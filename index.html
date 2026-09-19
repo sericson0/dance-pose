@@ -169,7 +169,7 @@
 
       <section class="collapsed" id="labels-section" data-tab="teach">
         <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="labels-section">Labels</button></h2>
-        <div class="muted">Name bones, muscles and joints for slides. Use the <b>Label</b> mode to click structures, or highlight a body part / muscles and label them all at once. Text is editable; labels are saved into photos and videos.</div>
+        <div class="muted">Name bones, muscles and joints for slides. Use the <b>Label</b> mode to click structures, or highlight a body part / muscles and label them all at once. Text is editable; labels are saved into photos and videos. In the 3D view, <b>drag a callout</b> across the figure to move it to the other column and <b>double-click</b> one to pick its colour.</div>
         <div class="check-row">
           <label title="How much anatomy a new label names. Simple: one everyday name per body part or joint — 'Foot', 'Hip'. Detailed: every bone and muscle, named anatomically. Labels you already made keep their text.">Detail</label>
           <div class="btn-group" id="label-detail">
@@ -324,6 +324,11 @@
           <button id="muscle-show-all">Show all</button>
           <button id="muscle-hide-all">Hide all</button>
           <button id="muscle-clear-hl" disabled>Clear highlights</button>
+        </div>
+        <div class="slider-row">
+          <div class="lbl"><span title="How much of a picked colour the belly takes: 100% is exactly the colour in the swatch, lower mixes it back toward the muscle's own flesh tone">Colour strength</span><span class="val" id="muscle-tint-val">100%</span></div>
+          <input type="range" id="muscle-tint" min="0" max="100" step="5" value="100" />
+          <div class="range-hint"><span>a tint of flesh</span><span>the colour picked</span></div>
         </div>
         <div id="muscle-list" class="muted">Loading…</div>
       </section>

@@ -10,6 +10,11 @@
 //           the clip's side; a full name ('hip_R', 'chest') is literal. The
 //           FIRST entry is the primary joint: the angle arc, the plane and the
 //           axis of motion are drawn on it.
+//   complex the arm-on-trunk total that several drives in ONE plane SHARE (see
+//           sh_abd, the scapulohumeral rhythm). Coupled joints add, so the
+//           total has to be stated somewhere a check can read it: the drives
+//           must sum to it, and it must fit the primary joint's own limits,
+//           which is where this rig keeps complex ROM.
 //   base    extra joint angles held through the clip on top of NEUTRAL — the
 //           test position (elbow at 90° to show shoulder rotation, the foot
 //           lifted clear of the floor for ankle work).
@@ -63,8 +68,16 @@ const FOOT_UP = { hip: { x: -55 }, knee: { x: 65 } }; // foot clear of the floor
 
 const BICEPS = ['Biceps brachii', 'Long head of biceps brachii', 'Short head of biceps brachii'];
 const TRICEPS = ['Triceps brachii', 'Long head of triceps brachii', 'Lateral head of triceps brachii', 'Medial head of triceps brachii'];
+// The thigh groups act on the KNEE through their tendons, in the same way the
+// calf acts on the ankle through the Achilles: the bellies stop well short of
+// the joint line (the quadriceps by 66-81 mm, measured), so they ride the femur
+// and only the tendon crosses. A knee callout therefore has to cover the whole
+// muscle-tendon unit or it highlights only the half that cannot move there.
+const PES = 'Pes anserinus common tendon';
 const HAMSTRINGS = ['Hamstrings', 'Long head of biceps femoris', 'Semitendinosus', 'Semimembranosus', 'Short head of biceps femoris'];
+const HAMSTRINGS_KNEE = [...HAMSTRINGS, 'Common tendon of biceps femoris', 'Semimembranosus muscle tendon', PES];
 const QUADS = ['Quadriceps', 'Rectus femoris', 'Vastus lateralis', 'Vastus medialis', 'Vastus intermedius'];
+const QUADS_KNEE = [...QUADS, 'Quadriceps common tendon and patellar ligament'];
 // The calf acts on the ankle THROUGH its tendon: the bellies now ride the femur
 // and cross the knee (their real origin), and the Achilles spans the ankle, so
 // the callout has to cover the whole muscle-tendon unit or an ankle clip would
@@ -84,19 +97,34 @@ export const MOVEMENTS = [
   { id: 'sh_ext', group: 'Shoulder', title: 'Shoulder extension', plane: 'sagittal', frame: 'arm', pair: 'sh_flex',
     drive: [{ joint: 'shoulder', axis: 'x', to: 45 }],
     movers: ['Latissimus dorsi', 'Teres major', ['Deltoid (posterior)', 'Deltoid'], ['Triceps (long head)', 'Long head of triceps brachii']] },
-  // NOTE — scapulohumeral rhythm is NOT modelled here: the arm abducts 170° over
-  // a scapula that does not move, so the trapezius and serratus this row names
-  // are doing nothing visible even though they are now correctly seated on the
-  // blade. Adding `{ joint: 'scapula', axis: 'z', to: 20 }` was tried and
-  // reverted: it makes dev-verify-studio read the row as moving the WRONG WAY on
-  // both sides (score -0.111), because that check measures the marker's swing
-  // about the PRIMARY joint's own axis and a second joint turning in the same
-  // plane corrupts it. The opposite sign is not the answer either — the left
-  // side's scapula z range is [-12, 25], so -20 is out of range and would trip
-  // the limit test instead. Fixing this means teaching the direction check about
-  // multi-joint drives in one plane first.
+  // SCAPULOHUMERAL RHYTHM — the one row that drives two joints in ONE plane.
+  // The arm does not reach overhead on the glenohumeral joint alone: past the
+  // first ~30° the scapula upwardly rotates to supply roughly a third of the
+  // elevation, which is why this row names the trapezius and the serratus at
+  // all. Over a motionless scapula they were named and did nothing visible.
+  // The coupling SPLITS the 170° rather than adding to it, because the 170 is
+  // the ARM-ON-TRUNK total: this rig deliberately keeps complex ROM on the
+  // shoulder's own limits rather than glenohumeral-only (docs/rom-research.md).
+  // Driving the scapula on TOP of a 170° shoulder carries the arm 190°, past
+  // the vertical and down the far side — measured, and the reason an earlier
+  // attempt at this row read as moving the wrong way. `complex` states the
+  // shared total, so the table is checked against itself (movements.test.js)
+  // and the played readout against the table (dev-verify-studio.mjs).
+  // Three honest simplifications. The rig's scapula pivots at the STERNO-
+  // CLAVICULAR joint, so its `z` lumps clavicular elevation in with scapular
+  // upward rotation; both joints lerp from 0, spending the girdle's share
+  // evenly instead of holding it back through the setting phase; and 20° of a
+  // 170° total is well short of the real ~2:1 rhythm (the rig's scapula `z`
+  // stops at 25°, and pinning a target to a limit is how ranges silently go
+  // stale). This is the rhythm made visible, not a measured ratio.
+  // Only ABDUCTION is coupled: in the frontal plane the scapula turns about the
+  // same axis the shoulder does, so the two angles simply add. In the sagittal
+  // plane (sh_flex) that axis is skew to the motion, so the same shrug would
+  // tilt the humerus out of the measured plane — corrupting the readout for a
+  // movement the camera barely sees.
   { id: 'sh_abd', group: 'Shoulder', title: 'Shoulder abduction', plane: 'frontal', frame: 'arm', pair: 'sh_add',
-    drive: [{ joint: 'shoulder', axis: 'z', to: 170 }],
+    complex: 170,
+    drive: [{ joint: 'shoulder', axis: 'z', to: 150 }, { joint: 'scapula', axis: 'z', to: 20 }],
     movers: [['Deltoid (middle)', 'Deltoid'], 'Supraspinatus', 'Trapezius', 'Serratus anterior'] },
   { id: 'sh_add', group: 'Shoulder', title: 'Shoulder adduction', plane: 'frontal', frame: 'arm', pair: 'sh_abd',
     base: { shoulder: { x: -25 } }, // a little forward, so the arm crosses in front of the body
@@ -203,11 +231,11 @@ export const MOVEMENTS = [
   // ----------------------------------------------------------------- knee
   { id: 'kn_flex', group: 'Knee', title: 'Knee flexion', plane: 'sagittal', frame: 'leg', pair: 'kn_ext',
     drive: [{ joint: 'knee', axis: 'x', to: 145 }],
-    movers: [HAMSTRINGS, GASTROC, 'Gracilis', 'Sartorius'] },
+    movers: [HAMSTRINGS_KNEE, GASTROC, ['Gracilis', 'Gracilis', PES], ['Sartorius', 'Sartorius', PES]] },
   { id: 'kn_ext', group: 'Knee', title: 'Knee extension', plane: 'sagittal', frame: 'leg', pair: 'kn_flex',
     base: { hip: { x: -60 }, knee: { x: 100 } },
     drive: [{ joint: 'knee', axis: 'x', to: 0 }],
-    movers: [QUADS] },
+    movers: [QUADS_KNEE] },
 
   // ------------------------------------------------------- ankle and toes
   { id: 'an_df', group: 'Ankle & foot', title: 'Ankle dorsiflexion', plane: 'sagittal', frame: 'foot', pair: 'an_pf',

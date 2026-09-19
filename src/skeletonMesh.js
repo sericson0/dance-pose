@@ -189,6 +189,37 @@ const TRUNK_SHEETS = new Set([
   'Internal abdominal oblique muscle.r',
 ].map(norm));
 
+// Bellies whose skin weights come from CONTACT with the two bones rather than
+// from position along a bone axis (`contact` path in Figure.#addSkinnedMuscle).
+//
+// Gluteus maximus is the case that needs it. The axial split assigns tissue by
+// its height along the FEMUR relative to the hip centre, which suits a belly
+// whose fibres run down the limb — gluteus medius and minimus, iliac wing to
+// trochanter, are well served by it and stay on it. Maximus is a fan running
+// obliquely from the sacrum, coccyx and posterior ilium out to the femur, and
+// HALF OF ITS ORIGIN LIES BELOW THE HIP JOINT'S HEIGHT. Measured by height, that
+// sacral and coccygeal tissue is "distal", so it was welded to the thigh: through
+// the hip-flexion clip the tissue actually touching the pelvis drifted 55 mm on
+// average and 130 mm at worst off the bone, the belly peeling away from the
+// sacrum and swinging forward with the leg. Weighted by contact instead — tissue
+// on the pelvis follows the pelvis, tissue on the femur follows the femur, what
+// lies between shears — the origin holds to 1.1 mm (3.5 max), the insertion to
+// 2.0 mm (5.6 max, from 23.1), and the belly stretches no more than before
+// (edge p95 x2.48 against x2.59).
+//
+// What this does NOT fix, so it is not mistaken for a regression: at 120° the
+// belly still hangs a few cm below the ischium as a sling. Blending two rigid
+// frames carries mid-belly tissue round the hip at its resting radius, where a
+// real gluteus maximus is pulled taut over the ischial tuberosity. That needs a
+// wrapping surface, which two-bone skinning cannot express.
+//
+// Two alternatives were measured and are worse — do not reach for them. The
+// full-length `spread` ramp fixes maximus but needs an axis, and any axis that
+// suits maximus ruins medius (origin 0 → 32 mm) and minimus (0 → 14). Biasing
+// the contact ratio toward the pelvis, to keep more of the buttock on the bone,
+// tears the insertion off instead (2 → 15 mm at a 0.6 exponent, 72 mm at 0.3).
+const CONTACT_SHEETS = new Set(['Gluteus maximus muscle.r'].map(norm));
+
 // Girdle sheets now RIDE the scapula (so the blade carries them), but they are
 // back/chest-wall muscles and must keep highlighting with the Torso part. Without
 // this they would follow their node into `arm_L`/`arm_R` (PART_OF_NODE maps
@@ -208,28 +239,48 @@ const GIRDLE_SHEETS = new Set([
 // articulates; muscles omitted here are treated as effectively single-bone and
 // stay rigid on `node`. `insert` bases resolve per-side to match the muscle.
 const MUSCLE_INSERT = new Map(Object.entries({
-  // Thigh muscles reaching the shank (quadriceps, sartorius, gracilis,
-  // hamstrings) → they follow the knee at their distal end.
+  // Thigh units reaching the shank → they follow the knee at their distal end.
+  // ONLY the long tendons are left here, and that is the whole point: a belly
+  // is skinned across a joint only if it actually TOUCHES the bone on the far
+  // side. Measured against the shin cluster at rest, the quadriceps bellies
+  // stop 66-81 mm short of it (vastus intermedius 80.9, lateralis 69.9, rectus
+  // femoris 69.1, medialis 65.6) while their common tendon reaches it at 0.7 mm.
+  // Skinned to the tibia anyway, the sliding window parked their far weight
+  // band on tissue nowhere near the joint and knee flexion dragged it across
+  // the gap: the quadriceps group tore to x1.59..x1.75 of bind length in
+  // kn_flex and x1.46..x1.65 in hp_flex (which drives the knee 110° too). That
+  // is the "quad pulling off the bone" this table used to produce. The tendons
+  // below touch the shin at 0.3-0.9 mm and do the crossing, which is exactly
+  // the division of labour gastrocnemius/Achilles already uses.
   knee: [
-    // The thigh's long tendons cross the knee to the tibia, which is exactly
-    // what their bellies do not reach.
     'Quadriceps common tendon and patellar ligament.r',
     'Common tendon of biceps femoris.r', 'Semimembranosus muscle tendon.r',
     'Pes anserinus common tendon.r',
-    'Rectus femoris.r', 'Vastus lateralis muscle.r', 'Vastus medialis muscle.r',
-    'Vastus intermedius muscle.r', 'Sartorius muscle.r', 'Gracilis muscle.r',
-    'Long head of biceps femoris.r', 'Short head of biceps femoris.r',
-    'Semitendinosus muscle.r', 'Semimembranosus muscle.r',
     // Gastrocnemius crosses the KNEE (femoral origin → shank); the Achilles
     // above carries its ankle half.
     'Lateral head of gastrocnemius.r', 'Medial head of gastrocnemius.r',
   ],
-  // Hip muscles anchored to the pelvis/sacrum above the joint (adductors,
-  // glutes, iliopsoas, piriformis) → their proximal end follows the pelvis.
+  // Hip muscles anchored to the pelvis/sacrum above the joint → their proximal
+  // end follows the pelvis.
+  //
+  // The second block is the counterpart to the note above, and it is the bug
+  // the hip-flexion clip showed. These bellies REST ON the pelvis (measured
+  // gap to the pelvic bone cloud: sartorius 2.3 mm, semimembranosus 1.6,
+  // gracilis 2.4, rectus femoris 2.1 — 5-10% of each belly's tissue is in
+  // contact with it), but their one `insert` slot was spent on the knee, so
+  // their origins were welded to the FEMUR with nothing modelling the hip. Hip
+  // flexion then carried those origins bodily off the pelvis — measured in the
+  // pelvis's own frame, sartorius 169 mm, semimembranosus 127, gracilis 101,
+  // rectus femoris 77, against 0-9 mm for the already-correct hip muscles
+  // beside them. A belly can only span two joints, so the proximal one wins
+  // here: the hip is where the detachment is, and every one of these already
+  // has a shipped tendon crossing the knee for it.
   pelvis: [
     'Adductor longus.r', 'Adductor brevis.r', 'Adductor magnus.r', 'Pectineus muscle.r',
     'Gluteus maximus muscle.r', 'Gluteus medius muscle.r', 'Gluteus minimus muscle.r',
     'Iliacus muscle.r', 'Psoas major.r', 'Piriformis muscle.r',
+    'Rectus femoris.r', 'Sartorius muscle.r', 'Gracilis muscle.r',
+    'Long head of biceps femoris.r', 'Semitendinosus muscle.r', 'Semimembranosus muscle.r',
   ],
   // Shank muscles crossing to the foot (triceps surae + the ankle/toe movers)
   // → their distal end follows the ankle. Gastrocnemius is the classic
@@ -286,6 +337,17 @@ const MUSCLE_INSERT = new Map(Object.entries({
   toes: ['Extensor digitorum longus tendons.r'],
 }).flatMap(([node, names]) => names.map((name) => [norm(name), node])));
 
+// DELIBERATELY ABSENT above, so the omission does not read as an oversight: the
+// three vasti and the short head of biceps femoris. Measured at rest, they touch
+// NEITHER neighbouring bone — 55-63 mm from the pelvis and 66-81 mm from the
+// shin (short head 120 mm / 13 mm) — because they arise from the femoral shaft
+// and end in a tendon. There is no joint for them to be skinned across, so they
+// stay rigid on the femur and their tendons (quadriceps/patellar, common tendon
+// of biceps femoris) carry the knee. A clip whose prime movers are these bellies
+// must name the tendon in its callout or it highlights nothing that can move —
+// see QUADS/HAMSTRINGS in movements.js, the same rule the Achilles set for the
+// ankle clips.
+
 // Map an atlas muscle name → { node, insert? } — the joint it rides plus, for a
 // belly that crosses an articulated joint, the far bone it also attaches to. Or
 // null to skip (arteries, nerves, ligaments, intrinsics, and muscles we don't
@@ -299,6 +361,7 @@ export function classifyMuscle(rawName) {
   // part even though they ride the pelvis node.
   if (TRUNK_SHEETS.has(n)) return { node, insert, spread: true, ride: 'spine' };
   if (GIRDLE_SHEETS.has(n)) return { node, insert, ride: 'spine' };
+  if (insert && CONTACT_SHEETS.has(n)) return { node, insert, contact: true };
   return insert ? { node, insert } : { node };
 }
 
@@ -354,8 +417,8 @@ export async function loadMuscleMeshes(url) {
     const g = bakeToWorld(o);
     muscles.push({
       name: o.name, label: muscleLabel(o.name),
-      node: cls.node, insert: cls.insert, spread: cls.spread, ride: cls.ride,
-      geometry: g,
+      node: cls.node, insert: cls.insert, spread: cls.spread, contact: cls.contact,
+      ride: cls.ride, geometry: g,
     });
   });
   gltf.scene.traverse((o) => { if (o.isMesh) o.geometry.dispose(); });

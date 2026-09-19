@@ -19,6 +19,7 @@ const MUSCLE_HL_COLOR = 0xffce4a;
 const MUSCLE_HL_EMISSIVE = 0xffb020;
 const MUSCLE_HIDDEN_OPACITY = 0.06;
 const WHITE = new THREE.Color(0xffffff);
+const _hl = new THREE.Color(); // scratch for the muscle highlight mix
 
 // Centroid and smallest-variance axis (≈ the flat normal of a slab-like cloud,
 // e.g. a palm or a sole) of a set of points, via power iteration on
@@ -619,7 +620,8 @@ export class Figure {
           g.applyMatrix4(T);
           if (mirror) reverseWinding(g);
           const rideName = m.ride ? resolve(m.ride, side) : nodeName;
-          this.#addSkinnedMuscle(g, node, insNode, material, m.label, rideName, m.spread)
+          const mode = m.spread ? 'spread' : m.contact ? 'contact' : null;
+          this.#addSkinnedMuscle(g, node, insNode, material, m.label, rideName, mode)
             .userData.muscleSide = side;
         } else {
           // Rigid: bake into the node's local frame and hang it there.
@@ -653,7 +655,10 @@ export class Figure {
   // mesh hangs off `group` (not a joint node) so its own frame never moves — all
   // motion comes through the two joints, keeping the skin correct even as the
   // whole dancer translates or turns.
-  #addSkinnedMuscle(g, nodeA, nodeB, material, label, originNode, spread = false) {
+  // `mode` picks how the weights are laid out: null = the axial split at the
+  // crossed joint (nearly every belly), 'spread' = a full-length ramp (the
+  // abdominal wall), 'contact' = by which of the two bones the tissue lies on.
+  #addSkinnedMuscle(g, nodeA, nodeB, material, label, originNode, mode = null) {
     const pos = g.attributes.position;
     const nrm = g.attributes.normal;
     const count = pos.count;
@@ -662,7 +667,11 @@ export class Figure {
     const b = new THREE.Vector3().setFromMatrixPosition(nodeB.matrixWorld).applyMatrix4(gInv);
     const weight = new Float32Array(count);
     const v = new THREE.Vector3();
-    if (spread) {
+    if (mode === 'contact' && this.#contactWeights(pos, nodeA, nodeB, gInv, weight)) {
+      // Weights written by #contactWeights. It returns false — and the axial
+      // split below takes over — when either bone has no geometry to measure
+      // against (the skeleton GLB failed to load).
+    } else if (mode === 'spread') {
       // Broad trunk sheet (the abdominal wall) that spans BOTH joints rather than
       // lying on one bone and crossing at a tendon: shear the whole belly
       // progressively from the proximal joint (nodeA, the pelvis) to the distal
@@ -802,6 +811,67 @@ export class Figure {
     this.layerMeshes.muscle.push(mesh);
     this._skinMuscles.push({ mesh, nodeA, nodeB, weight, bindPos, bindNrm, invA, invB });
     return mesh;
+  }
+
+  // Skin weights from CONTACT: each vertex is shared between the two bones in
+  // proportion to how close it lies to each (weight → nodeB = dA / (dA + dB),
+  // smoothstepped), so tissue resting on a bone is glued to it and what lies
+  // between shears. It needs no axis at all, which is the point — the axial
+  // split cannot serve a fan like gluteus maximus, half of whose origin sits
+  // below the joint it crosses (see CONTACT_SHEETS in skeletonMesh.js for the
+  // measurements). Writes into `weight` and returns true, or returns false when
+  // either bone has no geometry to measure against.
+  #contactWeights(pos, nodeA, nodeB, gInv, weight) {
+    const cloudA = this.#boneCloud(nodeA, gInv);
+    const cloudB = this.#boneCloud(nodeB, gInv);
+    if (!cloudA.length || !cloudB.length) return false;
+    const nearest = (p, cloud) => {
+      let best = Infinity;
+      for (let k = 0; k < cloud.length; k += 3) {
+        const dx = p.x - cloud[k], dy = p.y - cloud[k + 1], dz = p.z - cloud[k + 2];
+        const d = dx * dx + dy * dy + dz * dz;
+        if (d < best) best = d;
+      }
+      return Math.sqrt(best);
+    };
+    const v = new THREE.Vector3();
+    for (let i = 0; i < pos.count; i++) {
+      v.fromBufferAttribute(pos, i);
+      const dA = nearest(v, cloudA);
+      const dB = nearest(v, cloudB);
+      const t = dA / Math.max(dA + dB, 1e-9); // 1 = lying on nodeB's bone
+      weight[i] = t * t * (3 - 2 * t);
+    }
+    return true;
+  }
+
+  // The bone surface hanging on a joint node, as a flat xyz array in
+  // figure-local space at bind. Sub-sampled to ~3000 points: a nearest-point
+  // search against every vertex of a pelvis, per belly vertex, per side, is load
+  // time nobody asked for, and the coarse cloud costs almost nothing — measured
+  // on gluteus maximus, the origin holds to 1.1 mm against 0.9 mm for a cloud
+  // five times denser. Cached per node; both sides measure against one pelvis.
+  #boneCloud(node, gInv) {
+    this._boneClouds ??= new Map();
+    let cloud = this._boneClouds.get(node);
+    if (cloud) return cloud;
+    const meshes = node.children.filter((c) => c.isMesh && c.userData.boneRanges);
+    const total = meshes.reduce((n, m) => n + m.geometry.attributes.position.count, 0);
+    const step = Math.max(1, Math.floor(total / 3000));
+    const out = [];
+    const v = new THREE.Vector3();
+    const M = new THREE.Matrix4();
+    for (const mesh of meshes) {
+      M.multiplyMatrices(gInv, mesh.matrixWorld);
+      const p = mesh.geometry.attributes.position;
+      for (let i = 0; i < p.count; i += step) {
+        v.fromBufferAttribute(p, i).applyMatrix4(M);
+        out.push(v.x, v.y, v.z);
+      }
+    }
+    cloud = Float32Array.from(out);
+    this._boneClouds.set(node, cloud);
+    return cloud;
   }
 
   // The deeper (child) of two hierarchy-adjacent joint nodes — the joint the
@@ -1988,6 +2058,49 @@ export class Figure {
     this.#applyMuscleStyle();
   }
 
+  // The colour ONE belly lights in, overriding both the default highlight amber
+  // and the body part's hue (the more specific pick wins). Keyed by atlas label
+  // like the lit/hidden sets, so both copies of a named belly agree; `hex` null
+  // hands it back to the default. The callouts read it back through
+  // `muscleColor` so a labelled muscle and its pill carry the same colour.
+  setMuscleColor(label, hex) {
+    this.muscleColors ??= new Map();
+    if (hex) this.muscleColors.set(label, hex); else this.muscleColors.delete(label);
+    this.#applyMuscleStyle();
+  }
+
+  muscleColor(label) { return this.muscleColors?.get(label) ?? null; }
+
+  // How much of a picked colour a belly takes (0..1, default 1 = exactly the
+  // colour picked). Below 1 it mixes back toward the belly's own flesh tone and
+  // dims the glow with it, so the colour reads as a tint rather than a coat.
+  // Only PICKED colours listen to it: a body-part highlight has its own
+  // calibrated look (see #applyMuscleStyle).
+  setMuscleTint(frac) {
+    this.muscleTint = Math.min(1, Math.max(0, frac));
+    this.#applyMuscleStyle();
+  }
+
+  // Set a material's transparency IN PLACE. `transparent` is not an ordinary
+  // uniform: three bakes it into the shader program (`opaque` is a program
+  // parameter → `#define OPAQUE`, and an opaque program forces the fragment's
+  // alpha to 1), so flipping the flag on an already-compiled material changes
+  // NOTHING on screen until the program is rebuilt. That is exactly what made
+  // "Fade others" look broken — every faded belly carried opacity 0.06 and went
+  // on rendering solid. Only flag a rebuild when the value really changed;
+  // recompiling a shader per call would be a real cost.
+  //
+  // (The body-part highlight escapes this because it swaps in CLONED variant
+  // materials, which compile once with the flag they are born with.)
+  static setTransparency(mat, transparent, opacity, depthWrite) {
+    if (mat.transparent !== transparent) {
+      mat.transparent = transparent;
+      mat.needsUpdate = true;
+    }
+    mat.opacity = opacity;
+    mat.depthWrite = depthWrite;
+  }
+
   // Resolve each imported muscle belly's look from three inputs: the panel's
   // hidden set (transparent), its highlight set (warm glow), and the body-part
   // highlight (dim the bellies outside the chosen part). Each belly owns its
@@ -2015,24 +2128,42 @@ export class Figure {
 
       const mat = mesh.material;
       if (state === 'lit') {
-        if (partColor) {
-          // The belly takes the part's hue, lightened so it still reads as flesh
+        // A colour picked for THIS belly beats the body part's hue beneath it.
+        const own = this.muscleColors?.get(label) ?? null;
+        const hue = own ?? partColor;
+        if (own) {
+          // A PICKED colour renders as picked: mixing it halfway to white (what
+          // the body-part hue below does, so a whole lit region still reads as
+          // flesh over the bones) makes the belly visibly paler than the swatch
+          // the user chose it from. The strength slider mixes back toward the
+          // belly's own flesh colour instead of toward white, so turning it
+          // down desaturates the tint rather than bleaching it.
+          const t = this.muscleTint ?? 1;
+          mat.color.setHex(mesh.userData.muscleBaseColor).lerp(_hl.set(hue), t);
+          mat.emissive.set(hue);
+          mat.emissiveIntensity = 0.5 * t;
+          Figure.setTransparency(mat, false, 1, true);
+          mesh.castShadow = true;
+          continue;
+        }
+        if (hue) {
+          // The belly takes the hue, lightened so it still reads as flesh
           // over the bones, with the pure hue as its glow.
-          mat.emissive.set(partColor);
-          mat.color.set(partColor).lerp(WHITE, 0.45);
+          mat.emissive.set(hue);
+          mat.color.set(hue).lerp(WHITE, 0.45);
         } else {
           mat.color.setHex(MUSCLE_HL_COLOR);
           mat.emissive.setHex(MUSCLE_HL_EMISSIVE);
         }
         mat.emissiveIntensity = 0.5;
-        mat.transparent = false; mat.opacity = 1; mat.depthWrite = true;
+        Figure.setTransparency(mat, false, 1, true);
       } else {
         mat.color.setHex(mesh.userData.muscleBaseColor);
         mat.emissive.setHex(0x000000);
         mat.emissiveIntensity = 1;
-        if (state === 'hidden') { mat.transparent = true; mat.opacity = MUSCLE_HIDDEN_OPACITY; mat.depthWrite = false; }
-        else if (state === 'dim') { mat.transparent = true; mat.opacity = 0.13; mat.depthWrite = false; }
-        else { mat.transparent = false; mat.opacity = 1; mat.depthWrite = true; }
+        if (state === 'hidden') Figure.setTransparency(mat, true, MUSCLE_HIDDEN_OPACITY, false);
+        else if (state === 'dim') Figure.setTransparency(mat, true, 0.13, false);
+        else Figure.setTransparency(mat, false, 1, true);
       }
       mesh.castShadow = state !== 'hidden';
     }

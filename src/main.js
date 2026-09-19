@@ -1937,6 +1937,21 @@ const app = {
   setMuscleLit(labels) {
     for (const f of this.figures) f.setMuscleLit(labels);
   },
+  // Give ONE highlighted belly its own colour (hex, or null for the default
+  // amber). Its callout's accent follows — see Labels.accentColor — so the
+  // muscle and the label naming it stay the same colour on a slide.
+  setMuscleColor(label, hex) {
+    for (const f of this.figures) f.setMuscleColor(label, hex);
+    this.labels.onChange?.(); // the sidebar list wears the colour too
+  },
+  muscleColor(label) { return this.figures[0]?.muscleColor(label) ?? null; },
+  // How strongly a picked colour paints its belly (0..1, 1 = exactly the colour
+  // picked — the Muscles panel's "Colour strength").
+  setMuscleTint(frac) {
+    this.muscleTintValue = frac;
+    for (const f of this.figures) f.setMuscleTint(frac);
+  },
+  muscleTint() { return this.muscleTintValue ?? 1; },
 
   // The lower of the two ankles — the foot the dancer is standing on.
   supportAnkle(figure) {
@@ -2662,6 +2677,22 @@ Object.assign(app, {
     const at = studio.lastLayout?.find((p) => p.label.id === id);
     studio.labels.flip(id, at?.side ?? 'left');
   },
+  // Which column a callout is in right now ('left' | 'right'), and putting it
+  // in one deliberately. `null` hands it back to the automatic side-of-the-
+  // anchor rule.
+  labelSide(id) { return studio.lastLayout?.find((p) => p.label.id === id)?.side ?? null; },
+  setLabelSide(id, side) { return studio.labels.setSide(id, side); },
+  // A colour for the CALLOUT itself. A muscle callout is recoloured through its
+  // belly instead (app.setMuscleColor → Labels.accentColor reads it back), so
+  // the belly and the label naming it stay one thing; this is for the bones and
+  // joints, which have no colour of their own to take.
+  setLabelColor(id, hex) {
+    if (studio.labels.setColor(id, hex)) requestRender();
+  },
+  labelAccent(id) {
+    const l = studio.labels.byId(id);
+    return l ? studio.labels.accentColor(l) : null;
+  },
   setLabelSize(frac) { studio.labels.size = frac; },
   setLabelsVisible(on) { studio.labels.visible = !!on; },
   // How much anatomy a NEW label names: 'simple' (one everyday name per body
@@ -2895,10 +2926,67 @@ tcontrols.addEventListener('objectChange', () => {
   }
 });
 
+// A clip's title block is 2D overlay chrome, so it has no place in the scene's
+// picking: studio.js says where it drew, and these three handlers drag it. The
+// grab is armed by HOVER (canvasPoint below turns orbiting off while the cursor
+// is over the title) rather than at pointerdown — OrbitControls listens on this
+// same canvas and would already have started a camera rotate by the time a
+// pointerdown handler of ours ran.
+let titleDrag = false;
+let titleHover = false;
+// The same arrangement for a callout pill: hovering one hands it the cursor, a
+// drag moves it to the column the cursor ends in, and a double-click opens its
+// colour picker.
+let labelDrag = false;
+let labelHover = false;
+const DOUBLE_TAP_MS = 400;
+let labelTap = { id: null, t: 0 };
+const canvasPoint = (e) => {
+  const r = renderer.domElement.getBoundingClientRect();
+  return [e.clientX - r.left, e.clientY - r.top];
+};
+
 // Click-vs-drag detection so orbiting doesn't change the selection.
 let downPos = null;
-renderer.domElement.addEventListener('pointerdown', (e) => { downPos = [e.clientX, e.clientY]; });
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  downPos = [e.clientX, e.clientY];
+  if (titleHover && studio.beginTitleDrag(...canvasPoint(e))) titleDrag = true;
+  else if (labelHover && studio.beginLabelDrag(...canvasPoint(e))) labelDrag = true;
+});
 renderer.domElement.addEventListener('pointerup', (e) => {
+  if (titleDrag) {
+    titleDrag = false;
+    studio.endTitleDrag();
+    downPos = null;
+    return; // the title took this gesture; nothing in the scene should see it
+  }
+  if (labelDrag) {
+    labelDrag = false;
+    downPos = null;
+    const movedId = studio.endLabelDrag();
+    if (movedId !== null) {
+      const l = studio.labels.byId(movedId);
+      app.status(`“${l?.text}” moved to the ${l?.force} column.`, 'info');
+      labelTap = { id: null, t: 0 };
+      return;
+    }
+    // A press that never travelled is a click ON the pill — it changed no
+    // column, and it must not fall through to pick a joint behind the callout
+    // either. A SECOND one in quick succession opens the colour picker.
+    //
+    // Counted here rather than off the native `dblclick` event: the pill's own
+    // drag already owns pointerdown/up over it, so this is where the second
+    // press arrives — and the gesture then does not depend on how a browser
+    // (or an automated one, which never fired dblclick here at all) decides to
+    // synthesise a double click.
+    const hit = studio.labelHit(...canvasPoint(e));
+    const now = performance.now();
+    if (hit && labelTap.id === hit.label.id && now - labelTap.t < DOUBLE_TAP_MS) {
+      labelTap = { id: null, t: 0 };
+      openLabelColor(hit.label, e.clientX, e.clientY);
+    } else labelTap = { id: hit?.label.id ?? null, t: now };
+    return;
+  }
   if (!downPos) return;
   const moved = Math.hypot(e.clientX - downPos[0], e.clientY - downPos[1]);
   downPos = null;
@@ -3064,9 +3152,50 @@ function jointActionable(jointName) {
   return clickTargetJoint(jointName) !== null;
 }
 
-renderer.domElement.addEventListener('pointerleave', () => { clearHover(); studio.hover = null; });
+renderer.domElement.addEventListener('pointerleave', () => {
+  clearHover();
+  studio.hover = null;
+  if (titleHover && !titleDrag) { titleHover = false; orbit.enabled = true; }
+  if (labelHover && !labelDrag) { labelHover = false; orbit.enabled = true; }
+});
 renderer.domElement.addEventListener('pointermove', (e) => {
+  if (titleDrag) {
+    studio.dragTitleTo(...canvasPoint(e));
+    requestRender(); // overlay-only change; the solve loop may be idling
+    return;
+  }
+  if (labelDrag) {
+    if (studio.dragLabelTo(...canvasPoint(e))) requestRender();
+    return;
+  }
   if (downPos || gizmoDragging()) return; // don't fight a click, gizmo drag, or orbit
+  // Over the clip title, the cursor belongs to the title: nothing in the scene
+  // is pickable through it, and orbiting is held off so a drag moves the block
+  // instead of the camera.
+  const overTitle = studio.clipActive && studio.titleHit(...canvasPoint(e));
+  titleHover = overTitle;
+  // Assigned every move, not toggled on the edge: a gizmo drag that ends under
+  // the title re-enables orbiting behind our back, and a stale edge would then
+  // leave the title dragging the camera with it.
+  orbit.enabled = !overTitle;
+  if (overTitle) {
+    clearHover();
+    studio.hover = null;
+    renderer.domElement.style.cursor = 'move';
+    return;
+  }
+  // Over a callout pill the cursor belongs to the callout, on the same terms:
+  // orbiting is held off so a drag moves it between the columns instead of the
+  // camera, and it is ASSIGNED every move rather than toggled on the edge.
+  const overLabel = !!studio.labelHit(...canvasPoint(e));
+  labelHover = overLabel;
+  orbit.enabled = !overLabel;
+  if (overLabel) {
+    clearHover();
+    studio.hover = null;
+    renderer.domElement.style.cursor = 'grab';
+    return;
+  }
   pointerRay(e);
   const visible = app.visibleFigures();
 
@@ -3173,6 +3302,40 @@ function handleDrawClick() {
   else if (app.drawTool === 'circle') app.addDrawCircle(a, a.distanceTo(p));
 }
 
+// The atlas labels of the HIGHLIGHTED muscle under the cursor, or null.
+// Lighting is by label (a bare name lights both sides, `name|L` one of them),
+// the same keys Figure.setMuscleLit takes. A clip's callout usually names a
+// GROUP of bellies ("Quadriceps" is four of them, "Iliopsoas" two) and the
+// colour belongs to the callout, so a click on any one of them returns the
+// whole group and they recolour together.
+// The bellies one callout covers. A clip's mover row groups several heads under
+// a single name ("Quadriceps"), and a colour picked for it belongs to the
+// callout, so it has to reach every head the callout speaks for.
+function moverGroup(name) {
+  const group = (studio.clip?.move.movers ?? [])
+    .map((g) => (Array.isArray(g) ? g.slice(1) : [g]))
+    .find((names) => names.includes(name));
+  return group?.length ? group : [name];
+}
+
+function litMuscleAtPointer(visible) {
+  const pick = studio.labels.pick(raycaster, visible, 'muscle', camera);
+  if (!pick || pick.kind !== 'muscle') return null;
+  const lit = pick.figure.litMuscles;
+  const side = pick.mesh.userData.muscleSide;
+  if (!lit || !(lit.has(pick.name) || lit.has(`${pick.name}|${side}`))) return null;
+  return moverGroup(pick.name);
+}
+
+// Double-click a callout to colour it. A MUSCLE callout is recoloured through
+// its belly (app.setMuscleColor), so the belly, its pill and the sidebar tag go
+// on reading as one thing — the same picker a click on a lit belly opens. A
+// bone or joint callout has no belly to carry a colour, so it takes one itself.
+function openLabelColor(label, x, y) {
+  if (label.kind === 'muscle') app.ui?.pickMuscleColor(moverGroup(label.name), x, y);
+  else app.ui?.pickLabelColor(label.id, x, y);
+}
+
 function handleClick(e) {
   pointerRay(e);
 
@@ -3187,6 +3350,14 @@ function handleClick(e) {
   }
 
   const visible = app.visibleFigures();
+  // On the clip stage, clicking a LIT belly opens a colour picker for it: the
+  // prime movers are what the slide is about, and a teacher wants them in their
+  // own colours. Only there — off the stage that click still picks a joint, and
+  // in Label mode it names the muscle.
+  if (studio.clipActive && app.mode !== 'label') {
+    const names = litMuscleAtPointer(visible);
+    if (names) { app.ui?.pickMuscleColor(names, e.clientX, e.clientY); return; }
+  }
   if (app.mode === 'label') {
     // Click a bone, muscle or joint to name it; click it again to un-name it.
     const pick = studio.labels.pick(raycaster, visible, app.labelFilter, camera);
