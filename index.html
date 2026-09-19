@@ -84,8 +84,24 @@
       </span>
     </header>
 
-    <aside id="sidebar">
-      <section id="view-section">
+    <!-- Three workflows, shown one at a time. The panel carried all 14 sections
+         in a ~1600px column, so the posing controls — the 90% case — started
+         below the fold on a 1366x768 laptop. Every section keeps its id and its
+         place in the markup; a section declares its group with data-tab and the
+         strip below only filters which groups are displayed (style.css). DOM
+         order is therefore still visual order, so focus order stays honest.
+         These are deliberately plain toggle buttons rather than role="tab":
+         without a single wrapping element per group there is no honest
+         tabpanel to point aria-controls at, and half-built tab semantics read
+         worse to a screen reader than a labelled group of pressed buttons. -->
+    <aside id="sidebar" data-active-tab="pose">
+      <div id="sidebar-tabs" role="group" aria-label="Which group of controls to show">
+        <button type="button" data-tab="pose" aria-pressed="true" title="Build the pose: the selected joint, the embrace, contact pins, saved slides and the dancers themselves">Pose</button>
+        <button type="button" data-tab="teach" aria-pressed="false" title="Make teaching material: the view and backdrop, anatomy labels, movement clips, highlights and muscles">Teach</button>
+        <button type="button" data-tab="measure" aria-pressed="false" title="Read the biomechanics: balance and angles, the foot map, A/B comparison and movement sequences">Measure</button>
+      </div>
+
+      <section id="view-section" data-tab="teach">
         <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="view-section">View</button></h2>
         <div class="check-row">
           <label for="layer-mode">Layer</label>
@@ -148,7 +164,7 @@
         </div>
       </section>
 
-      <section class="collapsed" id="labels-section">
+      <section class="collapsed" id="labels-section" data-tab="teach">
         <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="labels-section">Labels</button></h2>
         <div class="muted">Name bones, muscles and joints for slides. Use the <b>Label</b> mode to click structures, or highlight a body part / muscles and label them all at once. Text is editable; labels are saved into photos and videos.</div>
         <div class="check-row">
@@ -173,7 +189,7 @@
         <div id="label-list"></div>
       </section>
 
-      <section class="collapsed" id="clips-section">
+      <section class="collapsed" id="clips-section" data-tab="teach">
         <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="clips-section">Movement clips</button></h2>
         <div class="muted">Short looping videos of single joint movements for slides. Pick a movement: one dancer steps onto a clean stage, the camera frames the joint, and the overlays you tick are drawn in. Orbit freely to reframe. Your couple's pose returns when you exit.</div>
         <div class="row">
@@ -240,7 +256,7 @@
         </div>
       </section>
 
-      <section id="embrace-section">
+      <section id="embrace-section" data-tab="pose">
         <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="embrace-section">Embrace</button></h2>
         <div class="check-row">
           <label title="Keep the arm frame through any movement: the leader's left hand joins the follower's right palm to palm (open side, his palm facing her and hers facing him; the elbows hang and the hands join at collarbone height — raise the clasp for a higher salon frame), his right palm stays on her back and her left palm on his upper arm (closed side).">
@@ -272,7 +288,7 @@
         <div class="muted" id="embrace-anchor-hint" hidden>Both dancers are held in place — pose the arm or shoulder you want (try <b>Drag limb</b> to pull a hand into position) and the partner stays put. Joint limits stop an arm short of an impossible reach. Uncheck to let the embrace re-settle.</div>
       </section>
 
-      <section class="collapsed" id="pins-section">
+      <section class="collapsed" id="pins-section" data-tab="pose">
         <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="pins-section">Contact pins</button></h2>
         <div class="muted">Hold a spot on one dancer against a spot on the other through any move — his palm on her back, foot against foot for a parada. Author them with the <b>Pin spots</b> mode: click the first spot, then the matching spot on the partner. The partner of whoever you edit adapts: a pinned arm or leg re-solves to keep the contact, a torso spot pulls the whole dancer along.</div>
         <div id="pin-list"></div>
@@ -281,7 +297,7 @@
         </div>
       </section>
 
-      <section class="collapsed" id="highlight-section">
+      <section class="collapsed" id="highlight-section" data-tab="teach">
         <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="highlight-section">Highlight</button></h2>
         <div class="muted">Click a part to light it up and fade the rest. Each part has its own colour — click the swatch beside an active part to change it.</div>
         <div class="muted" id="highlight-layer-note" hidden>
@@ -293,7 +309,7 @@
         </div>
       </section>
 
-      <section class="collapsed" id="muscle-section">
+      <section class="collapsed" id="muscle-section" data-tab="teach">
         <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="muscle-section">Muscles</button></h2>
         <div class="muted" id="muscle-layer-note" hidden>
           Turn on the <button id="muscle-enable-layer" class="linkish">Muscles layer</button> to see these.
@@ -306,7 +322,7 @@
         <div id="muscle-list" class="muted">Loading…</div>
       </section>
 
-      <section id="joint-section">
+      <section id="joint-section" data-tab="pose">
         <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="joint-section">Selected joint</button></h2>
         <div class="row" id="joint-picker">
           <div id="joint-fig-toggle" class="btn-group" title="Which dancer the joint grid targets">
@@ -318,12 +334,12 @@
         <div id="joint-panel" class="muted">Click a joint on a figure — or pick one above — to select it.</div>
       </section>
 
-      <section id="balance-section">
+      <section id="balance-section" data-tab="measure">
         <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="balance-section">Balance &amp; angles</button></h2>
         <div id="stats-panel"></div>
       </section>
 
-      <section id="footmap-section">
+      <section id="footmap-section" data-tab="measure">
         <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="footmap-section">Foot map</button></h2>
         <div class="row">
           <div id="footmap-fig" class="btn-group" title="Whose foot to map">
@@ -340,7 +356,7 @@
         <div id="footmap-note" class="muted"></div>
       </section>
 
-      <section class="collapsed" id="compare-section">
+      <section class="collapsed" id="compare-section" data-tab="measure">
         <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="compare-section">Compare poses</button></h2>
         <div class="btn-row">
           <button id="snap-a">Set A</button>
@@ -365,7 +381,7 @@
         <div id="compare-panel" class="muted">Snapshot two poses to see joint-angle and COG changes.</div>
       </section>
 
-      <section class="collapsed" id="sequence-section">
+      <section class="collapsed" id="sequence-section" data-tab="measure">
         <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="sequence-section">Sequence</button></h2>
         <div class="muted">Chain keyframes into a whole figure (a giro is 4+ poses): pose the couple, add a keyframe, repeat — then scrub or play the movement.</div>
         <div class="btn-row">
@@ -389,7 +405,7 @@
         </div>
       </section>
 
-      <section id="poses-section">
+      <section id="poses-section" data-tab="pose">
         <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="poses-section">Poses</button></h2>
         <div class="row">
           <select id="preset-select"></select>
@@ -407,7 +423,7 @@
         </div>
       </section>
 
-      <section class="collapsed" id="dancers-section">
+      <section class="collapsed" id="dancers-section" data-tab="pose">
         <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="dancers-section">Dancers</button></h2>
         <div id="figure-config"></div>
       </section>

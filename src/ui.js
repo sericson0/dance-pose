@@ -66,6 +66,76 @@ export function setSectionCollapsed(section, collapsed) {
   if (!section) return;
   section.classList.toggle('collapsed', !!collapsed);
   sectionToggle(section)?.setAttribute('aria-expanded', String(!collapsed));
+  // Opening a section that belongs to another tab must bring that tab forward
+  // too, or a caller that "reveals" something (the joint panel on selection,
+  // Contact pins on a pending spot, Labels after "Label highlighted") would
+  // unfold it inside a hidden group and appear to do nothing.
+  if (!collapsed) activateTab(section.dataset.tab);
+  saveLayout();
+}
+
+// ------------------------------------------------------------- sidebar tabs
+const LAYOUT_KEY = 'tangoPoseStudio.layout.v1';
+const TABS = ['pose', 'teach', 'measure'];
+// Restoring writes the very classes that trigger a save; nothing persists until
+// the stored layout has been applied.
+let layoutReady = false;
+
+const sidebarSections = () => [...document.querySelectorAll('#sidebar > section')];
+
+function readLayout() {
+  try { return JSON.parse(localStorage.getItem(LAYOUT_KEY)) || {}; } catch { return {}; }
+}
+
+function saveLayout(patch = {}) {
+  if (!layoutReady) return;
+  const sidebar = document.getElementById('sidebar');
+  const next = {
+    ...readLayout(),
+    tab: sidebar?.dataset.activeTab,
+    collapsed: sidebarSections().filter((s) => s.classList.contains('collapsed') && s.id).map((s) => s.id),
+    ...patch,
+  };
+  try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(next)); } catch { /* full / private mode */ }
+}
+
+/**
+ * Show one workflow's sections and hide the rest. The sections never move — a
+ * section declares its group with data-tab and CSS filters on the sidebar's
+ * data-active-tab — so DOM order stays visual order and focus order with it.
+ * @param {string} name one of TABS; anything else is ignored
+ */
+export function activateTab(name) {
+  const sidebar = document.getElementById('sidebar');
+  if (!sidebar || !TABS.includes(name)) return;
+  sidebar.dataset.activeTab = name;
+  for (const b of document.querySelectorAll('#sidebar-tabs button')) {
+    b.setAttribute('aria-pressed', String(b.dataset.tab === name));
+  }
+  // The dividing hairline belongs to the last section actually SHOWN, which
+  // :last-child cannot express: the filter hides with display:none, so the
+  // markup's last child still matches it whatever tab is up.
+  const shown = sidebarSections().filter((s) => s.dataset.tab === name);
+  for (const s of sidebarSections()) s.classList.remove('last-shown');
+  shown.at(-1)?.classList.add('last-shown');
+  saveLayout();
+}
+
+// Put back the tab and the folded/unfolded set from the last visit. Sections
+// are written directly rather than through setSectionCollapsed, which would
+// activate a tab per restored section and fight the stored one.
+function restoreLayout() {
+  const saved = readLayout();
+  if (Array.isArray(saved.collapsed)) {
+    for (const s of sidebarSections()) {
+      if (!s.id) continue;
+      const collapsed = saved.collapsed.includes(s.id);
+      s.classList.toggle('collapsed', collapsed);
+      sectionToggle(s)?.setAttribute('aria-expanded', String(!collapsed));
+    }
+  }
+  activateTab(TABS.includes(saved.tab) ? saved.tab : 'pose');
+  layoutReady = true;
 }
 
 export function initUI(app) {
@@ -190,6 +260,14 @@ export function initUI(app) {
     setSectionCollapsed(section, section.classList.contains('collapsed'));
   }
   app.setSectionCollapsed = setSectionCollapsed;
+
+  // The three workflow tabs. Wired before restoreLayout so the stored tab is
+  // applied through the same path a click takes.
+  for (const btn of document.querySelectorAll('#sidebar-tabs button')) {
+    btn.addEventListener('click', () => activateTab(btn.dataset.tab));
+  }
+  restoreLayout();
+  app.activateTab = activateTab;
 
   // ---------------------------------------------------------------- embrace
   // Close embrace implies the hand hold: enabling close switches hands on,
