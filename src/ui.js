@@ -5,6 +5,9 @@ import { keyAngles, tangoStats, convexHull2D, stabilityMargin } from './analysis
 const R2D = 180 / Math.PI;
 const D2R = Math.PI / 180;
 const STORAGE_KEY = 'tangoPoseStudio.poses.v1';
+// The deck's running order. Separate from STORAGE_KEY so the name→slide map
+// keeps the shape every already-saved pose is stored in.
+const ORDER_KEY = 'tangoPoseStudio.slideOrder.v1';
 
 const AXIS_FALLBACK = { x: 'Forward / back', y: 'Twist', z: 'Side' };
 
@@ -1166,9 +1169,16 @@ export function initUI(app) {
   const FLOOR_CONTACT = FLOOR_CONTACT_FRAC;
 
   function renderFootMap(reps) {
+    // ~350 lines of per-frame work (world matrices, a Newell best-fit plane, a
+    // convex hull, a 10-anchor Catmull-Rom path, five toe pads) driven at 4 Hz
+    // by the stats tick — worth nothing at all when the canvas is off screen,
+    // which is now the DEFAULT case: the foot map lives in the Measure tab, so
+    // it is hidden whenever the user is posing. Nothing needs to re-arm it:
+    // the same 4 Hz tick repaints it within ~250 ms of becoming visible.
+    if (!fmCanvas.clientWidth || !fmCanvas.clientHeight) return;
     const dpr = window.devicePixelRatio || 1;
-    const cssW = fmCanvas.clientWidth || 296;
-    const cssH = fmCanvas.clientHeight || 175;
+    const cssW = fmCanvas.clientWidth;
+    const cssH = fmCanvas.clientHeight;
     if (fmCanvas.width !== Math.round(cssW * dpr)) {
       fmCanvas.width = Math.round(cssW * dpr);
       fmCanvas.height = Math.round(cssH * dpr);
@@ -1805,11 +1815,37 @@ export function initUI(app) {
     }
     renderLibrary();
   }
+  // The deck's running order, kept beside the name→slide map rather than in
+  // it: the map is the shape every previously saved pose is already stored in,
+  // and an "order" key inside it would collide with a slide actually called
+  // "order". Names missing from the list (saved before this, or hand-edited in)
+  // fall in alphabetically at the end, so no slide can become unreachable.
+  function loadOrder(lib) {
+    let saved = [];
+    try { saved = JSON.parse(localStorage.getItem(ORDER_KEY)) || []; } catch { saved = []; }
+    const known = new Set(Object.keys(lib));
+    const ordered = saved.filter((n) => known.has(n));
+    const rest = [...known].filter((n) => !ordered.includes(n)).sort();
+    return [...ordered, ...rest];
+  }
+  function saveOrder(names) {
+    try { localStorage.setItem(ORDER_KEY, JSON.stringify(names)); } catch { /* full / private mode */ }
+  }
+  // The deck, in order, for Present mode's ← / → .
+  app.slideNames = () => loadOrder(loadLibrary());
+  app.showSlide = (name) => {
+    const lib = loadLibrary();
+    if (!lib[name]) return false;
+    app.pushHistory();
+    app.applyCoupleState(lib[name]);
+    return true;
+  };
+
   function renderLibrary() {
     const lib = loadLibrary();
-    const names = Object.keys(lib).sort();
-    poseList.innerHTML = names.length ? '' : '<span class="muted">No saved poses yet.</span>';
-    for (const name of names) {
+    const names = loadOrder(lib);
+    poseList.innerHTML = names.length ? '' : '<span class="muted">No slides saved yet.</span>';
+    names.forEach((name, i) => {
       const row = document.createElement('div');
       row.className = 'pose-item';
       // textContent, never innerHTML: the name is free text from the Save field
@@ -1818,48 +1854,82 @@ export function initUI(app) {
       const nameEl = document.createElement('span');
       nameEl.className = 'name';
       nameEl.textContent = name;
-      const load = document.createElement('button');
-      load.textContent = 'Load';
-      load.addEventListener('click', () => {
-        app.pushHistory();
-        app.applyCoupleState(lib[name]);
-      });
+      // A slide restores the view too; a file saved before slides existed
+      // carries only the pose, and applyCoupleState leaves the view alone.
+      const show = document.createElement('button');
+      show.textContent = 'Show';
+      show.title = lib[name]?.view
+        ? 'Put the couple, the camera, the labels and the highlights back as this slide has them'
+        : 'Pose only — this entry was saved before slides carried the view, so the layer, camera and labels stay as they are';
+      show.addEventListener('click', () => app.showSlide(name));
+
+      const move = (delta) => {
+        const order = loadOrder(loadLibrary());
+        const at = order.indexOf(name);
+        const to = at + delta;
+        if (at < 0 || to < 0 || to >= order.length) return;
+        order.splice(to, 0, ...order.splice(at, 1));
+        saveOrder(order);
+        renderLibrary();
+      };
+      const up = document.createElement('button');
+      up.append(Object.assign(document.createElement('span'), { textContent: '↑', ariaHidden: 'true' }));
+      up.setAttribute('aria-label', `Move “${name}” earlier in the deck`);
+      up.title = 'Show this slide earlier';
+      up.disabled = i === 0;
+      up.addEventListener('click', () => move(-1));
+      const down = document.createElement('button');
+      down.append(Object.assign(document.createElement('span'), { textContent: '↓', ariaHidden: 'true' }));
+      down.setAttribute('aria-label', `Move “${name}” later in the deck`);
+      down.title = 'Show this slide later';
+      down.disabled = i === names.length - 1;
+      down.addEventListener('click', () => move(1));
+
       const del = document.createElement('button');
-      del.textContent = '✕';
-      del.title = 'Delete this saved pose';
+      del.append(Object.assign(document.createElement('span'), { textContent: '✕', ariaHidden: 'true' }));
+      del.setAttribute('aria-label', `Delete the slide “${name}”`);
+      del.title = 'Delete this slide';
       del.addEventListener('click', () => {
         const l = loadLibrary();
         const removed = l[name];
+        const order = loadOrder(l);
         delete l[name];
+        saveOrder(order.filter((n) => n !== name));
         saveLibrary(l);
-        // A saved pose is not pose STATE, so Ctrl+Z cannot bring it back — it
+        // A saved slide is not pose STATE, so Ctrl+Z cannot bring it back — it
         // would restore the couple and leave the library entry gone. Offer the
         // recovery where the loss happened instead of a dialog beforehand.
-        app.status(`Deleted the saved pose “${name}”.`, 'info', {
+        app.status(`Deleted the slide “${name}”.`, 'info', {
           label: 'Undo',
           run: () => {
             const lib2 = loadLibrary();
             lib2[name] = removed;
+            saveOrder(order);
             saveLibrary(lib2);
           },
         });
       });
-      row.append(nameEl, load, del);
+      row.append(nameEl, show, up, down, del);
       poseList.appendChild(row);
-    }
+    });
   }
 
   $('pose-save').addEventListener('click', () => {
-    const name = $('pose-name').value.trim() || `Pose ${new Date().toLocaleString()}`;
+    const name = $('pose-name').value.trim() || `Slide ${new Date().toLocaleString()}`;
     const lib = loadLibrary();
-    lib[name] = app.getCoupleState(name);
+    const order = loadOrder(lib);
+    const isNew = !lib[name];
+    lib[name] = app.getCoupleState(name, { view: true });
+    // A new slide goes on the end of the deck; re-saving one keeps its place.
+    if (isNew) saveOrder([...order, name]);
     saveLibrary(lib);
     $('pose-name').value = '';
+    app.status(`Saved the slide “${name}”.`, 'info');
   });
 
   $('pose-export').addEventListener('click', () => {
-    const name = $('pose-name').value.trim() || 'tango-pose';
-    const blob = new Blob([JSON.stringify(app.getCoupleState(name), null, 2)], { type: 'application/json' });
+    const name = $('pose-name').value.trim() || 'tango-slide';
+    const blob = new Blob([JSON.stringify(app.getCoupleState(name, { view: true }), null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = `${name.replace(/[^\w\- ]/g, '')}.json`;
@@ -1877,10 +1947,20 @@ export function initUI(app) {
       app.pushHistory();
       app.applyCoupleState(state);
       const lib = loadLibrary();
-      lib[state.name || file.name.replace(/\.json$/i, '')] = state;
+      const name = state.name || file.name.replace(/\.json$/i, '');
+      const order = loadOrder(lib);
+      const isNew = !lib[name];
+      lib[name] = state;
+      if (isNew) saveOrder([...order, name]);
       saveLibrary(lib);
+      app.status(
+        state.view
+          ? `Loaded the slide “${name}”.`
+          : `Loaded “${name}” — a pose-only file, so the view is unchanged.`,
+        'info',
+      );
     } catch {
-      app.status('Could not read that file as a pose.', 'error');
+      app.status('Could not read that file as a slide or pose.', 'error');
     }
     e.target.value = '';
   });
@@ -1921,7 +2001,94 @@ export function initUI(app) {
 
   renderJointPanel();
 
+  // ------------------------------------------------------------- slide view
+  // Everything a SLIDE carries beyond the pose: the layer and backdrop, the
+  // camera, who is on screen, the callouts, the lit parts and muscles.
+  //
+  // Deliberately NOT part of getCoupleState's default shape. That shape feeds
+  // pushHistory, the COG trail and every sequence keyframe — an undo of a
+  // joint nudge that also moved the camera would be a bug, and the trail
+  // rebuilds state ~289 times per edit, where serialising a label set each
+  // pass would be pure waste. main.js asks for this block only for a slide.
+  const getViewState = () => ({
+    layer: layerMode(),
+    backdrop: $('backdrop').value,
+    frame: $('frame-mode').value,
+    shown: app.shown,
+    viz: {
+      cog: $('show-cog').checked,
+      support: $('show-support').checked,
+      couple: $('show-couple-cog').checked,
+      dissoc: $('show-dissoc').checked,
+    },
+    camera: { pos: app.camera.position.toArray(), target: app.orbit.target.toArray() },
+    labels: app.labels.toJSON(),
+    labelsVisible: $('labels-visible').checked,
+    highlight: { parts: [...highlighted], colors: [...(app.highlightColors ?? [])] },
+    muscles: { hidden: [...hiddenMuscles], lit: [...litMuscles] },
+  });
+
+  // Put a captured view back. A state with no `view` block is a pose-only file
+  // — every slide saved before this existed, plus A/B snapshots and keyframes —
+  // so it leaves the view exactly as it is rather than resetting it.
+  const applyViewState = (v) => {
+    if (!v) return;
+    // Selects go back through a dispatched `change`, so every listener runs
+    // (the layer note, the muscle note, the studio) instead of just one.
+    if (v.layer) chooseLayer(v.layer);
+    for (const [id, val] of [['backdrop', v.backdrop], ['frame-mode', v.frame]]) {
+      if (!val) continue;
+      $(id).value = val;
+      $(id).dispatchEvent(new Event('change'));
+    }
+    if (v.shown) {
+      app.setVisibleFigures(v.shown);
+      setActive([...document.querySelectorAll('#show-buttons button')], (b) => b.dataset.show === v.shown);
+    }
+    if (v.viz) {
+      $('show-cog').checked = !!v.viz.cog;
+      $('show-support').checked = !!v.viz.support;
+      $('show-couple-cog').checked = !!v.viz.couple;
+      $('show-dissoc').checked = !!v.viz.dissoc;
+      syncViz();
+    }
+    if (Array.isArray(v.labels)) {
+      app.labels.fromJSON(v.labels);
+      app.labels.onChange?.();
+      onLabelsChanged();
+    }
+    if (typeof v.labelsVisible === 'boolean') {
+      $('labels-visible').checked = v.labelsVisible;
+      app.setLabelsVisible(v.labelsVisible);
+    }
+    if (v.highlight) {
+      highlighted.clear();
+      for (const id of v.highlight.parts ?? []) highlighted.add(id);
+      app.setHighlight(highlighted, new Map(v.highlight.colors ?? []));
+      highlightClear.disabled = highlighted.size === 0;
+      for (const r of chipRows) paintChip(r.chip, r.swatch, r.part);
+    }
+    if (v.muscles) {
+      hiddenMuscles.clear();
+      for (const m of v.muscles.hidden ?? []) hiddenMuscles.add(m);
+      litMuscles.clear();
+      for (const m of v.muscles.lit ?? []) litMuscles.add(m);
+      app.setMuscleHidden(hiddenMuscles);
+      app.setMuscleLit(litMuscles);
+      muscleClearHl.disabled = litMuscles.size === 0;
+      renderMuscleList();
+    }
+    if (v.camera?.pos && v.camera?.target) {
+      app.camera.position.fromArray(v.camera.pos);
+      app.orbit.target.fromArray(v.camera.target);
+      app.orbit.update();
+    }
+    app.requestRender();
+  };
+
   return {
+    getViewState,
+    applyViewState,
     onSelectionChanged() {
       renderJointPanel();
       syncJointPicker();

@@ -174,6 +174,9 @@ if (!photo.ok || photo.len < 20000) problems.push(`photo data URL wrong (ok=${ph
 console.log(`--- Photo: ${(photo.len / 1024).toFixed(0)} kB data URL`);
 
 // ---- 5. Foot map canvas draws pixels; note text reports the COG.
+// It lives in the sidebar's Measure tab and only draws while on screen, so
+// bring that tab forward first and let a stats tick repaint it.
+await page.evaluate(() => window.__app.activateTab('measure'));
 await sleep(600); // let a stats tick redraw it
 const footmap = await page.evaluate(() => {
   const canvas = document.getElementById('footmap-canvas');

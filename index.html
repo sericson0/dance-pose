@@ -406,19 +406,20 @@
       </section>
 
       <section id="poses-section" data-tab="pose">
-        <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="poses-section">Poses</button></h2>
+        <h2><button type="button" class="collapse-toggle" aria-expanded="true" aria-controls="poses-section">Slides</button></h2>
+        <div class="muted">A slide is a pose <i>plus the way it is shown</i> — layer, backdrop, camera, labels and highlights. Save the ones your lesson needs, put them in order with ↑ ↓, and <b>Present</b> steps through them.</div>
         <div class="row">
-          <select id="preset-select"></select>
-          <button id="preset-apply">Apply</button>
+          <select id="preset-select" aria-label="Starting pose" title="A ready-made tango pose to start from"></select>
+          <button id="preset-apply" title="Put both dancers into the chosen starting pose">Apply</button>
         </div>
         <div class="row">
-          <input type="text" id="pose-name" placeholder="Pose name…" />
-          <button id="pose-save">Save</button>
+          <input type="text" id="pose-name" placeholder="Slide name…" />
+          <button id="pose-save" title="Save the current pose and the way it is shown as a slide">Save slide</button>
         </div>
         <div id="pose-list"></div>
         <div class="btn-row">
-          <button id="pose-export">Export file</button>
-          <button id="pose-import">Import file</button>
+          <button id="pose-export" title="Download the current slide as a JSON file">Export file</button>
+          <button id="pose-import" title="Load a slide or pose JSON file. A file saved before slides existed carries only the pose, and leaves the view alone.">Import file</button>
           <input type="file" id="pose-file" accept=".json" hidden />
         </div>
       </section>

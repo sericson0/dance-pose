@@ -191,10 +191,13 @@ await sleep(200);
 await page.screenshot({ path: `${outDir}/keys-hips-crouch.png` });
 
 // ---- 6. Foot map: still paints with the new silhouette; grab it for a look.
+// The foot map lives in the sidebar's Measure tab and only draws while it is
+// actually on screen, so bring that tab forward before measuring it.
 const footmap = await page.evaluate(() => {
   const app = window.__app;
   app.applyPreset(0);
   app.setVisibleFigures('both');
+  app.activateTab('measure');
   return new Promise((resolve) => setTimeout(() => {
     const canvas = document.getElementById('footmap-canvas');
     const ctx = canvas.getContext('2d');

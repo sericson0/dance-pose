@@ -2312,8 +2312,15 @@ const app = {
     if (this.ui) this.ui.onPoseChanged();
   },
 
-  getCoupleState(name = '') {
-    return {
+  // The couple's pose. `view: true` also captures how the scene is SHOWN
+  // (layer, backdrop, camera, labels, highlights — see ui.getViewState), which
+  // is what turns a saved pose into a slide.
+  //
+  // It is opt-in because this same shape is every undo snapshot, every
+  // COG-trail sample and every sequence keyframe: an undo that also moved the
+  // camera would be a bug, and the trail rebuilds state ~289 times per edit.
+  getCoupleState(name = '', { view = false } = {}) {
+    const state = {
       app: 'tangle',
       version: 1,
       name,
@@ -2323,6 +2330,11 @@ const app = {
       },
       figures: this.figures.map((f) => f.getPose()),
     };
+    if (view) {
+      const v = this.ui?.getViewState?.();
+      if (v) state.view = v;
+    }
+    return state;
   },
 
   applyCoupleState(state) {
@@ -2336,6 +2348,10 @@ const app = {
       state.meta.masses.forEach((m, i) => { this.figures[i].mass = m; });
     }
     state.figures.forEach((pose, i) => this.figures[i].setPose(pose));
+    // Only a slide carries a view. A pose-only state — every file saved before
+    // slides existed, plus A/B snapshots, keyframes and undo entries — leaves
+    // the layer, camera and labels exactly where the user has them.
+    if (state.view) this.ui?.applyViewState?.(state.view);
     if (this.ui) this.ui.onPoseChanged();
   },
 
