@@ -21,7 +21,18 @@ import { LIMB_BASES } from './skeletonMesh.js';
 
 const SLIDE_W = 1920;
 const SLIDE_H = 1080;
-const SIDEBAR_W = 320; // #sidebar's CSS width — the slide frame sits beside it
+// The slide frame sits beside the sidebar, so it has to know how wide the
+// sidebar currently is. MEASURED, not a constant: Present mode hides the
+// sidebar entirely, and a hardcoded 320 would letterbox the frame against a
+// panel that is not on screen. A hidden element reports 0, which is exactly
+// the answer wanted. Falls back to the --sidebar-w token if the element is
+// missing (the clip stage builds before the DOM settles in some paths).
+function sidebarWidth() {
+  const el = document.getElementById('sidebar');
+  if (el) return el.offsetWidth;
+  const token = getComputedStyle(document.documentElement).getPropertyValue('--sidebar-w');
+  return parseFloat(token) || 320;
+}
 
 const DARK = {
   text: '#f4f6fb', sub: '#c3cad8', pill: 'rgba(18,21,28,0.84)', edge: 'rgba(255,255,255,0.16)',
@@ -108,7 +119,7 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
   studio.layoutCanvas = () => {
     if (studio.frame === 'slide') {
       const top = document.getElementById('topbar')?.offsetHeight ?? 0;
-      const availW = Math.max(200, window.innerWidth - SIDEBAR_W);
+      const availW = Math.max(200, window.innerWidth - sidebarWidth());
       const availH = Math.max(120, window.innerHeight - top);
       const cssW = Math.floor(Math.min(availW, availH * SLIDE_W / SLIDE_H));
       const cssH = Math.floor(cssW * SLIDE_H / SLIDE_W);
@@ -147,7 +158,7 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
     const top = studio.clip ? drawClipOverlay(ctx, w, h, theme) : 0;
     // In the window frame the sidebar covers the canvas's right edge; keep the
     // callouts out from under it (the slide frame already sits beside it).
-    const right = studio.frame === 'window' ? SIDEBAR_W * (w / (gl.clientWidth || w)) : 0;
+    const right = studio.frame === 'window' ? sidebarWidth() * (w / (gl.clientWidth || w)) : 0;
     studio.lastLayout = labels.draw(ctx, camera, w, h, theme, { top, right });
     if (studio.hover && ctx === hudCtx) {
       const k = w / (gl.clientWidth || w); // CSS px → canvas px

@@ -139,6 +139,21 @@ body {
    ui.js marks it on every switch. */
 #sidebar section.last-shown { border-bottom: none; }
 
+/* --------------------------------------------------------------- presenting */
+/* The teaching view: nothing on screen but the dancers and their callouts.
+   The sidebar is display:none rather than shifted off-screen, so it measures 0
+   and studio.js's sidebarWidth() lets the 16:9 frame use the whole window. */
+#app.presenting #sidebar,
+#app.presenting #topbar,
+#app.presenting #hint { display: none; }
+/* The status line stays: it is how a slide change announces itself
+   ("Slide 2 of 7 — Cruzada") with the sidebar gone. Centred at the foot of
+   the screen rather than tucked in the corner, and out of the way of clicks. */
+#app.presenting #status-line {
+  left: 50%; right: auto; bottom: 22px; transform: translateX(-50%);
+  max-width: min(90vw, 900px); text-align: center; font-size: 13px;
+}
+
 /* ------------------------------------------------------------ sidebar tabs */
 /* Sticky so the workflow switch is reachable without scrolling back up; the
    negative top cancels #sidebar's own 12px padding so it sits flush. */

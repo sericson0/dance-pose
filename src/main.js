@@ -1557,6 +1557,76 @@ const app = {
     return null;
   },
 
+  // ---------------------------------------------------------------- present
+  // The teaching view: the dancers fill the screen, the chrome goes away, and
+  // the keys a presenter remote actually sends drive the deck.
+  presenting: false,
+  slideAt: -1,
+
+  enterPresent() {
+    if (this.presenting) return;
+    // Everything the exit has to put back. The frame is forced to 16:9 because
+    // that is the shape a projector and every exported still already use — a
+    // slide composed in "fill window" would reframe itself the moment it is
+    // recorded.
+    this.presentSaved = { frame: studio.frame, mode: this.mode };
+    this.presenting = true;
+    container.parentElement.classList.add('presenting');
+    this.setMode('rotate'); // no gizmos, no half-authored shapes on screen
+    this.deselect();
+    if (this.ui?.setFrameMode) this.ui.setFrameMode('slide'); else this.setFrame('slide');
+    document.documentElement.requestFullscreen?.().catch(() => {
+      // Fullscreen needs a user gesture and can be refused by policy; the
+      // chrome is hidden either way, so presenting still works in-window.
+    });
+    // The sidebar is gone, so the frame has a different width to fill.
+    window.dispatchEvent(new Event('resize'));
+    const n = this.slideNames?.().length ?? 0;
+    this.status(
+      n ? `Presenting — ← → change slide, Space plays, Esc leaves. ${n} slide${n === 1 ? '' : 's'}.`
+        : 'Presenting — no slides saved yet. Esc leaves; save slides in the Pose tab.',
+      'info',
+    );
+    if (this.ui) this.ui.onPresentChanged?.();
+  },
+
+  exitPresent() {
+    if (!this.presenting) return;
+    this.presenting = false;
+    container.parentElement.classList.remove('presenting');
+    const frame = this.presentSaved?.frame ?? 'window';
+    if (this.ui?.setFrameMode) this.ui.setFrameMode(frame); else this.setFrame(frame);
+    if (this.presentSaved?.mode) this.setMode(this.presentSaved.mode);
+    this.presentSaved = null;
+    if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
+    window.dispatchEvent(new Event('resize'));
+    if (this.ui) this.ui.onPresentChanged?.();
+  },
+
+  togglePresent() {
+    if (this.presenting) this.exitPresent(); else this.enterPresent();
+  },
+
+  // Step the deck. `delta` is +1/-1; the ends are walls, not a wrap — a
+  // presenter pressing → once more at the last slide should stay put rather
+  // than silently loop back to the beginning mid-sentence.
+  gotoSlide(delta) {
+    const names = this.slideNames?.() ?? [];
+    if (!names.length) {
+      this.status('No slides saved yet — save one in the Pose tab.', 'info');
+      return false;
+    }
+    const next = Math.min(names.length - 1, Math.max(0, (this.slideAt < 0 ? -1 : this.slideAt) + delta));
+    if (next === this.slideAt) {
+      this.status(delta > 0 ? 'Last slide.' : 'First slide.', 'info');
+      return false;
+    }
+    this.slideAt = next;
+    this.showSlide(names[next]);
+    this.status(`Slide ${next + 1} of ${names.length} — ${names[next]}`, 'info');
+    return true;
+  },
+
   // ------------------------------------------------------------ floor drawings
   // Annotations are scene content, not pose state: they live outside the pose
   // undo stack and are managed by the Draw toolbar's ⌫ Last / Clear.
@@ -3453,7 +3523,48 @@ app.setViz = (flags) => {
 app.setVisibleFiguresRefresh = applyVizVisibility;
 app.setViz(vizFlags);
 
+// Present mode owns the keyboard outright, in the CAPTURE phase: the arrow and
+// Page keys are already bound to nudging a joint or a figure, and a presenter
+// stepping through slides must not pose a dancer by accident. Everything here
+// is consumed, so no bubble-phase handler sees it.
+//
+// The key set is what a presenter remote actually sends: most send Page Down /
+// Page Up for next / previous, some send the arrows, so both are bound.
+window.addEventListener('keydown', (e) => {
+  if (!app.presenting) return;
+  const k = e.key;
+  let handled = true;
+  if (k === 'Escape') app.exitPresent();
+  else if (k === 'ArrowRight' || k === 'ArrowDown' || k === 'PageDown') app.gotoSlide(1);
+  else if (k === 'ArrowLeft' || k === 'ArrowUp' || k === 'PageUp') app.gotoSlide(-1);
+  else if (k === 'Home') { app.slideAt = -1; app.gotoSlide(1); }
+  else if (k === 'f' || k === 'F') {
+    if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
+    else document.documentElement.requestFullscreen?.().catch(() => {});
+  } else if (k === ' ' || e.code === 'Space') {
+    // Play whatever movement this slide is about: a keyframe sequence first,
+    // then an A→B comparison, and failing both just advance the deck.
+    if (app.seqStates.length >= 2) app.playSeq();
+    else if (app.interpStates) app.playInterp();
+    else app.gotoSlide(1);
+  } else handled = false;
+  if (handled) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+}, true);
+
+// Leaving fullscreen by any route the page does not see — the browser eats Esc
+// to exit fullscreen, and F11 never reaches us at all — must also leave Present
+// mode, or the user is stranded with the sidebar and toolbar hidden and no
+// visible way back. Nothing fires if the fullscreen request was refused (no
+// user gesture, or policy), so an in-window presentation is unaffected.
+document.addEventListener('fullscreenchange', () => {
+  if (app.presenting && !document.fullscreenElement) app.exitPresent();
+});
+
 // Esc abandons whatever is half-finished — see app.cancelPending for the order.
+// Never reached while presenting: the capture handler above consumes Escape.
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') app.cancelPending();
 });

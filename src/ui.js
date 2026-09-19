@@ -198,6 +198,15 @@ export function initUI(app) {
   }
   setHint(app.mode);
 
+  // Present mode. The button is the only way in; Esc, F11 and the capture-phase
+  // key handler in main.js are the ways out.
+  const presentBtn = $('present-btn');
+  const syncPresent = () => {
+    presentBtn.textContent = app.presenting ? '✕ End' : '▶ Present';
+  };
+  presentBtn.addEventListener('click', () => app.togglePresent());
+  syncPresent();
+
   const movePivot = $('move-pivot');
   movePivot.addEventListener('change', () => app.setMovePivot(movePivot.value));
 
@@ -2089,6 +2098,16 @@ export function initUI(app) {
   return {
     getViewState,
     applyViewState,
+    onPresentChanged: syncPresent,
+    // Drive the frame through its own control so the dropdown keeps telling
+    // the truth — Present mode forces 16:9, and a select left reading "Fill
+    // window" would lie about what a photo or video will contain.
+    setFrameMode(frame) {
+      const el = $('frame-mode');
+      if (!el || el.value === frame) return;
+      el.value = frame;
+      el.dispatchEvent(new Event('change'));
+    },
     onSelectionChanged() {
       renderJointPanel();
       syncJointPicker();
