@@ -241,11 +241,28 @@ const TRUNK_SHEETS = new Set([
 // inter-node line is exactly the case an axial split cannot express. Note the
 // diagnosis did NOT come from stretch or drift, both of which read clean here
 // (subscapularis x0.915..1.048): see dev-probe-muscle-anchor.mjs.
+//
+// SERRATUS ANTERIOR AND PECTORALIS MINOR are the cuff's case seen from the other
+// bone. Both run from the blade to the RIBS, and the axial split along
+// scapula→chest handed the ribs' share to the blade: of the serratus tissue
+// actually lying on a rib, 74-79% was weighted to the scapula (615 of 890
+// vertices wholly the blade's, 6 wholly the cage's), pectoralis minor 42%. So
+// the digitations rode the blade across the ribs they arise from — 88.6 mm in
+// sh_abd, 110.5 in sc_elev, 72.5 in sc_pro (pectoralis minor 37-47) — and in a
+// trunk twist they stayed rigid on the chest frame while those ribs turned with
+// their own vertebrae (13.9 mm mean). By contact the rib tissue reads 15%
+// mis-committed and holds to 4-7 mm mean (pectoralis minor 0.6). What it costs:
+// serratus's back third is SANDWICHED between the blade and the cage and
+// touches both, so contact shares it and it now leaves the blade by ~8 mm mean
+// in protraction where it used to leave the ribs by 38. That tissue really does
+// glide on both, and dev-verify-trunk-muscles.mjs gates its rib row on the mean
+// for that reason.
 const CONTACT_SHEETS = new Set([
   'Gluteus maximus muscle.r',
   'Supraspinatus muscle.r', 'Infraspinatus muscle.r', 'Subscapularis muscle.r',
   'Teres major muscle.r', 'Teres minor muscle.r',
   'Latissimus dorsi.r',
+  'Serratus anterior muscle.r', 'Pectoralis minor muscle.r',
 ].map(norm));
 
 // A contact sheet whose ORIGIN spreads over more bones than the one node it
@@ -460,12 +477,16 @@ export function classifyMuscle(rawName) {
   // Trunk sheets get the full-length spread skin and highlight with the Torso
   // part even though they ride the pelvis node.
   if (TRUNK_SHEETS.has(n)) return { node, insert, spread: true, ride: 'spine' };
-  if (GIRDLE_SHEETS.has(n)) return { node, insert, ride: 'spine' };
+  // `ride` (which highlight group) and `contact` (how it is weighted) are
+  // independent: serratus anterior and pectoralis minor are girdle sheets AND
+  // contact sheets.
+  const out = insert ? { node, insert } : { node };
+  if (GIRDLE_SHEETS.has(n)) out.ride = 'spine';
   if (insert && CONTACT_SHEETS.has(n)) {
     const opts = CONTACT_OPTS.get(n);
-    return { node, insert, contact: true, contactOrigin: opts?.origin, contactWindow: opts?.window };
+    Object.assign(out, { contact: true, contactOrigin: opts?.origin, contactWindow: opts?.window });
   }
-  return insert ? { node, insert } : { node };
+  return out;
 }
 
 // Human-readable muscle label from an atlas name. GLTFLoader sanitises the

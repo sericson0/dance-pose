@@ -51,6 +51,7 @@
         <button data-tool="text" title="One click on the floor, then type the label">Text</button>
         <label class="tool-field" title="Chalk colour. With a drawing selected this recolours it; otherwise it sets the colour of the next one."><input type="color" id="draw-color" value="#ffd27f" /></label>
         <label class="tool-field" title="Stroke width (text size follows it). With a drawing selected this resizes it; otherwise it sets the width of the next one."><span>Size</span><input type="range" id="draw-width" min="0.006" max="0.06" step="0.002" value="0.02" /></label>
+        <button id="draw-hide" title="Hide the selected drawing — hiding is how you build the set a sequence keyframe is then tagged with. With nothing selected this brings the hidden ones back.">◐ Hide</button>
         <button id="draw-delete" title="Remove the selected drawing (Del)">✕ Selected</button>
         <button id="draw-undo" title="Remove the most recent drawing">⌫ Last</button>
         <button id="draw-clear" title="Remove all drawings">Clear</button>
@@ -332,7 +333,10 @@
       <section class="collapsed" id="muscle-section" data-tab="teach">
         <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="muscle-section">Muscles</button></h2>
         <div class="muted" id="muscle-layer-note" hidden>
-          Turn on the <button id="muscle-enable-layer" class="linkish">Muscles layer</button> to see these.
+          The clothed body hides these. Turn on the <button id="muscle-enable-layer" class="linkish">Muscles layer</button> for all of them — or the Skeleton view, where the highlighted ones ride over the bones.
+        </div>
+        <div class="muted" id="muscle-kf-note" hidden>
+          A sequence keyframe is showing <b>its own</b> highlighting — these chips say what is lit on screen. Your own set is kept; change anything here to take it back.
         </div>
         <div class="btn-row">
           <button id="muscle-show-all">Show all</button>

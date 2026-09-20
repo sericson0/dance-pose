@@ -364,12 +364,37 @@ table.cmp th { color: var(--muted); font-weight: 600; }
 .pose-item { display: flex; align-items: center; gap: 6px; padding: 3px 0; }
 .pose-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pose-item button { padding: 2px 8px; font-size: 11px; }
-/* Per-keyframe duration: narrow, because it holds "2.4" and the row already
-   carries five buttons. The unit sits outside the field so the number itself
-   stays selectable/typable. */
-.seq-dur { width: 46px; padding: 2px 4px; font-size: 11px; }
-.seq-dur-unit { color: var(--muted); font-size: 11px; margin-left: -2px; }
+/* Per-keyframe duration: narrow, because the row now also carries a label. It
+   is 52px rather than the old 46 because the "s" that used to sit beside it is
+   gone (the unit is in the field's tooltip) and "2.4" was being clipped to
+   "2." — a duration you cannot read is not a duration. */
+.seq-dur { width: 52px; padding: 2px 4px; font-size: 11px; }
 .seq-total { padding-top: 4px; }
+
+/* Keyframe rows. The number is kept (it maps the row onto the scrubber) and
+   doubles as the grip, so it wears the grab cursor; the label takes whatever
+   width the controls leave. The row is unselectable because a drag over text
+   is a SELECTION to the browser — it painted the rows the cursor passed in
+   selection blue, which is both ugly and unreadable over the drop indicator.
+   The label opts back in: a field you cannot select text in is a poor field. */
+.seq-item { cursor: grab; user-select: none; }
+.seq-index { flex: none; width: 12px; text-align: right; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.seq-name { flex: 1; min-width: 34px; padding: 2px 4px; font-size: 11px; cursor: text; user-select: text; }
+.seq-item button, .seq-item input[type="number"] { cursor: auto; }
+/* A keyframe is two lines: the controls row, and its extras (the on-screen
+   caption and the muscle-highlight tag). The extras line indents past the
+   index column so the two read as one block, and it is NOT grabbable — the
+   drag is armed on the row only. */
+.seq-block + .seq-block { margin-top: 2px; }
+.seq-extras { display: flex; align-items: center; gap: 6px; padding: 0 0 4px 18px; }
+.seq-caption { flex: 1; min-width: 40px; padding: 2px 4px; font-size: 11px; }
+.seq-kf-btn { flex: none; padding: 2px 8px; font-size: 11px; }
+/* The row being carried, and where it would land. The indicator is a
+   box-shadow rather than a border so showing it cannot re-flow the list the
+   user is aiming at — the rows would shift out from under the cursor. */
+.pose-item.seq-dragging { opacity: 0.45; cursor: grabbing; }
+.pose-item.drop-before { box-shadow: 0 -3px 0 -1px var(--accent); }
+.pose-item.drop-after { box-shadow: 0 3px 0 -1px var(--accent); }
 
 /* Labels list */
 #label-detail button { padding: 4px 10px; font-size: 11.5px; }

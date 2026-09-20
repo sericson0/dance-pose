@@ -3,20 +3,28 @@
 //  - sequence: add keyframes through the UI, scrub the slider (pose actually
 //    interpolates), reorder/update/delete rows, play to the end, COG trail
 //    covers every segment, export payload round-trips, localStorage persists
+//  - rows: the per-keyframe LABEL (set through app.seqSetName and through the
+//    row's own input, shown in the row, surviving ⟳ and a page reload), and
+//    the DRAG reorder — a REAL pointer drag of row 3 onto row 1 must produce
+//    [3, 1, 2], the lift-and-drop, not the [2, 3, 1] a chain of swaps gives —
+//    plus its keyboard fallback, Alt+↑/↓ on the focused row
 //  - record: MediaRecorder captures the sequence playback into a non-trivial
 //    .webm blob and the ⏺ buttons lock while it runs
 //  - dissociation: the checkbox shows per-dancer hip/shoulder axes + wedge,
 //    and the wedge sweep matches the tangoStats dissociation angle
 //
 // Usage: node scripts/dev-verify-sequence.mjs <outDir>   (dev server running)
+// Honours DEV_URL and BROWSER_PATH.
 import puppeteer from 'puppeteer-core';
 import fs from 'node:fs';
 
 const outDir = process.argv[2] || 'shots-sequence';
+const DEV_URL = process.env.DEV_URL || 'http://localhost:5173/';
 fs.mkdirSync(outDir, { recursive: true });
 
 const browser = await puppeteer.launch({
-  executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+  executablePath: process.env.BROWSER_PATH
+    || 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
   headless: 'new',
   defaultViewport: { width: 1280, height: 900 },
 });
@@ -24,7 +32,7 @@ const page = await browser.newPage();
 const errors = [];
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 page.on('pageerror', (e) => errors.push(e.message));
-await page.goto('http://localhost:5173/', { waitUntil: 'networkidle0', timeout: 60000 });
+await page.goto(DEV_URL, { waitUntil: 'networkidle0', timeout: 60000 });
 await page.waitForFunction(() => window.__app, { timeout: 30000 });
 await new Promise((r) => setTimeout(r, 1200));
 
@@ -78,28 +86,35 @@ if (seq.trailPts !== 65) problems.push(`trail has ${seq.trailPts} samples, want 
 if (seq.stored !== 3) problems.push(`localStorage holds ${seq.stored} keyframes, want 3`);
 await page.screenshot({ path: `${outDir}/sequence-panel.png` });
 
-// ---- reorder / update / delete through the row buttons ----
+// ---- reorder / update / delete through the row controls ----
+// The rows carry no ↑/↓ buttons any more (the order is a drag, with Alt+↑/↓
+// as the keyboard route), so each row's buttons are [Show, ⟳, ◻, ✕] — the ◻
+// tags which floor drawings the keyframe shows (dev-verify-draw-persist.mjs
+// owns what it does; here it only has to be in the row, in that place).
 const edit = await page.evaluate(() => {
   const app = window.__app;
   const rowBtns = (i) => document.querySelectorAll('#seq-list .pose-item')[i].querySelectorAll('button');
   const posOf = (s) => s.figures[0].position;
+  const btnLabels = [...rowBtns(0)].map((b) => b.textContent);
   const p0 = posOf(app.seqStates[0]);
-  rowBtns(0)[3].click(); // ↓: move keyframe 1 later
+  app.seqMoveTo(0, 1); // the lift-and-drop the drag and the keys both call
   const movedDown = posOf(app.seqStates[1]);
-  rowBtns(2)[4].click(); // ✕: delete the last keyframe
+  rowBtns(2)[3].click(); // ✕: delete the last keyframe
   const afterDelete = app.seqStates.length;
   app.applyPreset(3); // apilado
   rowBtns(0)[1].click(); // ⟳: overwrite keyframe 1 with the current pose
   const updated = posOf(app.seqStates[0]);
   const apilado = app.leader.getPose().position;
   return {
+    btnLabels,
     swapOK: movedDown[0] === p0[0] && movedDown[2] === p0[2],
     afterDelete,
     updateOK: Math.hypot(updated[0] - apilado[0], updated[2] - apilado[2]) < 1e-9,
   };
 });
 console.log('--- sequence edit:', JSON.stringify(edit));
-if (!edit.swapOK) problems.push('↓ did not swap keyframes');
+if (edit.btnLabels.join('') !== 'Show⟳◻✕') problems.push(`row buttons are ${JSON.stringify(edit.btnLabels)}, want [Show, ⟳, ◻, ✕]`);
+if (!edit.swapOK) problems.push('seqMoveTo did not move a keyframe one place later');
 if (edit.afterDelete !== 2) problems.push(`✕ left ${edit.afterDelete} keyframes, want 2`);
 if (!edit.updateOK) problems.push('⟳ did not overwrite the keyframe with the current pose');
 
@@ -279,6 +294,161 @@ if (Math.abs(played.secs - played.asked) > 0.35) {
   problems.push(`a ${played.asked}s sequence played in ${played.secs.toFixed(2)}s`);
 }
 console.log(`--- duration playback: asked ${played.asked}s, took ${played.secs.toFixed(2)}s`);
+
+// ---- the row: its label, and the drag reorder ----------------------------
+// Both need the section actually ON SCREEN: the reorder is a real mouse
+// gesture, and you cannot press a row sitting in a collapsed section on a tab
+// that is not showing.
+await page.evaluate(() => {
+  const app = window.__app;
+  document.querySelector('#sidebar-tabs [data-tab="teach"]').click();
+  const sec = document.getElementById('sequence-section');
+  if (sec.classList.contains('collapsed')) sec.querySelector('.collapse-toggle').click();
+  app.setSeqStates([]);
+  app.applyPreset(0); app.seqAdd();
+  app.applyPreset(1); app.seqAdd();
+  app.applyPreset(2); app.seqAdd();
+  app.seqSetName(0, '  cross  '); // trimmed on the way in
+  app.seqSetName(1, 'pivot out');
+  app.seqSetName(2, 'collection');
+  sec.scrollIntoView({ block: 'center' });
+});
+const rowShape = await page.evaluate(() => {
+  const rows = [...document.querySelectorAll('#seq-list .pose-item')];
+  // A keyframe with no name at all — every file saved before labels existed —
+  // must still draw a row that names itself.
+  const kept = window.__app.seqStates[2].name;
+  delete window.__app.seqStates[2].name;
+  window.__app.onSeqChanged();
+  const anon = document.querySelectorAll('#seq-list .seq-name')[2];
+  const fallback = { value: anon.value, placeholder: anon.placeholder };
+  window.__app.seqSetName(2, kept);
+  return {
+    labels: rows.map((r) => r.querySelector('.seq-name')?.value),
+    indices: rows.map((r) => r.querySelector('.seq-index')?.textContent),
+    unitSpans: document.querySelectorAll('#seq-list .seq-dur-unit').length,
+    durTitle: rows[0].querySelector('.seq-dur').title,
+    rowTitle: rows[0].title,
+    fallback,
+  };
+});
+console.log('--- row shape:', JSON.stringify(rowShape));
+if (rowShape.labels.join('|') !== 'cross|pivot out|collection') problems.push(`row labels are ${JSON.stringify(rowShape.labels)}`);
+if (rowShape.indices.join('') !== '123') problems.push(`the leading index is gone: ${JSON.stringify(rowShape.indices)}`);
+if (rowShape.unitSpans) problems.push('the "s" unit span is still in the row');
+if (!/econds/.test(rowShape.durTitle)) problems.push(`the duration's unit is not in its tooltip: "${rowShape.durTitle}"`);
+if (!/Alt/.test(rowShape.rowTitle)) problems.push(`the row does not advertise the keyboard reorder: "${rowShape.rowTitle}"`);
+if (rowShape.fallback.value !== '' || !/Keyframe 3/.test(rowShape.fallback.placeholder)) {
+  problems.push(`an unnamed keyframe draws anonymously: ${JSON.stringify(rowShape.fallback)}`);
+}
+
+// Typing in the row's own field commits, and Enter (which re-renders the list
+// mid-keystroke) must not throw the caret out of the row.
+// Picked by index rather than by `:nth-child`: a keyframe is a BLOCK now (the
+// controls row plus its caption/muscle extras line), so the row's position
+// among #seq-list's children is not the keyframe's position.
+const nameBox = (await page.$$('#seq-list .seq-name'))[1];
+await nameBox.click();
+await page.keyboard.down('Control');
+await page.keyboard.press('KeyA');
+await page.keyboard.up('Control');
+await page.keyboard.type('ocho cortado');
+await page.keyboard.press('Enter');
+const typed = await page.evaluate(() => ({
+  stored: window.__app.seqStates[1].name,
+  focused: document.activeElement?.dataset?.field,
+  focusRow: document.activeElement?.closest('.pose-item')?.dataset?.index,
+}));
+console.log('--- typed label:', JSON.stringify(typed));
+if (typed.stored !== 'ocho cortado') problems.push(`typing in the row stored "${typed.stored}"`);
+if (typed.focused !== 'name' || typed.focusRow !== '1') problems.push('committing a label dropped the caret out of its row');
+
+// A REAL pointer drag of row 3 onto row 1. The answer must be the LIFT AND
+// DROP [3, 1, 2] — a chain of neighbour swaps would give [2, 3, 1], carrying
+// the rows it passed backwards with it.
+await page.evaluate(() => window.__app.seqSetName(1, 'pivot out'));
+const boxes = await page.evaluate(() => [...document.querySelectorAll('#seq-list .pose-item')]
+  .map((r) => { const b = r.getBoundingClientRect(); return { x: b.x, y: b.y, h: b.height }; }));
+const gripX = boxes[0].x + 6; // the index column: never a control
+await page.mouse.move(gripX, boxes[2].y + boxes[2].h / 2);
+await page.mouse.down();
+await page.mouse.move(gripX, boxes[1].y + boxes[1].h / 2, { steps: 6 });
+const midDrag = await page.evaluate(() => ({
+  carried: document.querySelectorAll('#seq-list .seq-dragging').length,
+  marks: [...document.querySelectorAll('#seq-list .pose-item')]
+    .map((r) => (r.classList.contains('drop-before') ? 'before'
+      : r.classList.contains('drop-after') ? 'after' : '-')).join(','),
+}));
+await page.screenshot({ path: `${outDir}/sequence-drag.png` });
+await page.mouse.move(gripX, boxes[0].y + boxes[0].h * 0.25, { steps: 6 });
+await page.mouse.up();
+const dragged = await page.evaluate(() => ({
+  names: window.__app.seqStates.map((s) => s.name),
+  rows: [...document.querySelectorAll('#seq-list .seq-name')].map((i) => i.value),
+  leftovers: document.querySelectorAll('#seq-list .drop-before, #seq-list .drop-after, #seq-list .seq-dragging').length,
+}));
+console.log('--- drag reorder:', JSON.stringify({ midDrag, ...dragged }));
+if (!midDrag.carried) problems.push('the dragged row is not marked while it is carried');
+if (!/before|after/.test(midDrag.marks)) problems.push(`no drop indicator mid-drag (${midDrag.marks}) — the user is aiming at nothing`);
+if (dragged.names.join('|') !== 'collection|cross|pivot out') {
+  problems.push(`drag of row 3 onto row 1 gave ${JSON.stringify(dragged.names)}, want [collection, cross, pivot out]`);
+}
+if (dragged.rows.join('|') !== dragged.names.join('|')) problems.push('the rows do not show the reordered keyframes');
+if (dragged.leftovers) problems.push('drag chrome survived the drop');
+
+// The keyboard half — a drag-only reorder is unreachable. Alt+↓ on the focused
+// row moves it, focus follows it, and the arrow must NOT also reach the 3D
+// view's joint nudge.
+const chestBefore = await page.evaluate(() => window.__app.leader.worldPos('chest').toArray());
+await page.evaluate(() => document.querySelectorAll('#seq-list .pose-item')[0].focus());
+await page.keyboard.down('Alt');
+await page.keyboard.press('ArrowDown');
+await page.keyboard.up('Alt');
+const keyed = await page.evaluate((before) => {
+  const app = window.__app;
+  const now = app.leader.worldPos('chest').toArray();
+  return {
+    names: app.seqStates.map((s) => s.name),
+    focusRow: document.activeElement?.closest('.pose-item')?.dataset?.index,
+    poseMoved: Math.max(...now.map((v, i) => Math.abs(v - before[i]))),
+  };
+}, chestBefore);
+console.log('--- keyboard reorder:', JSON.stringify(keyed));
+if (keyed.names.join('|') !== 'cross|collection|pivot out') problems.push(`Alt+↓ gave ${JSON.stringify(keyed.names)}`);
+if (keyed.focusRow !== '1') problems.push(`focus did not follow the moved row (row ${keyed.focusRow})`);
+if (keyed.poseMoved > 1e-6) problems.push(`Alt+↓ also nudged the dancer (${keyed.poseMoved.toFixed(4)} m)`);
+
+// ⟳ re-records the POSE. The label is not pose — nor is anything else a
+// keyframe carries, including a block this script did not write.
+const kept = await page.evaluate(() => {
+  const app = window.__app;
+  app.seqStates[1].kf = { caption: 'from another feature' };
+  app.applyPreset(3);
+  app.seqUpdate(1);
+  return { name: app.seqStates[1].name, dur: app.seqStates[1].dur, kf: app.seqStates[1].kf?.caption };
+});
+console.log('--- ⟳ keeps:', JSON.stringify(kept));
+if (kept.name !== 'collection') problems.push('⟳ lost the keyframe label');
+if (kept.dur !== 2.4) problems.push(`⟳ lost the duration (${kept.dur})`);
+if (kept.kf !== 'from another feature') problems.push('⟳ dropped an unknown field off the keyframe');
+await page.screenshot({ path: `${outDir}/sequence-rows.png` });
+
+// …and the labels survive a reload, which is the only proof they are stored
+// rather than merely displayed.
+await page.reload({ waitUntil: 'networkidle0', timeout: 60000 });
+await page.waitForFunction(() => window.__app, { timeout: 30000 });
+await new Promise((r) => setTimeout(r, 1200));
+const reloaded = await page.evaluate(() => ({
+  names: window.__app.seqStates.map((s) => s.name),
+  rows: [...document.querySelectorAll('#seq-list .seq-name')].map((i) => i.value),
+  kf: window.__app.seqStates[1]?.kf?.caption ?? null,
+}));
+console.log('--- after reload:', JSON.stringify(reloaded));
+if (reloaded.names.join('|') !== 'cross|collection|pivot out') {
+  problems.push(`labels did not survive a reload: ${JSON.stringify(reloaded.names)}`);
+}
+if (reloaded.rows.join('|') !== reloaded.names.join('|')) problems.push('the restored rows do not show their labels');
+
 await page.evaluate(() => window.__app.setSeqStates([]));
 
 if (problems.length) console.log('\nPROBLEMS:\n' + problems.join('\n'));

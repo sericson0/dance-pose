@@ -247,11 +247,38 @@ export function initUI(app) {
   const drawUndo = $('draw-undo');
   const drawClear = $('draw-clear');
   const drawDelete = $('draw-delete');
+  const drawHide = $('draw-hide');
   const drawColor = $('draw-color');
   const drawWidth = $('draw-width');
   drawUndo.addEventListener('click', () => app.removeLastDrawing());
-  drawClear.addEventListener('click', () => app.clearDrawings());
+  // A diagram now survives a reload, so Clear destroys authored work AND the
+  // saved copy of it, and annotations sit outside the pose undo stack — Ctrl+Z
+  // cannot bring one back. Ask, but only when there is something to lose (the
+  // rule the sequence/pins/labels wipes already follow). The dialog lives here
+  // and never in app.clearDrawings, which the headless scripts drive directly.
+  drawClear.addEventListener('click', () => {
+    const n = app.drawings.length;
+    if (n && !window.confirm(`Remove all ${n} drawing${n === 1 ? '' : 's'}? This also clears the saved copy and cannot be undone.`)) return;
+    app.clearDrawings();
+    if (n) app.status(`Removed ${n} drawing${n === 1 ? '' : 's'}.`, 'info');
+  });
   drawDelete.addEventListener('click', () => app.removeSelectedDrawing());
+  // One control, two meanings, decided by the selection — the same idiom the
+  // swatch and the width slider already carry. With a drawing selected it hides
+  // that one; with nothing selected it brings every hidden drawing back. Hiding
+  // is what builds the subset a sequence keyframe captures (◻ on its row), and
+  // it is a VIEW state: nothing is deleted and nothing leaves the saved file.
+  drawHide.addEventListener('click', () => {
+    const sel = app.drawSelected;
+    if (sel) {
+      app.setDrawingVisible(sel, false);
+      app.selectDrawing(null); // its handles would hang in the air over nothing
+      app.status('Drawing hidden — ◻ on a keyframe row captures what is showing.', 'info');
+      return;
+    }
+    app.setDrawVisibleIds(null);
+    app.status('All drawings shown.', 'info');
+  });
   // The swatch and the width slider are ONE control with two meanings, decided
   // by whether a drawing is selected: restyle that one, or set the look the
   // next one is drawn in (app.setDrawStyle owns the rule). `input` rather than
@@ -263,6 +290,13 @@ export function initUI(app) {
     drawUndo.disabled = empty;
     drawClear.disabled = empty;
     drawDelete.disabled = !app.drawSelected;
+    // With nothing selected the button is the way back: it clears the filter
+    // outright, so it is armed whenever there IS one, not only when a drawing
+    // happens to be off screen (a full-set filter still silently excludes every
+    // drawing authored after it).
+    const filtered = app.drawVisibleIds !== null;
+    drawHide.textContent = app.drawSelected ? '◐ Hide' : '◉ Show all';
+    drawHide.disabled = !app.drawSelected && !filtered;
   };
   // A selected drawing hands its own colour and width to the toolbar, so the
   // controls always read the thing they would change.
@@ -273,6 +307,34 @@ export function initUI(app) {
   };
   syncDrawButtons();
   syncDrawStyle();
+
+  // The floor diagram survives a reload, like the sequence and the Muscles
+  // panel's look. A teacher's chalk is authored work — a giro drawn on the
+  // floor under a keyframe chain took as long to place as the keyframes did,
+  // and a refresh mid-lesson used to throw all of it away while the sequence
+  // it belonged to came back intact.
+  const DRAW_KEY = 'tangoPoseStudio.drawings.v1';
+  // Restoring goes through the very hook that saves (onDrawingsChanged), and
+  // at startup the floor is EMPTY — so nothing may be written until the stored
+  // diagram has been applied, or the first sync would overwrite the saved set
+  // with nothing. Same guard the Muscles panel and the sidebar layout carry.
+  let drawingsReady = false;
+  // The keyframe rows carry a ◻ that only means anything with drawings on the
+  // floor. Rebuilding the list on every drawing mutation would re-render it
+  // for a colour tweak too, so the rows are refreshed when the COUNT moves.
+  let lastDrawCount = null;
+  function saveDrawings() {
+    if (!drawingsReady) return;
+    try {
+      localStorage.setItem(DRAW_KEY, JSON.stringify(app.drawingsJSON()));
+    } catch { /* full / private mode */ }
+  }
+  try {
+    const saved = JSON.parse(localStorage.getItem(DRAW_KEY));
+    if (Array.isArray(saved) && saved.length) app.setDrawings(saved);
+  } catch { /* corrupted storage: start with a clean floor */ }
+  drawingsReady = true;
+  syncDrawButtons();
 
   // Collapsible sidebar sections: the heading's button folds it away. The
   // button is what carries the click (and the keyboard: Enter/Space on an <h2>
@@ -804,6 +866,7 @@ export function initUI(app) {
   const muscleList = $('muscle-list');
   const muscleClearHl = $('muscle-clear-hl');
   const muscleLayerNote = $('muscle-layer-note');
+  const muscleKfNote = $('muscle-kf-note');
   const hiddenMuscles = new Set();
   const litMuscles = new Set();
   const muscleColors = new Map(); // atlas label → the colour the user gave it
@@ -831,18 +894,96 @@ export function initUI(app) {
     } catch { /* full / private mode */ }
   }
 
+  // ---- a sequence keyframe's own highlighting (kf.muscles) ----------------
+  // A keyframe may carry its own lit set and colours. That is a VIEW OVERRIDE,
+  // not an edit: `litMuscles` / `muscleColors` above stay the user's RUNNING
+  // look, and scrubbing to an untagged keyframe hands it straight back.
+  //
+  // WHY THIS IS NOT applyViewState. Showing a SLIDE deliberately makes that
+  // slide's look the running one — applyViewState ends with saveMuscleLook(),
+  // and that is right there, because the user asked for that slide. Scrubbing a
+  // timeline is not showing a slide: the playhead crosses every keyframe on the
+  // way past, several times a second, and persisting each one would grind the
+  // panel state the user authored down to whatever keyframe the scrubber last
+  // happened to sit on. So an override reaches the FIGURES and the panel's
+  // chips, and never localStorage.
+  let muscleOverride = null;       // { lit: Set, colors: Map } | null
+  const appliedColors = new Set(); // labels whose colour is on the figures now
+  const effLit = () => muscleOverride?.lit ?? litMuscles;
+  const effColors = () => muscleOverride?.colors ?? muscleColors;
+
+  // Push the EFFECTIVE look at the dancers. Colours are cleared by DIFFERENCE
+  // rather than wholesale, so dropping an override restores exactly the running
+  // colours and nothing stays painted from the keyframe that just left.
+  function pushMuscleLook() {
+    const colors = effColors();
+    for (const label of appliedColors) if (!colors.has(label)) app.setMuscleColor(label, null);
+    appliedColors.clear();
+    for (const [label, hex] of colors) {
+      app.setMuscleColor(label, hex);
+      appliedColors.add(label);
+    }
+    app.setMuscleLit(effLit());
+    muscleClearHl.disabled = effLit().size === 0;
+  }
+
+  const sameLook = (a, b) => {
+    if (!a || !b) return a === b;
+    if (a.lit.size !== b.lit.size || a.colors.size !== b.colors.size) return false;
+    for (const l of a.lit) if (!b.lit.has(l)) return false;
+    for (const [l, h] of a.colors) if (b.colors.get(l) !== h) return false;
+    return true;
+  };
+
+  // Called from main.js's applyKeyframeExtras — i.e. several times a second
+  // while a sequence plays — so an UNCHANGED look must cost nothing. Restyling
+  // ~130 bellies on two dancers every frame is a real cost, and rebuilding the
+  // panel every frame would also eat the caret out of anything being typed.
+  function setMuscleOverride(m) {
+    const next = m
+      ? { lit: new Set(m.lit ?? []), colors: new Map((m.colors ?? []).map(([l, h]) => [l, h])) }
+      : null;
+    if (sameLook(next, muscleOverride)) return;
+    muscleOverride = next;
+    pushMuscleLook();
+    // The chips have to tell the truth about what is lit on screen, or the
+    // panel lies for as long as the keyframe is up.
+    renderMuscleList();
+    muscleKfNote.hidden = !muscleOverride;
+  }
+
+  // The highlighting ON SCREEN right now, in the shape a keyframe stores — what
+  // a row's muscle tag captures. It reads the EFFECTIVE look, so re-capturing a
+  // keyframe that is already showing is idempotent rather than a wipe.
+  const muscleLookNow = () => ({
+    lit: [...effLit()],
+    colors: [...effLit()].filter((l) => effColors().has(l)).map((l) => [l, effColors().get(l)]),
+  });
+
+  // Any edit in this panel is the user taking the look back, so it drops the
+  // override — otherwise the chip they just pressed would be overwritten by the
+  // keyframe on screen and the panel would read as dead.
+  const takeBackMuscleLook = () => {
+    if (!muscleOverride) return false;
+    muscleOverride = null;
+    muscleKfNote.hidden = true;
+    return true;
+  };
+
   // One place a muscle's colour changes, whichever control asked: the panel's
   // swatch or a click on the belly itself in a clip (app.ui.pickMuscleColor).
   // Takes one label or several, because a clip's callout names a group of
   // bellies and the colour belongs to the callout.
   const applyMuscleColor = (labels, hex) => {
+    const wasOverride = takeBackMuscleLook();
     for (const label of [labels].flat()) {
       muscleColors.set(label, hex);
-      app.setMuscleColor(label, hex);
       const sw = muscleSwatches.get(label);
       if (sw) sw.value = hex;
     }
+    pushMuscleLook();
     saveMuscleLook();
+    if (wasOverride) renderMuscleList(); // every other row's chip may have changed
     renderLabels(); // the callout list's kind tag wears the colour too
   };
 
@@ -937,7 +1078,9 @@ export function initUI(app) {
         hl.className = 'chip muscle-hl';
         hl.textContent = 'highlight';
         hl.title = 'Highlight this muscle';
-        hl.classList.toggle('active', litMuscles.has(label));
+        // The EFFECTIVE set, not the running one: while a keyframe's own
+        // highlighting is showing, the chips must say what is lit on screen.
+        hl.classList.toggle('active', effLit().has(label));
         // Its own colour, so several bellies lit at once stay tellable apart —
         // and so does each one's callout (see Labels.accentColor). Shown only
         // while the muscle is lit, like the Highlight panel's part swatches.
@@ -945,17 +1088,22 @@ export function initUI(app) {
         sw.type = 'color';
         sw.className = 'chip-color';
         sw.title = `Colour of the ${label} highlight`;
-        sw.hidden = !litMuscles.has(label);
-        sw.value = muscleColors.get(label) ?? MUSCLE_HL_DEFAULT;
+        sw.hidden = !effLit().has(label);
+        sw.value = effColors().get(label) ?? MUSCLE_HL_DEFAULT;
         sw.addEventListener('input', () => applyMuscleColor(label, sw.value));
         muscleSwatches.set(label, sw);
         hl.addEventListener('click', () => {
+          const wasOverride = takeBackMuscleLook();
           if (litMuscles.has(label)) litMuscles.delete(label); else litMuscles.add(label);
-          hl.classList.toggle('active', litMuscles.has(label));
-          sw.hidden = !litMuscles.has(label);
-          app.setMuscleLit(litMuscles);
-          muscleClearHl.disabled = litMuscles.size === 0;
+          pushMuscleLook();
           saveMuscleLook();
+          // Dropping an override changes every other row too, so the whole list
+          // is rebuilt — otherwise just the two controls that moved.
+          if (wasOverride) renderMuscleList();
+          else {
+            hl.classList.toggle('active', litMuscles.has(label));
+            sw.hidden = !litMuscles.has(label);
+          }
         });
         row.append(lbl, hl, sw);
         group.appendChild(row);
@@ -987,9 +1135,9 @@ export function initUI(app) {
   };
   muscleTint.addEventListener('input', syncMuscleTint);
   muscleClearHl.addEventListener('click', () => {
+    takeBackMuscleLook();
     litMuscles.clear();
-    app.setMuscleLit(litMuscles);
-    muscleClearHl.disabled = true;
+    pushMuscleLook();
     saveMuscleLook();
     renderMuscleList();
   });
@@ -1002,24 +1150,26 @@ export function initUI(app) {
     let saved = null;
     try { saved = JSON.parse(localStorage.getItem(MUSCLE_KEY)); } catch { saved = null; }
     if (saved) {
-      for (const [label, hex] of saved.colors ?? []) {
-        muscleColors.set(label, hex);
-        app.setMuscleColor(label, hex);
-      }
+      for (const [label, hex] of saved.colors ?? []) muscleColors.set(label, hex);
       for (const label of saved.lit ?? []) litMuscles.add(label);
       for (const label of saved.hidden ?? []) hiddenMuscles.add(label);
       if (saved.tint != null) muscleTint.value = saved.tint;
       syncMuscleTint();
-      app.setMuscleLit(litMuscles);
       app.setMuscleHidden(hiddenMuscles);
-      muscleClearHl.disabled = litMuscles.size === 0;
+      // Through pushMuscleLook, not the setters directly, so `appliedColors`
+      // knows what is painted — a later keyframe override has to be able to
+      // take exactly these colours back off again.
+      pushMuscleLook();
     }
     muscleLookReady = true;
   }
   restoreMuscleLook();
 
-  // The panel only shows through the Muscles layer — nudge the user to enable it.
-  const syncMuscleNote = () => { muscleLayerNote.hidden = layerMode() === 'muscle'; };
+  // The panel needs a layer that draws bellies at all. The Muscles view shows
+  // every one of them; the Skeleton view shows exactly the LIT ones over the
+  // bare bones (Figure.#syncMuscleVisibility), so the chips are live there too
+  // and the nudge would be a lie. Only the opaque Body view hides the lot.
+  const syncMuscleNote = () => { muscleLayerNote.hidden = layerMode() !== 'body'; };
   $('layer-mode').addEventListener('change', syncMuscleNote);
   $('muscle-enable-layer').addEventListener('click', () => chooseLayer('muscle'));
   syncMuscleNote();
@@ -1898,17 +2048,112 @@ export function initUI(app) {
     const n = app.seqStates.length;
     if (n && !window.confirm(`Delete all ${n} keyframe${n === 1 ? '' : 's'}? This also clears the saved copy and cannot be undone.`)) return;
     app.setSeqStates([]);
+    // There is no timeline left to be on, so its extras go with it: the caption
+    // band clears and the Muscles panel takes its own look back.
+    app.clearKeyframeExtras();
     if (n) app.status(`Deleted ${n} keyframe${n === 1 ? '' : 's'}.`, 'info');
   });
 
+  // ---- keyframe reordering --------------------------------------------
+  // A row is dragged with POINTER events, not HTML5 drag-and-drop. The row
+  // carries a text field and a number box, and a `draggable` ancestor hijacks
+  // the ordinary press-and-sweep that selects text inside them — the label
+  // would become uneditable by the gesture users reach for first. Pointer
+  // events also let the drop indicator follow the cursor continuously, which
+  // is the whole point: you cannot aim at a landing place you cannot see.
+  let seqDrag = null;
+  const SEQ_DRAG_SLOP = 4; // px before a press counts as a drag, not a click
+  // Bumped by every renderSequence, and captured by each row's handlers, so a
+  // field can tell whether the list it belongs to is still the one on screen.
+  let seqGen = 0;
+
+  const seqRows = () => [...seqList.querySelectorAll('.pose-item')];
+
+  // Where the dragged row would be INSERTED in the list as drawn (0..n): the
+  // first row whose upper half the cursor is in, else past the last one.
+  function seqDropIndex(clientY) {
+    const rows = seqRows();
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i].getBoundingClientRect();
+      if (clientY < r.top + r.height / 2) return i;
+    }
+    return rows.length;
+  }
+
+  // The visible landing place: a rule above the row it would push down, or
+  // below the last row when the drop is off the end.
+  function seqShowDrop(insert) {
+    const rows = seqRows();
+    rows.forEach((r) => r.classList.remove('drop-before', 'drop-after'));
+    if (insert == null) return;
+    if (insert < rows.length) rows[insert].classList.add('drop-before');
+    else rows[rows.length - 1]?.classList.add('drop-after');
+  }
+
+  function seqDragEnd(commit) {
+    const d = seqDrag;
+    seqDrag = null;
+    if (!d) return;
+    seqShowDrop(null);
+    d.row.classList.remove('seq-dragging');
+    if (!commit || !d.active || d.insert == null) return;
+    // `insert` indexes the list as DRAWN; lifting the dragged row out first
+    // shifts every row after it down by one, so a drop below its old home
+    // lands one place earlier than the indicator read.
+    app.seqMoveTo(d.from, d.insert > d.from ? d.insert - 1 : d.insert);
+  }
+
+  // Bound on the window, not the row: a drag that leaves the sidebar (or ends
+  // over the 3D view) must still finish rather than latch on forever.
+  window.addEventListener('pointermove', (e) => {
+    if (!seqDrag) return;
+    if (!seqDrag.active) {
+      if (Math.abs(e.clientY - seqDrag.y0) < SEQ_DRAG_SLOP) return;
+      seqDrag.active = true;
+      seqDrag.row.classList.add('seq-dragging');
+    }
+    seqDrag.insert = seqDropIndex(e.clientY);
+    seqShowDrop(seqDrag.insert);
+  });
+  window.addEventListener('pointerup', () => seqDragEnd(true));
+  window.addEventListener('pointercancel', () => seqDragEnd(false));
+
   function renderSequence() {
     const n = app.seqStates.length;
+    seqGen++; // everything the previous rows still have in flight is now stale
+    // Every row is rebuilt here, so committing a label with Enter — which
+    // fires `change` while the field still holds the caret — would otherwise
+    // drop focus out of the list entirely. Remember which field of which row
+    // had it and hand it back.
+    // `[data-index]` rather than `.pose-item`: a keyframe is now a BLOCK (the
+    // controls row plus its extras line), and the caption field lives on the
+    // second line, outside the row itself.
+    const act = document.activeElement;
+    const held = seqList.contains(act)
+      ? { i: Number(act.closest('[data-index]')?.dataset.index), field: act.dataset.field }
+      : null;
     seqList.innerHTML = n ? ''
       : '<span class="muted">No keyframes yet — pose the couple and add one.</span>';
     app.seqStates.forEach((state, i) => {
+      // A keyframe is two lines: the controls row (index, label, buttons,
+      // duration) and an extras line under it. They are wrapped so the row
+      // itself stays exactly what the reorder drags and measures — seqDropIndex
+      // and the drop indicator both work off `.pose-item` rects.
+      const block = document.createElement('div');
+      block.className = 'seq-block';
+      block.dataset.index = String(i);
       const row = document.createElement('div');
-      row.className = 'pose-item';
-      row.innerHTML = `<span class="name">${i + 1}</span>`;
+      row.className = 'pose-item seq-item';
+      row.dataset.index = String(i);
+      row.dataset.field = 'row';
+      // Focusable because the reorder must not be drag-only: a pointer gesture
+      // is unreachable by keyboard, so Alt+↑/↓ on the focused row does the
+      // same move. The tooltip is where both gestures are advertised.
+      row.tabIndex = 0;
+      row.title = 'Drag to reorder — or focus this row and press Alt+↑ / Alt+↓';
+      // The number stays: it is how a row maps onto the movement scrubber.
+      // It doubles as the grip, which is why it wears the grab cursor.
+      row.innerHTML = `<span class="seq-index">${i + 1}</span>`;
       const btn = (label, title, fn, disabled = false) => {
         const b = document.createElement('button');
         b.textContent = label;
@@ -1917,14 +2162,73 @@ export function initUI(app) {
         b.addEventListener('click', fn);
         row.appendChild(b);
       };
+      // The user's own word for this keyframe ("cross", "pivot out"). Left
+      // blank the placeholder still names it by number, so no row is anonymous.
+      const label = document.createElement('input');
+      label.type = 'text';
+      label.className = 'seq-name';
+      label.dataset.field = 'name';
+      label.maxLength = app.seqNameMax;
+      label.value = typeof state.name === 'string' ? state.name : '';
+      label.placeholder = `Keyframe ${i + 1}`;
+      label.title = 'Name this keyframe — blank falls back to its number';
+      // `change` fires on Enter and on a blur that altered the text; the blur
+      // is belt-and-braces for anything that moves focus without it. Both go
+      // through the same guard, so a no-op blur cannot re-render the list out
+      // from under the caret.
+      //
+      // The generation check is the load-bearing half. Every re-render REPLACES
+      // this field, and an edited field that is torn out fires its `change` on
+      // the way — SYNCHRONOUSLY, while `innerHTML` is still clearing, so it is
+      // not yet detached and `isConnected` reads true. Without the check it
+      // wrote its abandoned text straight back over whatever had just renamed
+      // the keyframe (measured: a rename from a script was undone inside its
+      // own call). A row that belongs to a list that no longer exists must not
+      // speak for it.
+      const gen = seqGen;
+      const commitName = () => {
+        if (gen !== seqGen) return;
+        if (label.value.trim() !== (state.name ?? '')) app.seqSetName(i, label.value);
+      };
+      label.addEventListener('change', commitName);
+      label.addEventListener('blur', commitName);
+      row.appendChild(label);
       btn('Show', 'Jump the couple to this keyframe', () => app.seqApply(i));
       btn('⟳', 'Overwrite this keyframe with the current pose', () => app.seqUpdate(i));
+      // Which floor drawings this keyframe shows. UNTAGGED (◻) means all of
+      // them, which is what every keyframe authored before this carries and
+      // why the control is inert until someone presses it. Tagging CAPTURES
+      // what is on screen rather than offering a list of every drawing: the
+      // teacher has just arranged the diagram they want (Draw mode's ◐ Hide),
+      // and a checklist of fifteen chalk marks named "Line 7" identifies
+      // nothing. Pressing it again on a tagged row clears back to all.
+      const tagged = app.seqDrawIds(i);
+      const nDraw = app.drawings.length;
+      btn(tagged ? '◼' : '◻',
+        tagged
+          ? `Showing ${tagged.length} of ${nDraw} drawings on this keyframe — click to show all again`
+          : 'Show only the drawings currently on screen when this keyframe plays',
+        () => {
+          if (tagged) {
+            app.seqSetDrawIds(i, null);
+            app.status(`Keyframe ${i + 1} shows all drawings.`, 'info');
+            return;
+          }
+          const ids = app.drawShownIds;
+          app.seqSetDrawIds(i, ids);
+          app.status(`Keyframe ${i + 1} shows ${ids.length} of ${nDraw} drawing${nDraw === 1 ? '' : 's'}.`, 'info');
+        },
+        nDraw === 0);
       // How long this keyframe takes to reach the next one. The last keyframe
       // has nothing to travel to, so its box is disabled rather than hidden —
-      // the column stays aligned and the reason is in the tooltip.
+      // the column stays aligned and the reason is in the tooltip. The unit
+      // lives in that tooltip rather than in an "s" beside the field: the row
+      // now carries a label too, and a one-character span was the cheapest
+      // thing in it to give up.
       const dur = document.createElement('input');
       dur.type = 'number';
       dur.className = 'seq-dur';
+      dur.dataset.field = 'dur';
       dur.min = '0.2';
       dur.max = '30';
       dur.step = '0.1';
@@ -1935,14 +2239,84 @@ export function initUI(app) {
         : `Seconds from keyframe ${i + 1} to ${i + 2}`;
       dur.addEventListener('change', () => app.seqSetDuration(i, parseFloat(dur.value)));
       row.appendChild(dur);
-      const unit = document.createElement('span');
-      unit.className = 'seq-dur-unit';
-      unit.textContent = 's';
-      row.appendChild(unit);
-      btn('↑', 'Play this keyframe earlier', () => app.seqMove(i, -1), i === 0);
-      btn('↓', 'Play this keyframe later', () => app.seqMove(i, 1), i === n - 1);
       btn('✕', 'Delete this keyframe', () => app.seqDelete(i));
-      seqList.appendChild(row);
+      // A press on the row body arms the drag; a press on a control never
+      // does, or the label could not be typed in nor a button pressed.
+      row.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0 || e.target.closest('input, button')) return;
+        seqDrag = { from: i, row, y0: e.clientY, active: false, insert: null };
+      });
+      // The keyboard half of the reorder. stopPropagation because the arrow
+      // keys are also the 3D view's joint nudges, which listen on the window.
+      row.addEventListener('keydown', (e) => {
+        if (!e.altKey || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const to = i + (e.key === 'ArrowUp' ? -1 : 1);
+        if (to < 0 || to >= app.seqStates.length) return;
+        app.seqMoveTo(i, to);
+        seqRows()[to]?.focus(); // follow the row the user is carrying
+      });
+      block.appendChild(row);
+
+      // ---- the keyframe's own EXTRAS: a caption and a muscle highlight ----
+      // A SECOND LINE rather than two more controls on the row. The row is
+      // already index + label + four buttons + a number box inside a 320 px
+      // sidebar, and a caption is a sentence, not a chip. It is always shown
+      // rather than hidden behind a disclosure because this list has no
+      // "selected keyframe" to hang a panel off — and a caption you cannot see
+      // while you order the sequence is one you will forget you wrote.
+      const extras = document.createElement('div');
+      extras.className = 'seq-extras';
+      const cap = document.createElement('input');
+      cap.type = 'text';
+      cap.className = 'seq-caption';
+      cap.dataset.field = 'caption';
+      cap.maxLength = app.seqCaptionMax;
+      cap.value = app.seqCaption(i);
+      cap.placeholder = 'Caption on this keyframe…';
+      cap.title = 'Words drawn across the foot of the picture while this keyframe is showing — they ride into the photo and the recorded video with it';
+      // Same commit pair and the same stale-generation guard as the label
+      // above: a field torn out by a re-render fires `change` on the way and
+      // must not speak for a list that no longer exists.
+      const commitCaption = () => {
+        if (gen !== seqGen) return;
+        if (cap.value.trim() !== app.seqCaption(i)) app.seqSetCaption(i, cap.value);
+      };
+      cap.addEventListener('change', commitCaption);
+      cap.addEventListener('blur', commitCaption);
+      extras.appendChild(cap);
+
+      // The muscle tag — the drawings tag's twin, and CAPTURE for the same
+      // reason: the teacher has just lit the bellies they mean in the Muscles
+      // panel, and a checklist of 68 atlas names identifies nothing. Untagged
+      // (◻) means the keyframe shows whatever the panel has running.
+      const mus = app.seqMuscles(i);
+      const nLit = mus?.lit.length ?? 0;
+      const mBtn = document.createElement('button');
+      mBtn.className = 'seq-kf-btn';
+      mBtn.textContent = mus ? `◼ ${nLit}` : '◻ Muscles';
+      mBtn.title = mus
+        ? `This keyframe lights ${nLit} muscle${nLit === 1 ? '' : 's'} of its own — click to follow the Muscles panel again`
+        : 'Light exactly the muscles highlighted right now whenever this keyframe is showing';
+      mBtn.addEventListener('click', () => {
+        if (mus) {
+          app.seqSetMuscles(i, null);
+          app.status(`Keyframe ${i + 1} follows the Muscles panel again.`, 'info');
+          return;
+        }
+        const got = app.seqCaptureMuscles(i);
+        const n2 = got?.lit.length ?? 0;
+        // An empty capture is a real choice — "show no highlighting here" — so
+        // it is stored, and the message says what was taken rather than
+        // pretending nothing happened.
+        app.status(n2
+          ? `Keyframe ${i + 1} lights ${n2} muscle${n2 === 1 ? '' : 's'}.`
+          : `Keyframe ${i + 1} now shows no muscle highlighting.`, 'info');
+      });
+      extras.appendChild(mBtn);
+      block.appendChild(extras);
+      seqList.appendChild(block);
     });
     if (n >= 2) {
       const total = document.createElement('div');
@@ -1954,13 +2328,28 @@ export function initUI(app) {
     seqPlay.disabled = n < 2;
     seqClear.disabled = n === 0;
     seqExport.disabled = n < 2;
+    if (held && Number.isFinite(held.i)) {
+      // The row itself carries data-field="row", so one query serves both it
+      // and the fields inside the block.
+      const block = seqList.querySelectorAll('.seq-block')[held.i];
+      block?.querySelector(`[data-field="${held.field}"]`)?.focus();
+    }
     syncRecordButtons();
     syncPath();
     try { localStorage.setItem(SEQ_KEY, JSON.stringify(app.seqStates)); } catch { /* storage full */ }
   }
 
   seqExport.addEventListener('click', () => {
-    const payload = { app: 'tangle', type: 'sequence', version: 1, states: app.seqStates };
+    // The floor diagram travels WITH the sequence: a keyframe may name a subset
+    // of it (kf.draw), so a file carrying the keyframes and not the drawings
+    // they point at is a file that cannot be replayed. The key is additive and
+    // the version stays 1 — a file without it is still a valid sequence, and
+    // an older build simply ignores it.
+    const payload = {
+      app: 'tangle', type: 'sequence', version: 1,
+      states: app.seqStates,
+      drawings: app.drawingsJSON(),
+    };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -1978,17 +2367,36 @@ export function initUI(app) {
       if (!Array.isArray(states) || states.length < 2 || !states.every((s) => s && s.figures)) {
         throw new Error('not a sequence');
       }
+      // A file MAY carry the floor diagram its keyframes point at. One saved
+      // before drawings travelled with a sequence has no such key, and must
+      // import exactly as it always did — leaving whatever is on the floor
+      // alone rather than wiping it.
+      const incoming = Array.isArray(data.drawings) ? data.drawings : null;
       // An import REPLACES whatever is on the timeline. The pose import right
       // below this one has always taken a history snapshot first; this one did
       // not, which made the two inconsistent in the same file.
       const had = app.seqStates.length;
-      if (had && !window.confirm(`Replace the current ${had} keyframe${had === 1 ? '' : 's'} with the ${states.length} in this file?`)) {
+      const hadDrawings = incoming ? app.drawings.length : 0;
+      // Ask only about what would actually be lost — the drawings clause is
+      // there only when the file brings its own and there are some to replace.
+      const losing = [
+        had ? `${had} keyframe${had === 1 ? '' : 's'}` : null,
+        hadDrawings ? `${hadDrawings} floor drawing${hadDrawings === 1 ? '' : 's'}` : null,
+      ].filter(Boolean);
+      const bringing = [
+        `${states.length} keyframe${states.length === 1 ? '' : 's'}`,
+        incoming ? `${incoming.length} drawing${incoming.length === 1 ? '' : 's'}` : null,
+      ].filter(Boolean);
+      if (losing.length && !window.confirm(`Replace the current ${losing.join(' and ')} with the ${bringing.join(' and ')} in this file?`)) {
         e.target.value = '';
         return;
       }
       app.pushHistory();
+      // Drawings first: the keyframes' kf.draw ids name drawings, so the
+      // diagram they point at should be on the floor before they land.
+      if (incoming) app.setDrawings(incoming);
       app.setSeqStates(states);
-      app.status(`Loaded ${states.length} keyframes.`, 'info');
+      app.status(`Loaded ${bringing.join(' and ')}.`, 'info');
     } catch {
       app.status('Could not read that file as a sequence.', 'error');
     }
@@ -2295,23 +2703,24 @@ export function initUI(app) {
       for (const r of chipRows) paintChip(r.chip, r.swatch, r.part);
     }
     if (v.muscles) {
+      // A SLIDE replaces the running look outright, so any keyframe override
+      // showing is dropped rather than left sitting on top of it. (This is the
+      // deliberate difference from a keyframe's own highlighting — see
+      // setMuscleOverride: a slide is asked for, a scrub is passed through.)
+      takeBackMuscleLook();
       hiddenMuscles.clear();
       for (const m of v.muscles.hidden ?? []) hiddenMuscles.add(m);
       litMuscles.clear();
       for (const m of v.muscles.lit ?? []) litMuscles.add(m);
       // A colour dropped from the slide goes back to the default amber, or a
-      // belly recoloured since would keep a colour this slide never had.
-      for (const label of muscleColors.keys()) app.setMuscleColor(label, null);
+      // belly recoloured since would keep a colour this slide never had —
+      // pushMuscleLook clears by difference, which is that rule.
       muscleColors.clear();
-      for (const [label, hex] of v.muscles.colors ?? []) {
-        muscleColors.set(label, hex);
-        app.setMuscleColor(label, hex);
-      }
+      for (const [label, hex] of v.muscles.colors ?? []) muscleColors.set(label, hex);
       muscleTint.value = v.muscles.tint ?? 100;
       syncMuscleTint();
       app.setMuscleHidden(hiddenMuscles);
-      app.setMuscleLit(litMuscles);
-      muscleClearHl.disabled = litMuscles.size === 0;
+      pushMuscleLook();
       saveMuscleLook(); // the slide's look is now the running look
       renderMuscleList();
     }
@@ -2326,6 +2735,11 @@ export function initUI(app) {
   return {
     getViewState,
     applyViewState,
+    // A sequence keyframe's own highlighting, and what a keyframe captures.
+    // Driven from main.js's applyKeyframeExtras; see setMuscleOverride for why
+    // neither one touches the saved running look.
+    setMuscleOverride,
+    muscleLookNow,
     onPresentChanged: syncPresent,
     // Drive the frame through its own control so the dropdown keeps telling
     // the truth — Present mode forces 16:9, and a select left reading "Fill
@@ -2365,8 +2779,14 @@ export function initUI(app) {
     onRecordingChanged() {
       syncRecordButtons();
     },
-    // A drawing was added, removed, or cleared.
-    onDrawingsChanged: syncDrawButtons,
+    // A drawing was added, removed, restyled, re-shaped, hidden or cleared —
+    // every mutation lands here, which is what makes this the one save point.
+    onDrawingsChanged() {
+      syncDrawButtons();
+      saveDrawings();
+      const n = app.drawings.length;
+      if (n !== lastDrawCount) { lastDrawCount = n; renderSequence(); }
+    },
     // A drawing was selected or deselected in the 3D view.
     onDrawSelectionChanged() {
       syncDrawButtons();

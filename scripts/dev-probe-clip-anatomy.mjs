@@ -372,9 +372,25 @@ for (const id of ids) {
         // (Not for a belly whose nodeB IS the toes — the long-extensor tendons —
         // where the tail is the whole nodeB share and the cluster would empty.)
         const tw = /^toes/.test(mu.sm.nodeB.userData.jointName) ? null : mu.sm.tail?.w;
+        // The TRUNK FIELD is the same exemption for the same reason: a belly
+        // anchored on `chest` / `pelvis` takes that side from the vertebral
+        // column's per-vertebra frames (Figure.#bindTrunk), so tissue saturated
+        // toward the rig node is, by design, NOT rigid in the rig node's frame —
+        // it is rigid on its own vertebra or rib, which turns by its own share.
+        // Left in, every trunk clip reads the whole back as unglued (latissimus
+        // 44 mm in tr_rot, 124 mm in tr_flex — all of it the origin staying on
+        // the spine and pelvis). Only tissue the field leaves wholly on the rig
+        // frame stays in the cluster; whether the rest stays on ITS bone is
+        // dev-verify-trunk-muscles.mjs's question, asked of the rendered bones.
+        const tr = mu.sm.trunk;
+        const own = tr ? (tr.own === 18 ? 2 : 3) : 0;
+        const onRig = (i) => !tr || tr.w[i * 4 + own] >= 0.98;
+        const trA = tr?.sideA ? onRig : () => true;
+        const trB = tr && !tr.sideA ? onRig : () => true;
         return {
           ...mu, mesh: undefined, sm: undefined, rigid: false, minW: +minW.toFixed(4), maxW: +maxW.toFixed(4),
-          _keepA: (i) => w[i] <= loCut, _keepB: (i) => w[i] >= hiCut && !(tw && tw[i] > 0.02),
+          _keepA: (i) => w[i] <= loCut && trA(i),
+          _keepB: (i) => w[i] >= hiCut && !(tw && tw[i] > 0.02) && trB(i),
         };
       });
 

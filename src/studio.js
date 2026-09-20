@@ -85,6 +85,8 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
     hover: null,         // { text, x, y, remove } label-mode cursor preview (CSS px)
     titlePos: null,      // dragged title placement: { x, y } FRACTIONS of the frame
     titleBox: null,      // where the title last drew, canvas px (the drag target)
+    caption: '',         // the on-screen caption (a sequence keyframe's own words)
+    captionBox: null,    // where the caption last drew, canvas px — LIVE pass only
     recorder: null,
     clip: null,          // the active movement clip (see enterClip)
     onClipTick: null,    // UI callback: (progress 0..1, angleDeg)
@@ -153,18 +155,103 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
     studio.layoutCanvas();
   };
 
+  // ------------------------------------------------------------ the caption
+  // A line of the teacher's own words over the picture — today a sequence
+  // keyframe's `kf.caption`, set through studio.setCaption.
+  //
+  // WHY THE BOTTOM BAND. Every other region of the frame is already spoken
+  // for: the clip title hangs over the top of the shot's own points (and the
+  // user can drag it anywhere, which titleBottom tracks), and the callout
+  // columns run down both margins. The bottom strip is the one band nothing
+  // else claims — and it is where a viewer already expects a subtitle, so the
+  // eye finds it without leaving the dancer. It reserves its own height from
+  // the callout layout (`bottom` below), so a long caption pushes the columns
+  // up instead of being written over by them.
+  //
+  // Sizes are FRACTIONS of the frame height like every other overlay element,
+  // so the live view, a 1080p recording and a 4K photo show the same picture.
+  const CAPTION_FONT = 0.034;  // cap height / frame height — under the title's 0.052
+  const CAPTION_MAX_W = 0.78;  // the text box's width / frame width
+  const CAPTION_LINES = 3;     // more than this is a paragraph, not a caption
+
+  // Greedy word wrap. A caption longer than the band is the author's problem,
+  // not the audience's: keep what fits and say there was more.
+  function captionLines(ctx, text, maxW) {
+    const lines = [];
+    let line = '';
+    for (const word of text.split(/\s+/).filter(Boolean)) {
+      const next = line ? `${line} ${word}` : word;
+      if (line && ctx.measureText(next).width > maxW) { lines.push(line); line = word; }
+      else line = next;
+    }
+    if (line) lines.push(line);
+    if (lines.length <= CAPTION_LINES) return lines;
+    const kept = lines.slice(0, CAPTION_LINES);
+    kept[CAPTION_LINES - 1] += '…';
+    return kept;
+  }
+
+  // Returns the height the callout columns must leave clear at the foot of the
+  // frame (0 when there is no caption).
+  function drawCaption(ctx, w, h, theme) {
+    const text = studio.caption;
+    if (!text) {
+      if (ctx === hudCtx) studio.captionBox = null;
+      return 0;
+    }
+    const font = h * CAPTION_FONT;
+    ctx.font = `600 ${font}px "Segoe UI", system-ui, sans-serif`;
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'center';
+    const padX = font * 0.85;
+    const padY = font * 0.5;
+    const lineH = font * 1.34;
+    const lines = captionLines(ctx, text, w * CAPTION_MAX_W - padX * 2);
+    const bw = Math.min(w * CAPTION_MAX_W,
+      Math.max(...lines.map((l) => ctx.measureText(l).width)) + padX * 2);
+    const bh = lines.length * lineH + padY * 2;
+    const cx = w / 2;
+    const top = h - h * 0.035 - bh;
+    ctx.beginPath();
+    ctx.roundRect(cx - bw / 2, top, bw, bh, font * 0.42);
+    ctx.fillStyle = theme.pill;
+    ctx.fill();
+    ctx.strokeStyle = theme.edge;
+    ctx.lineWidth = Math.max(1, font * 0.05);
+    ctx.stroke();
+    ctx.fillStyle = theme.text;
+    lines.forEach((l, i) => ctx.fillText(l, cx, top + padY + lineH * (i + 0.5)));
+    // Only the LIVE overlay records the box, the same rule studio.titleBox
+    // follows: an export redraws the same block at its own resolution.
+    if (ctx === hudCtx) {
+      studio.captionBox = { left: cx - bw / 2, top, width: bw, height: bh, lines: lines.length };
+    }
+    return h - top + h * 0.012;
+  }
+
+  // The caption is applied from the keyframe being travelled FROM, i.e. several
+  // times a second while a sequence plays, so this has to be free when nothing
+  // changed. Returns whether it actually changed (main.js redraws on true).
+  studio.setCaption = (text) => {
+    const next = typeof text === 'string' ? text.trim() : '';
+    if (next === studio.caption) return false;
+    studio.caption = next;
+    return true;
+  };
+
   // ------------------------------------------------------------- the overlay
   function drawOverlay(ctx, w, h) {
     ctx.clearRect(0, 0, w, h);
     const theme = studio.theme;
     const top = studio.clip ? drawClipOverlay(ctx, w, h, theme) : 0;
+    const bottom = drawCaption(ctx, w, h, theme);
     // In the window frame the sidebar covers the canvas's right edge; keep the
     // callouts out from under it (the slide frame already sits beside it).
     const right = studio.frame === 'window' ? sidebarWidth() * (w / (gl.clientWidth || w)) : 0;
     // Only the live pass is kept: an export redraws the same callouts at its own
     // resolution, and the pointer hit-tests against what is on screen.
     const record = ctx === hudCtx;
-    const placed = labels.draw(ctx, camera, w, h, theme, { top, right, record });
+    const placed = labels.draw(ctx, camera, w, h, theme, { top, right, bottom, record });
     if (record) studio.lastLayout = placed;
     if (studio.hover && ctx === hudCtx) {
       const k = w / (gl.clientWidth || w); // CSS px → canvas px

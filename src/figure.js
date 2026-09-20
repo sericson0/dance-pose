@@ -5,6 +5,8 @@ import {
 } from './skeletonDef.js';
 import { buildSkeleton, buildMuscles } from './anatomy.js';
 import { LIMB_BASES, reverseWinding, BODY_RETARGET, normBoneName } from './skeletonMesh.js';
+import { SpineColumn } from './spineColumn.js';
+import { PointGrid } from './pointGrid.js';
 import { RIG_CALIBRATION } from './rigCalibration.js';
 import { ENDPOINT_FITS, regionCentroid, axisFrame } from './landmarks.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
@@ -93,6 +95,14 @@ function hornRotation(P, Q, W) {
 // 13.8/12.6/27.0° → clothed 8.5/7.3/16.1°). The thumb (ray 1) and middle
 // (ray 3, the reference) are left alone; index/ring/pinky adduct toward middle.
 const HAND_DESPLAY = 0.4;
+
+// How close to a bone a `spread` sheet's tissue must lie to be PINNED to it
+// (wholly at the first distance, not at all by the second; fractions of
+// stature — ~12 and ~35 mm; the near distance has to clear the grain of
+// #boneCloud's sub-sampled surface, or tissue lying ON a rib reads as several
+// mm off it and is only four-fifths pinned). See the spread branch of
+// #addSkinnedMuscle.
+const SPREAD_PIN = [0.007, 0.02];
 
 // Scratch objects for per-frame muscle skinning (updateMuscleSkin), reused so
 // the hot loop allocates nothing.
@@ -314,6 +324,7 @@ export class Figure {
     // One entry per toe: its phalanx meshes and the metatarsal head they hinge
     // about (see #buildToeDigits; read every frame by syncAtlasNodes).
     this._toeDigits = [];
+    this.spineColumn = null;
 
     // Joint hierarchy. ANY heeled figure raises its RIG ankle node (and, riding
     // them, the toes) by the heel height: a real heel lifts the ankle joint off
@@ -369,6 +380,10 @@ export class Figure {
     if (this.skeletonMesh) {
       this.#buildAtlasNodes(atlasRest);
       this.#buildMeshSkeleton();
+      // Spread the lumbar and thoracic joints' rotation along the vertebral
+      // column instead of hinging two rigid blocks (display only — see
+      // spineColumn.js). Bound here, at rest, before anything reads the bones.
+      this.spineColumn = new SpineColumn(this);
     } else buildSkeleton(this);
 
     // Joint pick/display spheres (always raycastable; opacity follows skeleton layer).
@@ -666,6 +681,9 @@ export class Figure {
         mesh.matrixWorldNeedsUpdate = true;
       });
     }
+    // The vertebral column bends as a curve between the pelvis and the chest
+    // (free unless the spine or chest joint has turned since the last call).
+    this.spineColumn?.update();
   }
 
   // Attach the imported atlas muscles to our joint tree. They live in the same
@@ -797,9 +815,29 @@ export class Figure {
         if (p > pMax) pMax = p;
       }
       const span = Math.max(pMax - pMin, 1e-6);
+      // The ramp alone leaves both ATTACHMENTS part-committed: the iliac crest
+      // climbs as it runs back, so tissue lying on it sits well up the belly's
+      // own extent (internal oblique's crest origin averaged ~0.3 toward the
+      // chest) and slid 27 mm along the crest in a 43° twist, 60 mm in trunk
+      // flexion; the costal end is the same mirrored. So the ends are pinned by
+      // CONTACT — tissue on the pelvis is the pelvis's, tissue on the cage the
+      // chest's — fading back into the ramp over SPREAD_PIN, and the free sheet
+      // between them shears exactly as before.
+      const cloudA = this.#boneCloud(nodeA, gInv, true), cloudB = this.#boneCloud(nodeB, gInv, true);
+      const [pinNear, pinFar] = SPREAD_PIN.map((f) => f * this.height);
+      const pin = (p, cloud) => {
+        if (!cloud.length) return 0;
+        const d = PointGrid.of(cloud).nearest(p.x, p.y, p.z, pinFar);
+        const u = THREE.MathUtils.clamp((d - pinNear) / (pinFar - pinNear), 0, 1);
+        return 1 - u * u * (3 - 2 * u);
+      };
       for (let i = 0; i < count; i++) {
         const t = THREE.MathUtils.clamp((sArr[i] - pMin) / span, 0, 1);
-        weight[i] = t * t * (3 - 2 * t); // smoothstep, 0 at nodeA end → 1 at nodeB
+        let w = t * t * (3 - 2 * t); // smoothstep, 0 at nodeA end → 1 at nodeB
+        v.fromBufferAttribute(pos, i);
+        w *= 1 - pin(v, cloudA);
+        w += (1 - w) * pin(v, cloudB);
+        weight[i] = w;
       }
     } else {
       // The muscle spans the deeper (child) of its two joints. Pick the crossed
@@ -910,8 +948,42 @@ export class Figure {
     mesh.userData.skinNode = originNode; // highlight groups it with this joint
     this.group.add(mesh);
     this.layerMeshes.muscle.push(mesh);
-    this._skinMuscles.push({ mesh, nodeA, nodeB, weight, bindPos, bindNrm, invA, invB });
+    const trunk = this.#bindTrunk(pos, nodeA, nodeB, gInv, mode);
+    this._skinMuscles.push({ mesh, nodeA, nodeB, weight, bindPos, bindNrm, invA, invB, trunk });
     return mesh;
+  }
+
+  // A belly anchored on the TRUNK follows the vertebral column's curve on that
+  // side, not the one rigid rig frame (`chest` / `pelvis`) it is nominally
+  // skinned to — see SpineColumn.bindTrunk for why and for the measurements.
+  // Returns the per-vertex trunk weights plus which of the two skin frames they
+  // replace (`sideA`), or null: no column, no trunk node, or a belly that lies
+  // wholly where its rig frame is already exact (pectoralis major on the front
+  // of the cage, every hip muscle on the pelvis), which then costs nothing.
+  //
+  // The abdominal wall (`spread`) spans pelvis→ribs over NO bone, and its
+  // full-length ramp between the two rig frames is already the even shear a
+  // free sheet should take, so it keeps both — except where its upper end lies
+  // ON the ribs, which takes those ribs' frames (`ribsOnly`). The whole field
+  // would crowd the twist into the few cm under the costal margin, because in
+  // front of the lumbar spine "the vertebra at this height" has barely turned.
+  #bindTrunk(pos, nodeA, nodeB, gInv, mode) {
+    const column = this.spineColumn;
+    if (!column?.vertebrae.length) return null;
+    const { chest, pelvis, spine } = this.nodes;
+    const ownOf = (n) => (n === chest ? 'chest' : n === pelvis ? 'pelvis' : null);
+    const ribsOnly = mode === 'spread';
+    const sideA = !ribsOnly && ownOf(nodeA) !== null;
+    const own = ribsOnly ? ownOf(nodeB) : ownOf(nodeA) ?? ownOf(nodeB);
+    if (!own || (ribsOnly && own !== 'chest')) return null;
+    // One array for "the trunk above the pelvis", kept: PointGrid caches per array.
+    if (!this._columnCloud) {
+      const above = [spine, chest].map((n) => this.#boneCloud(n, gInv));
+      this._columnCloud = new Float32Array(above[0].length + above[1].length);
+      this._columnCloud.set(above[0]); this._columnCloud.set(above[1], above[0].length);
+    }
+    const trunk = column.bindTrunk(pos, own, this.#boneCloud(pelvis, gInv), this._columnCloud, { ribsOnly });
+    return trunk && { ...trunk, sideA };
   }
 
   // Skin weights from CONTACT: each vertex is shared between the two bones in
@@ -967,13 +1039,18 @@ export class Figure {
   // time nobody asked for, and the coarse cloud costs almost nothing — measured
   // on gluteus maximus, the origin holds to 1.1 mm against 0.9 mm for a cloud
   // five times denser. Cached per node; both sides measure against one pelvis.
-  #boneCloud(node, gInv) {
+  // `fine` asks for a cloud three times as dense, for a test that turns on a
+  // few mm: the ribcage is by far the largest surface hung on one node, so at
+  // 3000 points its grain is ~8 mm and the tip of a costal cartilage can read
+  // 15 mm from "the bone" it is touching.
+  #boneCloud(node, gInv, fine = false) {
     this._boneClouds ??= new Map();
-    let cloud = this._boneClouds.get(node);
+    const cache = fine ? (this._boneCloudsFine ??= new Map()) : this._boneClouds;
+    let cloud = cache.get(node);
     if (cloud) return cloud;
     const meshes = node.children.filter((c) => c.isMesh && c.userData.boneRanges);
-    cloud = this.#meshCloud(meshes, gInv);
-    this._boneClouds.set(node, cloud);
+    cloud = this.#meshCloud(meshes, gInv, fine ? 9000 : 3000);
+    cache.set(node, cloud);
     return cloud;
   }
 
@@ -1030,8 +1107,17 @@ export class Figure {
   }
 
   // Re-skin every bi-articular muscle from its two joints' current transforms.
-  // Called each frame while the muscle layer is visible (skipped otherwise, so
-  // it costs nothing in the skeleton/body views). Uses dual-quaternion skinning
+  // Called each frame while ANY belly is on screen — the muscle view, or the
+  // skeleton view with something lit in the Muscles panel — and skipped
+  // otherwise, so it still costs nothing in the plain skeleton/body views. The
+  // gate is `_muscleShowing`, cached by #syncMuscleVisibility, NOT `layers
+  // .muscle`: a belly lit over the bare bones is skinned like any other, and on
+  // the old layer test it froze in its bind pose and visibly came away from the
+  // posed skeleton (measured through a 90° knee bend, as the centroid of the
+  // tissue committed to the far node: biceps femoris's common tendon travels
+  // 33.8 mm with this guard and exactly 0.0 mm with the old one).
+  // Bellies that are not on screen are skipped individually, so lighting one in
+  // the skeleton view costs one belly rather than all ~50. Uses dual-quaternion skinning
   // (DQS), not linear blend: the two joint deltas are rigid transforms, so
   // blending them as dual quaternions rotates each vertex along the shortest
   // arc and preserves volume. Plain linear blending collapses the belly toward
@@ -1039,7 +1125,7 @@ export class Figure {
   // muscles sink through the bone or pop off. Figure-local space; assumes
   // group.matrixWorld is already current.
   updateMuscleSkin() {
-    if (!this._skinMuscles.length || !this.layers?.muscle || !this.group.visible) return;
+    if (!this._skinMuscles.length || !this._muscleShowing || !this.group.visible) return;
     const gInv = _gInv.copy(this.group.matrixWorld).invert();
     // Each toe's rigid delta since bind, as a dual quaternion: the toes node's
     // frame shifted onto that toe's own hinge (the same offset syncAtlasNodes
@@ -1055,7 +1141,9 @@ export class Figure {
       q[6] = 0.5 * (_tC.x * _qC.y - _tC.y * _qC.x + _tC.z * _qC.w);
       q[7] = 0.5 * (-_tC.x * _qC.x - _tC.y * _qC.y - _tC.z * _qC.z);
     }
+    let TD = null; // the trunk frames, fetched once and only if a belly needs them
     for (const sm of this._skinMuscles) {
+      if (!sm.mesh.visible) continue; // nothing on screen to deform
       // Rigid delta of each joint since bind, in figure-local space.
       const dA = _dA.multiplyMatrices(gInv, sm.nodeA.matrixWorld).multiply(sm.invA);
       const dB = _dB.multiplyMatrices(gInv, sm.nodeB.matrixWorld).multiply(sm.invB);
@@ -1081,18 +1169,48 @@ export class Figure {
       const geom = sm.mesh.geometry;
       const parr = geom.attributes.position.array;
       const narr = geom.attributes.normal.array;
-      const { bindPos, bindNrm, weight, tail } = sm;
+      const { bindPos, bindNrm, weight, tail, trunk } = sm;
+      // A trunk-anchored belly takes its trunk side from the vertebral column's
+      // frames, per vertex, in place of the one rigid rig frame (#bindTrunk).
+      // The chain arrives in its own hemisphere; `ts` turns it into the one this
+      // belly's two frames were just put in, read off the rig frame it replaces.
+      let tk = null, tw = null, ts = 1, tA = false;
+      if (trunk && this.spineColumn) {
+        TD ??= this.spineColumn.trunkDQ(gInv);
+        tk = trunk.k; tw = trunk.w; tA = trunk.sideA;
+        const o = trunk.own * 8;
+        const dot = tA
+          ? TD[o] * arx + TD[o + 1] * ary + TD[o + 2] * arz + TD[o + 3] * arw
+          : TD[o] * brx + TD[o + 1] * bry + TD[o + 2] * brz + TD[o + 3] * brw;
+        if (dot < 0) ts = -1;
+      }
+      let a0 = arx, a1 = ary, a2 = arz, a3 = arw, a4 = adx, a5 = ady, a6 = adz, a7 = adw;
+      let b0 = brx, b1 = bry, b2 = brz, b3 = brw, b4 = bdx, b5 = bdy, b6 = bdz, b7 = bdw;
       for (let i = 0, j = 0; i < weight.length; i++, j += 3) {
         let wb = weight[i];
         const wa = 1 - wb;
         // A toe tail hands part of nodeB's share on to the toe it lies along.
         const wc = tail ? wb * tail.w[i] : 0;
         wb -= wc;
+        if (tk) {
+          const o = i * 4, e = tk[i] * 8;
+          const c0 = tw[o] * ts, c1 = tw[o + 1] * ts, c2 = tw[o + 2] * ts, c3 = tw[o + 3] * ts;
+          const t0 = c0 * TD[e] + c1 * TD[e + 8] + c2 * TD[144] + c3 * TD[0];
+          const t1 = c0 * TD[e + 1] + c1 * TD[e + 9] + c2 * TD[145] + c3 * TD[1];
+          const t2 = c0 * TD[e + 2] + c1 * TD[e + 10] + c2 * TD[146] + c3 * TD[2];
+          const t3 = c0 * TD[e + 3] + c1 * TD[e + 11] + c2 * TD[147] + c3 * TD[3];
+          const t4 = c0 * TD[e + 4] + c1 * TD[e + 12] + c2 * TD[148] + c3 * TD[4];
+          const t5 = c0 * TD[e + 5] + c1 * TD[e + 13] + c2 * TD[149] + c3 * TD[5];
+          const t6 = c0 * TD[e + 6] + c1 * TD[e + 14] + c2 * TD[150] + c3 * TD[6];
+          const t7 = c0 * TD[e + 7] + c1 * TD[e + 15] + c2 * TD[151] + c3 * TD[7];
+          if (tA) { a0 = t0; a1 = t1; a2 = t2; a3 = t3; a4 = t4; a5 = t5; a6 = t6; a7 = t7; }
+          else { b0 = t0; b1 = t1; b2 = t2; b3 = t3; b4 = t4; b5 = t5; b6 = t6; b7 = t7; }
+        }
         // Blend real + dual parts, then renormalize the real part.
-        let rx = arx * wa + brx * wb, ry = ary * wa + bry * wb;
-        let rz = arz * wa + brz * wb, rw = arw * wa + brw * wb;
-        let dx = adx * wa + bdx * wb, dy = ady * wa + bdy * wb;
-        let dz = adz * wa + bdz * wb, dw = adw * wa + bdw * wb;
+        let rx = a0 * wa + b0 * wb, ry = a1 * wa + b1 * wb;
+        let rz = a2 * wa + b2 * wb, rw = a3 * wa + b3 * wb;
+        let dx = a4 * wa + b4 * wb, dy = a5 * wa + b5 * wb;
+        let dz = a6 * wa + b6 * wb, dw = a7 * wa + b7 * wb;
         if (wc > 0) {
           const c = tail.digits[tail.idx[i]].dq;
           // Same hemisphere as A, like B above.
@@ -2655,14 +2773,21 @@ export class Figure {
   // Muscles panel: hide a set of bellies (render them nearly transparent) and/or
   // highlight a set (recolour + glow). Labels match userData.muscleName, so both
   // the left and right copy of a named belly respond together.
+  // Both also re-run the visibility pass: in the SKELETON view the lit set is
+  // what decides which bellies are on screen at all (see #syncMuscleVisibility),
+  // so lighting one there has to show it at once rather than on the next layer
+  // switch. In the muscle view the pass is a no-op — everything is visible there
+  // whatever the panel says.
   setMuscleHidden(labels) {
     this.hiddenMuscles = labels && labels.size ? new Set(labels) : null;
     this.#applyMuscleStyle();
+    this.#syncMuscleVisibility();
   }
 
   setMuscleLit(labels) {
     this.litMuscles = labels && labels.size ? new Set(labels) : null;
     this.#applyMuscleStyle();
+    this.#syncMuscleVisibility();
   }
 
   // The colour ONE belly lights in, overriding both the default highlight amber
@@ -2713,9 +2838,50 @@ export class Figure {
   // highlight (dim the bellies outside the chosen part). Each belly owns its
   // material, so states are set in place. Fallback (procedural) muscles carry no
   // isMuscle flag and keep flowing through #applyHighlight instead.
+  // Is this belly in the Muscles panel's lit set? A bare label lights both
+  // sides; `${label}|L` / `|R` lights one (the movement clips light only the
+  // moving side's prime movers). Factored out because the skeleton view's
+  // visibility pass has to ask the same question #applyMuscleStyle does, and
+  // two copies of that key convention would drift.
+  #muscleIsLit(mesh) {
+    const lit = this.litMuscles;
+    const label = mesh.userData.muscleName;
+    if (!lit || !label) return false;
+    return lit.has(label) || lit.has(`${label}|${mesh.userData.muscleSide}`);
+  }
+
+  // Which bellies are on screen. THREE states, not two: the muscle view shows
+  // them all, the body view none, and the SKELETON view shows exactly the
+  // bellies lit in the Muscles panel over the bare bones — teaching one muscle
+  // in place without the rest of the atlas burying the skeleton. An empty lit
+  // set therefore leaves the skeleton view looking exactly as it always did,
+  // which is what let this be plain `skeleton` mode rather than a fourth entry
+  // in the dropdown. The panel's hidden set still wins (a hidden belly is
+  // hidden however it was lit), matching #applyMuscleStyle's own precedence.
+  // A body-part highlight deliberately does NOT reveal bellies here: it lights
+  // what is already shown, and the Muscles panel is the control that says which
+  // muscles this slide is about.
+  #syncMuscleVisibility() {
+    // Before the first layer pick there is nothing to decide against; the
+    // setLayers at the end of #build runs this anyway (same shape as
+    // setPickVisible's guard).
+    if (!this.layers) return;
+    const { skeleton, muscle } = this.layers;
+    let any = false;
+    for (const m of this.layerMeshes.muscle) {
+      const v = muscle || (skeleton && m.userData.isMuscle
+        && !this.hiddenMuscles?.has(m.userData.muscleName) && this.#muscleIsLit(m));
+      m.visible = v;
+      any ||= v;
+    }
+    // updateMuscleSkin runs every frame for BOTH dancers, so it must not scan
+    // ~130 meshes to find out whether it has anything to do. Cache the answer
+    // at the two points visibility can change (here) instead.
+    this._muscleShowing = any;
+  }
+
   #applyMuscleStyle() {
     const hidden = this.hiddenMuscles;
-    const lit = this.litMuscles;
     const parts = this.highlightParts;
     for (const mesh of this.layerMeshes.muscle) {
       if (!mesh.userData.isMuscle) continue;
@@ -2723,9 +2889,7 @@ export class Figure {
       let state;
       let partColor = null; // set only when the body-part highlight is what lights it
       if (hidden && hidden.has(label)) state = 'hidden';
-      // A bare label lights both sides; `${label}|L` / `|R` lights one (the
-      // movement clips light only the moving side's prime movers).
-      else if (lit && (lit.has(label) || lit.has(`${label}|${mesh.userData.muscleSide}`))) state = 'lit';
+      else if (this.#muscleIsLit(mesh)) state = 'lit';
       else if (parts) {
         const jointName = this.#jointNameOf(mesh);
         const part = jointName ? PART_OF_NODE[jointName] : null;
@@ -2804,10 +2968,14 @@ export class Figure {
     this.layers = { skeleton, body, muscle };
     for (const m of this.layerMeshes.skeleton) m.visible = skeleton;
     for (const m of this.layerMeshes.body) m.visible = body;
-    for (const m of this.layerMeshes.muscle) m.visible = muscle;
+    // Not a plain `visible = muscle`: in the skeleton view the lit bellies ride
+    // over the bones. See #syncMuscleVisibility.
+    this.#syncMuscleVisibility();
     // The shoe/heel outline stands in for the (hidden) shoe: show it whenever
     // the body avatar is off, i.e. in the skeleton and muscle views.
     for (const g of this.heelOutline) g.visible = skeleton || muscle;
+    // The column is not deformed while hidden; catch it up on the way in.
+    if (skeleton) this.spineColumn?.update();
     // Joint spheres are click targets, not anatomy: keep them faint in skeleton
     // view (the bones already show the joints) and invisible-but-clickable
     // otherwise. Raycasting ignores opacity, so picking is unaffected.

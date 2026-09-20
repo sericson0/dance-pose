@@ -450,6 +450,7 @@ scene.add(dissocLeader.group, dissocFollower.group);
 // diagrams — step directions, giro circles, labels. See draw.js.
 const drawings = new Drawings();
 drawings.setFigures([leader, follower]); // an annotation stores a dancer by index
+drawings.setCamera(camera);              // a floating text billboards toward it
 scene.add(drawings.group, drawings.previewGroup, drawings.handleGroup);
 
 // ------------------------------------------------- pose interpolation (A→B)
@@ -550,12 +551,66 @@ function statesSeconds(states) {
   return segSeconds(states).reduce((a, b) => a + b, 0);
 }
 
+// The EXTRAS a keyframe may carry beside its pose, in its own `kf` block:
+// which floor drawings it shows (`kf.draw`), its on-screen caption
+// (`kf.caption`) and its muscle highlighting (`kf.muscles`). Each reads the
+// field it owns and leaves the rest of `kf` alone, so the three features cannot
+// tread on each other — nor on a key a later one adds.
+//
+// Absent or null means "whatever the user has running", which is what makes
+// every keyframe authored before this behave exactly as it did — and it is why
+// this is safe to run from the interpolator: an untagged chain hands the
+// running state back over and over, which is the state a session that has never
+// tagged anything is already in.
+// The keyframe whose extras are on screen. Kept so an edit made WHILE that
+// keyframe is showing lands at once (a caption you are typing has to appear as
+// you type it), without having to re-derive "which keyframe is current" from
+// the scrubber — Show (seqApply) does not move the scrubber, so t is not an
+// honest answer to that question.
+let shownExtras = null;
+
+function applyKeyframeExtras(state) {
+  shownExtras = state ?? null;
+  const kf = state?.kf;
+  const ids = kf?.draw;
+  drawings.setVisibleIds(Array.isArray(ids) ? ids : null);
+  // The caption is the ONE extra with no running counterpart: the panel holds
+  // no live caption to inherit, so the neutral state is simply no caption and
+  // an untagged keyframe clears the band.
+  studio.setCaption(typeof kf?.caption === 'string' ? kf.caption : '');
+  // The muscle look DOES have a running counterpart — the Muscles panel's own
+  // lit set and colours — so an untagged keyframe hands it back rather than
+  // going dark. It is applied as a VIEW OVERRIDE that never reaches storage;
+  // see ui.setMuscleOverride for why this must not go through applyViewState.
+  app.ui?.setMuscleOverride(kf?.muscles ?? null);
+  requestRender(); // all three are view changes; main.js renders on demand
+}
+
+// Write ONE field of a keyframe's `kf` block. The block is MERGED, never
+// rebuilt: three features hang their own key here and each owns exactly one of
+// them. `value === null/undefined` deletes that key rather than writing null,
+// so a keyframe that was never tagged and one that was untagged serialize
+// identically — and an emptied block is dropped, so nothing of this feature is
+// left behind in a file that uses none of it.
+function setKfField(state, key, value) {
+  if (!state) return;
+  const kf = { ...(state.kf || {}) };
+  if (value === null || value === undefined) delete kf[key];
+  else kf[key] = value;
+  if (Object.keys(kf).length) state.kf = kf;
+  else delete state.kf;
+}
+
 // Pose the couple at t ∈ [0, 1] along a chain of couple states — the A→B
 // lerp generalized to any number of keyframes. `t` is a fraction of the whole
 // chain's RUNNING TIME, so a keyframe held longer occupies more of the
 // scrubber; with equal durations this is exactly the old equal-time split.
 // The scrubber/player of both the A/B compare and the movement sequence land here.
-function applyStatesT(states, t) {
+//
+// `extras` is the one caller that must opt OUT: updateCogTrail runs this ~289
+// times per edit to sample the COG path, and a trail rebuild is not a scrub —
+// it must not leave the floor diagram set to whatever the last sample said.
+function applyStatesT(states, t, { extras = true } = {}) {
   const segs = states.length - 1;
   const durs = segSeconds(states);
   const total = durs.reduce((a, b) => a + b, 0);
@@ -563,6 +618,12 @@ function applyStatesT(states, t) {
   let i = 0;
   while (i < segs - 1 && time > durs[i]) { time -= durs[i]; i++; }
   const u = i + THREE.MathUtils.clamp(time / durs[i], 0, 1);
+  // Extras come from the keyframe being travelled FROM and hold until the next
+  // one is REACHED — a diagram that re-picked itself every frame would flicker
+  // its way through a recorded video. The while loop above already hands over
+  // at each segment boundary, so the only place `u` can sit ON a keyframe is
+  // the end of the chain, where the last keyframe's own extras take over.
+  if (extras) applyKeyframeExtras(states[u >= i + 1 ? i + 1 : i]);
   const sA = states[i];
   const sB = states[i + 1];
   // Foot anchors first: measuring applies the endpoint poses, which the
@@ -580,6 +641,16 @@ function applyStatesT(states, t) {
 const SEQ_SEG_SECONDS = 2.4;
 const SEQ_MIN_SECONDS = 0.2;
 const SEQ_MAX_SECONDS = 30;
+// A keyframe's own label ("cross", "pivot out"). Capped because the row is one
+// line in a 320 px sidebar — a label that cannot be read in the list is not
+// identifying anything, and the cap is where the input stops taking, so the
+// user sees the limit instead of losing the tail on save.
+const SEQ_NAME_MAX = 40;
+// A keyframe's on-screen caption. Far longer than the row's label because this
+// one is a SENTENCE said to the class, not an identifier — but capped all the
+// same: the caption band wraps to three lines and then ellipsizes, and text the
+// slide cannot show is text the author cannot proof-read.
+const SEQ_CAPTION_MAX = 160;
 
 // Floor trace of the three COGs along the A→B / sequence movement, vertex-
 // colored by balance: the entity's own color while balanced, red where it
@@ -617,7 +688,8 @@ function updateCogTrail() {
   const series = { a: [], b: [], couple: [] };
   const N = 32 * (states.length - 1) + 1;
   for (let i = 0; i < N; i++) {
-    applyStatesT(states, i / (N - 1));
+    // extras: false — sampling the path is not showing a keyframe (see applyStatesT).
+    applyStatesT(states, i / (N - 1), { extras: false });
     leader.clampToFloor();
     follower.clampToFloor();
     const rep = coupleReport(leader, follower);
@@ -911,6 +983,14 @@ function toFloorV3(p) {
 // click authoring and a handle drag all accept the same two forms.
 function drawEnd(p) {
   return (p && p.joint) ? p : toFloorV3(p);
+}
+
+// The dancer an anchor names. `fig` is an index or 'leader'/'follower' (the
+// same two forms Drawings.#end takes, which is where it is finally stored as an
+// index — a record is plain JSON by construction).
+function anchorFigure(at) {
+  const i = typeof at?.fig === 'string' ? (at.fig === 'follower' ? 1 : 0) : (at?.fig ?? 0);
+  return app.figures[i] ?? null;
 }
 
 // Yaw that makes floor text at `pos` read right-way-up from the camera.
@@ -1822,11 +1902,21 @@ const app = {
     return o;
   },
 
-  // Text reads right-way-up from the current camera unless a yaw is given.
-  addDrawText(pos, text, yaw) {
-    const p = toFloorV3(pos);
-    const o = drawings.addText(p, String(text), yaw ?? textYawFromCamera(p));
+  // `pos` is a floor point ({x, z}) or a JOINT ANCHOR ({ fig, joint }), exactly
+  // as addDrawLine's ends are. Anchored, the text floats a default height above
+  // that joint and turns to face the camera; on the floor it lies flat and
+  // reads right-way-up from the current camera unless a yaw is given.
+  // `opts.lift` overrides the height (metres above the anchor, or above the
+  // floor for an unanchored text, which lifts it and billboards it too).
+  addDrawText(pos, text, yaw, opts = {}) {
+    const end = drawEnd(pos);
+    // Yaw is ignored while the text floats, but it is still worth deriving
+    // from the anchor's own position: drag the text off the dancer later and it
+    // lands on the floor readable rather than at whatever angle 0 happens to be.
+    const at = end.joint ? anchorFigure(end)?.surfacePos?.(end.joint) : end;
+    const o = drawings.addText(end, String(text), yaw ?? (at ? textYawFromCamera(at) : 0), opts);
     this.ui?.onDrawingsChanged?.();
+    requestRender();
     return o;
   },
 
@@ -1856,6 +1946,49 @@ const app = {
     this.ui?.onDrawSelectionChanged?.(null);
     this.ui?.onDrawingsChanged?.();
     requestRender();
+  },
+
+  // The whole diagram as plain JSON, and back — what ui.js saves to
+  // localStorage on every mutation and what the sequence export carries. A
+  // record is plain data by construction (an anchored end stores its dancer as
+  // an index), so this is a round trip and not a re-authoring.
+  drawingsJSON() {
+    return drawings.toJSON();
+  },
+
+  setDrawings(list) {
+    this.cancelDraw();
+    const n = drawings.fromJSON(list);
+    this.ui?.onDrawSelectionChanged?.(null);
+    this.ui?.onDrawingsChanged?.();
+    requestRender();
+    return n;
+  },
+
+  // Which drawings are on screen: an array of ids, or null for all of them.
+  // The timeline drives this from the keyframe being travelled from
+  // (applyKeyframeExtras); by hand it is how a teacher builds the subset a
+  // keyframe is then tagged with.
+  get drawVisibleIds() { return drawings.visibleIds(); },
+  get drawShownIds() { return drawings.shownIds(); },
+
+  setDrawVisibleIds(ids) {
+    const out = drawings.setVisibleIds(ids);
+    this.ui?.onDrawingsChanged?.();
+    requestRender();
+    return out;
+  },
+
+  // Hide or show ONE drawing. The filter is expanded from null (everything) to
+  // the full id list on the first hide, so a subset is always explicit — "all
+  // but this one" cannot be stored, and a keyframe that captured it would then
+  // silently gain every drawing authored after it.
+  setDrawingVisible(obj, on) {
+    const id = obj?.userData?.annotation?.id;
+    if (!id) return null;
+    const next = new Set(drawings.visibleIds() ?? drawings.ids());
+    if (on) next.add(id); else next.delete(id);
+    return this.setDrawVisibleIds([...next]);
   },
 
   // ------------------------------------------------------------ COG highlight
@@ -2707,14 +2840,37 @@ const app = {
     this.onSeqChanged();
   },
 
-  // Overwrite keyframe i with the current couple pose. Its DURATION is timing,
-  // not pose, so re-recording the pose must not silently reset it.
+  // Overwrite keyframe i with the current couple pose. ⟲ re-records the POSE,
+  // and everything else a keyframe carries is NOT pose: its duration is timing,
+  // its name is the user's label, and a later feature may hang its own block
+  // here. So the fresh couple state is spread OVER the old one rather than
+  // replacing it — an unknown field rides through untouched by construction,
+  // instead of having to be listed here and silently lost when it isn't.
   seqUpdate(i) {
-    if (!this.seqStates[i]) return;
-    const { dur } = this.seqStates[i];
-    this.seqStates[i] = this.getCoupleState(this.seqStates[i].name);
-    if (dur != null) this.seqStates[i].dur = dur;
+    const old = this.seqStates[i];
+    if (!old) return;
+    this.seqStates[i] = { ...old, ...this.getCoupleState(old.name) };
     this.onSeqChanged();
+  },
+
+  // The cap the row's input enforces, read from here so the field and the
+  // setter can never disagree about where a label stops.
+  seqNameMax: SEQ_NAME_MAX,
+  seqCaptionMax: SEQ_CAPTION_MAX,
+
+  // The keyframe's own label ("cross", "pivot out"), so a row says what it is
+  // rather than only where it sits. Empty is allowed and meaningful — the row
+  // then falls back to its index, which is never anonymous.
+  seqSetName(i, text) {
+    if (!this.seqStates[i]) return;
+    this.seqStates[i].name = String(text ?? '').trim().slice(0, SEQ_NAME_MAX);
+    this.onSeqChanged();
+  },
+
+  // The label shown for keyframe i: its name, else the positional fallback.
+  seqName(i) {
+    const s = this.seqStates[i];
+    return (s && typeof s.name === 'string' && s.name.trim()) || `Keyframe ${i + 1}`;
   },
 
   // How long keyframe i takes to reach the next one, in seconds. The LAST
@@ -2754,12 +2910,114 @@ const app = {
     });
   },
 
-  // Swap keyframe i with its neighbour at i + di (di = ±1).
-  seqMove(i, di) {
-    const j = i + di;
-    if (!this.seqStates[i] || !this.seqStates[j]) return;
-    [this.seqStates[i], this.seqStates[j]] = [this.seqStates[j], this.seqStates[i]];
+  // Lift keyframe `from` out of the chain and drop it back in at `to` — the
+  // whole reorder, however far the row travelled. It is a LIFT-AND-DROP and
+  // deliberately not a run of swaps: swapping row 1 up to position 5 would
+  // carry each row it passed one step backwards with it, so a four-step drag
+  // would rewrite five rows instead of one. `to` is clamped rather than
+  // rejected, because a drag that overshoots the ends means "first"/"last".
+  seqMoveTo(from, to) {
+    const n = this.seqStates.length;
+    if (!this.seqStates[from]) return;
+    const dest = Math.min(Math.max(to | 0, 0), n - 1);
+    if (dest === from) return;
+    const [moved] = this.seqStates.splice(from, 1);
+    this.seqStates.splice(dest, 0, moved);
     this.onSeqChanged();
+  },
+
+  // Move keyframe i by di places (di = ±1). For a neighbour this is the same
+  // as a swap, which is all any caller ever asks for.
+  seqMove(i, di) {
+    this.seqMoveTo(i, i + di);
+  },
+
+  // Which floor drawings keyframe i shows, by id — or null for all of them,
+  // which is what an untagged keyframe means and what every keyframe authored
+  // before this carries. Stored in the keyframe's `kf` block, beside whatever
+  // else hangs there.
+  seqDrawIds(i) {
+    const ids = this.seqStates[i]?.kf?.draw;
+    return Array.isArray(ids) ? [...ids] : null;
+  },
+
+  // Tag keyframe i with a subset of the diagram (or null to clear back to all).
+  // The `kf` block is MERGED, never rebuilt — see setKfField.
+  seqSetDrawIds(i, ids) {
+    const s = this.seqStates[i];
+    if (!s) return null;
+    setKfField(s, 'draw', Array.isArray(ids) ? [...ids] : null);
+    this.onSeqChanged();
+    return this.seqDrawIds(i);
+  },
+
+  // ---- per-keyframe caption ------------------------------------------------
+  // The words shown over the picture while this keyframe is the current one
+  // ("here the leader's left obliques fire"). Empty/absent = no caption, so a
+  // keyframe authored before this existed shows none.
+  seqCaption(i) {
+    const c = this.seqStates[i]?.kf?.caption;
+    return typeof c === 'string' ? c : '';
+  },
+
+  seqSetCaption(i, text) {
+    const s = this.seqStates[i];
+    if (!s) return '';
+    const clean = String(text ?? '').trim().slice(0, SEQ_CAPTION_MAX);
+    setKfField(s, 'caption', clean || null);
+    this.onSeqChanged();
+    // If that keyframe is the one showing, the band updates as it is typed
+    // rather than on the next scrub; otherwise this is a no-op re-apply.
+    if (shownExtras === s) applyKeyframeExtras(s);
+    return this.seqCaption(i);
+  },
+
+  // The caption band, driven by hand (a script, or a future live caption
+  // field). The timeline overwrites it from the keyframe it is travelling from.
+  setCaption(text) {
+    studio.setCaption(text);
+    requestRender();
+    return studio.caption;
+  },
+  caption() { return studio.caption; },
+
+  // ---- per-keyframe muscle highlighting ------------------------------------
+  // `{ lit: [label], colors: [[label, hex]] }`, in the same label keys the
+  // Muscles panel and Figure.setMuscleColor use (`label`, `label|L`, `label|R`)
+  // — or null, meaning this keyframe shows whatever the panel has running.
+  seqMuscles(i) {
+    const m = this.seqStates[i]?.kf?.muscles;
+    if (!m) return null;
+    return { lit: [...(m.lit ?? [])], colors: (m.colors ?? []).map((p) => [...p]) };
+  },
+
+  seqSetMuscles(i, muscles) {
+    const s = this.seqStates[i];
+    if (!s) return null;
+    setKfField(s, 'muscles', muscles
+      ? { lit: [...(muscles.lit ?? [])], colors: (muscles.colors ?? []).map((p) => [...p]) }
+      : null);
+    this.onSeqChanged();
+    if (shownExtras === s) applyKeyframeExtras(s);
+    return this.seqMuscles(i);
+  },
+
+  // Tag keyframe i with the highlighting that is ON SCREEN right now — the
+  // same "capture what you have arranged" gesture the drawings tag uses, and
+  // for the same reason: the teacher has just lit the bellies they mean, and a
+  // checklist of 68 atlas names identifies nothing.
+  seqCaptureMuscles(i) {
+    const look = this.ui?.muscleLookNow?.();
+    if (!look) return null;
+    return this.seqSetMuscles(i, look);
+  },
+
+  // Hand the view back to the user: no caption, and the Muscles panel's own
+  // running look. The timeline's overrides last until the timeline says
+  // otherwise, so this is the way OFF it — Clear calls it, and so does the
+  // panel when the user takes the look back by hand.
+  clearKeyframeExtras() {
+    applyKeyframeExtras(null);
   },
 
   // Jump the couple to keyframe i.
@@ -2767,6 +3025,9 @@ const app = {
     if (!this.seqStates[i]) return;
     this.pushHistory();
     this.applyCoupleState(this.seqStates[i]);
+    // Show is the timeline's other seam onto a keyframe — the scrubber and the
+    // players go through applyStatesT, this one does not.
+    applyKeyframeExtras(this.seqStates[i]);
   },
 
   // Bulk replace (import / session restore).
@@ -3430,7 +3691,7 @@ renderer.domElement.addEventListener('pointermove', (e) => {
     // An end dropped on a joint attaches there; anywhere else it lands on the
     // floor, which is also how an anchored end is detached again.
     const type = drawHandleDrag.obj?.userData.annotation?.type;
-    const anchor = (type === 'line' || type === 'arrow') ? jointAnchorAtPointer() : null;
+    const anchor = ANCHOR_TOOLS.has(type) ? jointAnchorAtPointer() : null;
     const p = anchor ? null : floorPointAtPointer();
     if (anchor || p) {
       // moveHandle rebuilds the shape from its annotation, so the object (and
@@ -3501,11 +3762,11 @@ renderer.domElement.addEventListener('pointermove', (e) => {
       renderer.domElement.style.cursor = 'grab';
       return;
     }
-    // A joint under the cursor is an ANCHOR target for a line or an arrow. The
-    // pick spheres are invisible in body view until something ghosts them, so
-    // this borrows the rotate/drag hover: you can only aim at what you can see.
-    const anchorable = app.drawTool === 'line' || app.drawTool === 'arrow';
-    const jhit = anchorable ? jointSphereHit() : null;
+    // A joint under the cursor is an ANCHOR target (a line/arrow end, or a
+    // text, which then floats above that joint). The pick spheres are invisible
+    // in body view until something ghosts them, so this borrows the rotate/drag
+    // hover: you can only aim at what you can see.
+    const jhit = ANCHOR_TOOLS.has(app.drawTool) ? jointSphereHit() : null;
     if (jhit) setHover(jhit.object.userData.figure, jhit.object);
     else clearHover();
     if (app.drawPending) {
@@ -3586,6 +3847,12 @@ function toggleCogHit(hit) {
   viz.setFront(!viz.front);
 }
 
+// The tools whose points may land on a JOINT rather than on the floor. A line
+// and an arrow anchor either end; a text anchors its one position and then
+// floats above that joint. A circle is a floor figure by nature (a giro's
+// orbit is a ring on the ground), so it is deliberately not here.
+const ANCHOR_TOOLS = new Set(['line', 'arrow', 'text']);
+
 // Two-click authoring on the floor plane: the first click anchors the shape,
 // the second commits it (Text is a single click + prompt). A click that
 // misses the floor cancels the pending shape; so does Esc or a mode change.
@@ -3611,16 +3878,19 @@ function handleDrawClick() {
     }
     if (app.drawSelected) app.selectDrawing(null);
   }
-  // A line or arrow end landing on a JOINT anchors there instead of on the
-  // floor, which is what lets a teaching line run through a dancer and stay
-  // with them. The floor stays the fallback, so nothing about the old gesture
-  // changes; circles and text are floor diagrams by nature and ignore this.
-  const joint = (app.drawTool === 'line' || app.drawTool === 'arrow') ? jointAnchorAtPointer() : null;
+  // An end landing on a JOINT anchors there instead of on the floor, which is
+  // what lets a teaching line run through a dancer and stay with them — and,
+  // for a TEXT, what floats a caption above the dancer it names. The floor
+  // stays the fallback, so nothing about the old gesture changes; a circle is a
+  // floor diagram by nature and ignores this.
+  const joint = ANCHOR_TOOLS.has(app.drawTool) ? jointAnchorAtPointer() : null;
   const p = joint ? null : floorPointAtPointer();
   if (!joint && !p) { app.cancelDraw(); return; }
   if (app.drawTool === 'text') {
-    const text = window.prompt('Label to write on the floor:');
-    if (text && text.trim()) app.addDrawText(p, text.trim());
+    const text = window.prompt(joint
+      ? `Label to float above the ${app.figures[joint.fig].name.toLowerCase()}'s ${jointWords(joint.joint)}:`
+      : 'Label to write on the floor:');
+    if (text && text.trim()) app.addDrawText(joint ?? p, text.trim());
     return;
   }
   if (!app.drawPending) {
@@ -3885,6 +4155,18 @@ function applyVizVisibility() {
   dissocFollower.setVisible(((on && vizFlags.dissoc) || clipDissoc === follower) && follower.group.visible);
 }
 
+// Re-aim the billboarded floor texts at the camera. This runs on EVERY frame
+// that goes out, including a view-only one — which is the whole point, and why
+// it is not folded into the anchored pass below. An orbit changes no pose at
+// all: it takes the idle branch, skipping the entire constraint/analysis pass,
+// so a billboard driven from there would only re-aim when a dancer happened to
+// move, and reads as stuck while the camera swings past it. `anchoredCount` is
+// the wrong gate for the same reason twice over — it counts drawings that ride
+// the POSE, and a lifted but unanchored text rides nothing.
+function refreshBillboards() {
+  if (drawings.billboardCount) drawings.updateBillboards();
+}
+
 function animate() {
   requestAnimationFrame(animate);
   // Clamp dt so returning to a backgrounded tab can't feed the animation
@@ -3902,7 +4184,7 @@ function animate() {
     // Idle: nothing changed and nothing is animating. Redraw only if the VIEW
     // still owes frames (camera damping settling, a hover glow), then skip the
     // whole constraint/analysis pass below.
-    if (renderFrames > 0) { renderFrames--; studio.renderFrame(); }
+    if (renderFrames > 0) { renderFrames--; refreshBillboards(); studio.renderFrame(); }
     return;
   }
   simFrames--;
@@ -4022,9 +4304,13 @@ function animate() {
   // syncAtlasNodes, because an anchored end reads `surfacePos` — the node the
   // visible body is welded to, which is the atlas node on a seated limb joint.
   if (drawings.anchoredCount) drawings.updateAnchored();
+  // …and a floating text re-aims at the camera on this frame too (the anchored
+  // pass has just moved it; the aim is a separate question — see above).
+  refreshBillboards();
 
-  // Deform bi-articular muscles to the current pose (no-op unless the muscle
-  // layer is showing). Runs after clampToFloor so joint matrices are current.
+  // Deform bi-articular muscles to the current pose (a no-op unless a belly is
+  // actually on screen — the muscle layer, or one lit over the bare bones in
+  // skeleton view). Runs after clampToFloor so joint matrices are current.
   leader.updateMuscleSkin();
   follower.updateMuscleSkin();
 

@@ -20,6 +20,24 @@
 // geometry (a tube, with a cone for an arrow head) whose transform is
 // refreshed each frame by updateAnchored — cheap, because the mesh is a unit
 // cylinder that is only re-placed, never rebuilt.
+//
+// TEXT takes the same anchor, in the same vocabulary: a text has ONE position,
+// so it is the a-end case of that — `posAt` beside `pos`, resolved by the same
+// endWorld — plus a `lift` in metres, which is what puts the words ABOVE the
+// joint ("click the head, get text over the head") rather than inside it. A
+// text that has left the floor is BILLBOARDED: it faces the camera outright,
+// because a label about a dancer that is legible from one seat in the room is
+// not a label. That pass is orientation only (updateBillboards) — never a
+// rebuild, which would re-render a canvas texture every frame — and it is
+// driven by the CAMERA, not by the pose, so main.js runs it on view-only
+// frames too. See the note on updateBillboards.
+//
+// Every record also carries a stable `id`. A diagram is authored work — it
+// survives a reload (toJSON/fromJSON, saved by ui.js) and a sequence keyframe
+// may name a subset of it (`kf.draw`), so a drawing needs a name that outlives
+// its Object3D. #replace builds a NEW object from the SAME record, which is
+// exactly what keeps the id through a restyle or an endpoint drag: the id is
+// in the record, never in the mesh.
 import * as THREE from 'three';
 
 const DRAW_COLOR = '#ffd27f'; // chalk amber, readable on the dark wood
@@ -28,6 +46,15 @@ const LINE_W = 0.02;         // default stroke width in metres
 const HEAD_W = 0.075;        // arrow head width at the default stroke width
 const HEAD_L = 0.1;          // arrow head length at the default stroke width
 const TEXT_H = 0.16;         // world height of a text line at the default width
+
+// How far above its anchored joint a floating text sits, in metres. Sized so
+// that anchoring to `head` clears the skull (the head joint is ~13 cm below the
+// crown on a 1.75 m figure, and the text is TEXT_H tall) — "click the head, get
+// text above the head" with nothing further to fiddle with. Coarser placement
+// is had by anchoring somewhere else (chest, wrist, ankle), which is why there
+// is no lift handle: the floor-plane handle system cannot express a height, and
+// the joint list already gives the user the choice that matters.
+const TEXT_LIFT = 0.25;
 
 // The stroke width the toolbar offers, in metres: thin enough to annotate a
 // single foot, fat enough to read from the back of a room.
@@ -51,6 +78,12 @@ const HANDLE_COLOR = 0xffffff;
 // on the way past defeats the annotation; the anchors themselves are the depth
 // cue. Shared by the tube and its arrow head.
 const ANCHORED_RENDER_ORDER = 6;
+
+// The shapes a record may describe — the guard fromJSON runs a restored record
+// past before it is handed to #build, which otherwise falls through to the text
+// branch and dies on a missing string. Stored files are user data; a corrupt or
+// hand-edited one must cost the drawings it names, not the session.
+const TYPES = new Set(['line', 'arrow', 'circle', 'text']);
 
 // One unit-cylinder, reused by every 3D stroke: a tube from (0,0,0) to (0,1,0)
 // of radius 1, so a stroke is a scale + a rotation + a position, and moving with
@@ -106,10 +139,31 @@ export class Drawings {
     // The dancers an anchored end may ride, by index (0 = leader). Stored as
     // indices in the annotation so a sequence/JSON round trip survives.
     this.figures = [];
+    // The camera a billboarded text turns to face. Held here rather than passed
+    // per call so a shape can be aimed the instant it is BUILT — a billboard
+    // that waits for the next frame to turn is unpickable and wrong-facing in
+    // between, which is the same on-demand-render trap #commit answers.
+    this.camera = null;
+    // Which drawings are on screen: a Set of ids, or null for "all of them".
+    // A visibility FILTER, not a property of any record — a keyframe names the
+    // subset it wants (setVisibleIds) and the record is untouched, so the same
+    // drawing can be in one keyframe's diagram and out of the next's.
+    this.visible = null;
+    // Serial behind #nextId. Restoring bumps it past everything it loaded, so a
+    // drawing added after a reload cannot take an id a saved one already holds.
+    this.serial = 0;
+  }
+
+  #nextId() {
+    return `d${++this.serial}`;
   }
 
   setFigures(figures) {
     this.figures = figures || [];
+  }
+
+  setCamera(camera) {
+    this.camera = camera || null;
   }
 
   // ------------------------------------------------------------- anchors
@@ -118,27 +172,47 @@ export class Drawings {
   // place that choice is resolved, so authoring, rebuilding, the per-frame
   // refresh and the handles can never disagree about where an end is.
   //
+  // `which` is the record's own key for that end — 'a'/'b' for a segment,
+  // 'pos' for a text — and the anchor always lives in `<which>At`. One rule,
+  // so a text anchor needed no parallel vocabulary.
+  //
   // The joint is read through `surfacePos`, not `worldPos`: the question a
   // drawn line asks is "where is this dancer physically", which is the node the
   // visible body is welded to — the two differ by up to ~18 cm on a flexed arm
   // (see the two-frames rule in CLAUDE.md).
   endWorld(ann, which, out = new THREE.Vector3()) {
-    const at = which === 'a' ? ann.aAt : ann.bAt;
+    const at = ann[`${which}At`];
     const fig = at && this.figures[at.fig];
     if (fig && fig.nodes?.[at.joint]) return fig.surfacePos(at.joint, out);
-    const p = which === 'a' ? ann.a : ann.b;
+    const p = ann[which];
     // An anchor whose dancer is hidden or gone falls back to the floor point
     // kept beside it, so the line stays drawable instead of collapsing.
-    return out.set(p[0], DRAW_Y, p[1]);
+    return p ? out.set(p[0], DRAW_Y, p[1]) : out.set(0, DRAW_Y, 0);
   }
 
-  // Does this shape leave the floor? Only an anchored end does that today.
+  // Does this shape RIDE A DANCER — i.e. must it be re-placed when the pose
+  // changes? An anchored end of a segment, or an anchored text.
   static anchored(ann) {
-    return !!(ann && (ann.aAt || ann.bAt));
+    return !!(ann && (ann.aAt || ann.bAt || ann.posAt));
+  }
+
+  // Has this TEXT left the floor? Either because it is anchored to a joint or
+  // because it was simply given a height. Such a text is billboarded and is
+  // drawn through the dancers; a floor text keeps its flat, yaw-oriented look.
+  static floating(ann) {
+    return ann?.type === 'text' && !!(ann.posAt || (ann.lift ?? 0) > 0);
   }
 
   get anchoredCount() {
     return this.group.children.filter((o) => Drawings.anchored(o.userData.annotation)).length;
+  }
+
+  // How many shapes must re-aim when the CAMERA moves. Deliberately a separate
+  // count from anchoredCount: the two passes answer different events, and a
+  // free-floating billboard anchors nothing at all.
+  get billboardCount() {
+    return this.group.children.filter((o) => o.userData.billboard).length
+      + this.previewGroup.children.filter((o) => o.userData.billboard).length;
   }
 
   setStyle({ color, width } = {}) {
@@ -179,10 +253,15 @@ export class Drawings {
 
   // ------------------------------------------------------------- annotations
   // Fill in whatever the caller left out, so every stored record is complete
-  // and a drawing saved before colour/width existed still rebuilds.
+  // and a drawing saved before colour/width (or before ids) existed still
+  // rebuilds. The id is minted ONCE, here, and `...ann` carries it through
+  // every later edit — restyle and moveHandle both build their new record off
+  // the old one, so a keyframe's reference to a drawing survives being
+  // recoloured, re-weighted or dragged by an end.
   #styled(ann, { color, width } = {}) {
     return {
       ...ann,
+      id: ann.id || this.#nextId(),
       color: color ?? ann.color ?? this.style.color,
       width: width ?? ann.width ?? this.style.width,
     };
@@ -252,10 +331,17 @@ export class Drawings {
       mesh.position.set(ann.center[0], DRAW_Y, ann.center[1]);
       return mesh;
     }
-    // Text lies flat on the floor; `yaw` orients it (0 = readable looking along
-    // -z). The caller usually derives yaw from the camera so the label reads
-    // right-way-up from the current viewpoint. Its size follows the stroke
-    // width, so one slider sets the weight of the whole diagram.
+    // Text either lies flat on the floor or FLOATS (anchored to a joint, or
+    // simply lifted). Flat text is oriented by `yaw` (0 = readable looking
+    // along -z), which the caller usually derives from the camera so the label
+    // reads right-way-up from the current viewpoint. `yaw` is MEANINGLESS on a
+    // floating text and is deliberately ignored there — it is still recorded,
+    // so dropping the text back onto the floor (a handle drag onto the floor
+    // plane) lands it readable instead of at an arbitrary angle.
+    //
+    // Either way the size follows the stroke width, so one slider sets the
+    // weight of the whole diagram.
+    const floating = Drawings.floating(ann);
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
     const font = '600 64px "Segoe UI", system-ui, sans-serif';
@@ -274,12 +360,42 @@ export class Drawings {
     const tex = new THREE.CanvasTexture(canvas);
     tex.colorSpace = THREE.SRGBColorSpace;
     tex.anisotropy = 8;
+    // CONSTANT WORLD SIZE, not constant screen size, and the choice is
+    // deliberate. This is GL scene content, so it shrinks with distance exactly
+    // as the dancer does: the words keep a fixed proportion to the body, which
+    // is what makes a photo or a recorded clip show the same picture as the
+    // screen, and it keeps the one stroke-width slider setting the weight of
+    // the WHOLE diagram (a floor arrow and a floating caption drawn at the same
+    // width read as the same chalk). A constant screen size would grow the text
+    // relative to the dancer as the camera pulled back, and would have to be
+    // re-derived per export resolution — which is the very problem the overlay
+    // canvas solves with its fractions of frame height, and that machinery is
+    // not available down here in the GL scene.
     const h = TEXT_H * (w / LINE_W);
     const geo = new THREE.PlaneGeometry(h * canvas.width / canvas.height, h);
-    geo.rotateX(-Math.PI / 2);
+    // A floor text lies in the floor plane; a floating one stays an upright
+    // screen-facing quad, which the billboard pass then turns each frame.
+    if (!floating) geo.rotateX(-Math.PI / 2);
     // The glyphs carry the colour (baked into the canvas), so the material
     // must not tint them a second time.
-    const mesh = new THREE.Mesh(geo, this.#material({ preview, mat: { map: tex, color: 0xffffff, opacity: preview ? 0.45 : 1 } }));
+    const mesh = new THREE.Mesh(geo, this.#material({
+      preview,
+      mat: {
+        map: tex,
+        color: 0xffffff,
+        opacity: preview ? 0.45 : 1,
+        // Like an anchored stroke, a floating text draws THROUGH the dancers:
+        // a caption about a dancer that is buried in their torso is not doing
+        // its job, and the anchor point is the depth cue.
+        ...(floating ? { depthTest: false, polygonOffset: false } : {}),
+      },
+    }));
+    if (floating) {
+      mesh.userData.anchored = true;  // → ANCHORED_RENDER_ORDER in #commit
+      mesh.userData.billboard = true; // → updateBillboards
+      this.#placeAnchored(mesh, ann);
+      return mesh;
+    }
     mesh.position.set(ann.pos[0], DRAW_Y, ann.pos[1]);
     mesh.rotation.y = ann.yaw;
     return mesh;
@@ -289,6 +405,16 @@ export class Drawings {
   // at build time and again every frame the dancers move — nothing here
   // allocates, so it is safe in the render loop.
   #placeAnchored(obj, ann) {
+    // A floating text is a single point plus a height. `lift` is applied in
+    // WORLD y (not along any joint axis): the words hang above the joint
+    // however the dancer is turned or bent, which is what a caption wants —
+    // an upside-down label over an inverted colgada is not more informative.
+    if (ann.type === 'text') {
+      this.endWorld(ann, 'pos', _pa);
+      obj.position.set(_pa.x, _pa.y + (ann.lift ?? 0), _pa.z);
+      this.#aimBillboard(obj);
+      return;
+    }
     const r = (ann.width ?? LINE_W) / 2;
     this.endWorld(ann, 'a', _pa);
     this.endWorld(ann, 'b', _pb);
@@ -306,6 +432,35 @@ export class Drawings {
       placeAlong(tube, _pa, _pb, r);
     }
     obj.updateMatrixWorld(true);
+  }
+
+  // Turn one billboard to face the camera. The FULL camera quaternion, not a
+  // yaw-only spin about world up: a yaw-only billboard goes edge-on (and so
+  // invisible) the moment the camera looks down, and the Top view is one of the
+  // four presets. Copying the camera's own rotation keeps the quad parallel to
+  // the screen from any angle, which is the whole point of the feature.
+  //
+  // `group` hangs off the scene with no transform of its own, so the camera's
+  // world quaternion and this local one are the same thing.
+  #aimBillboard(obj) {
+    if (this.camera) obj.quaternion.copy(this.camera.quaternion);
+    obj.updateMatrixWorld(true); // pickable NOW — main.js renders on demand
+  }
+
+  // Re-aim every billboarded text. ORIENTATION ONLY: rebuilding a text means
+  // re-rendering its canvas texture, which is far too expensive to do per
+  // frame, and #build stays the one place a record becomes geometry.
+  //
+  // This is a separate pass from updateAnchored on purpose, because the two
+  // answer different events. An anchored end rides the POSE, so it is refreshed
+  // in the simulation pass. A billboard tracks the CAMERA, and an orbit changes
+  // no pose at all — on a view-only frame the solve pass is skipped entirely.
+  // Gating this on `anchoredCount` (as the anchored pass is gated) would also
+  // miss a free-floating lifted text, which anchors nothing. main.js calls it
+  // from both branches of its render loop; see the note there.
+  updateBillboards() {
+    for (const o of this.group.children) if (o.userData.billboard) this.#aimBillboard(o);
+    for (const o of this.previewGroup.children) if (o.userData.billboard) this.#aimBillboard(o);
   }
 
   // Re-place every anchored shape against the dancers' current pose. main.js
@@ -340,8 +495,51 @@ export class Drawings {
       this.previewGroup.add(obj);
     } else {
       this.group.add(obj);
+      this.#applyVisible(obj);
     }
     return obj;
+  }
+
+  // ------------------------------------------------------- visibility
+  // Which committed drawings are on screen. `null` shows every one of them,
+  // which is what an untagged keyframe (and a session that has never tagged
+  // anything) means — so this is inert until someone asks for a subset.
+  //
+  // A FLAG, never a rebuild: the filter changes several times a second while a
+  // sequence plays, and it must be free. previewGroup and handleGroup are
+  // editing chrome and are deliberately not touched — a half-drawn shape and
+  // the handles of the one being edited belong to the user, not to the slide.
+  setVisibleIds(ids) {
+    this.visible = Array.isArray(ids) ? new Set(ids) : null;
+    for (const o of this.group.children) this.#applyVisible(o);
+    // Handles over a shape that has just gone off screen are handles onto
+    // nothing — and the ray would still find them (they are their own group).
+    if (this.selected && !this.selected.visible) this.select(null);
+    return this.visibleIds();
+  }
+
+  // The filter as a plain array (what a keyframe stores), or null for "all".
+  visibleIds() {
+    return this.visible ? [...this.visible] : null;
+  }
+
+  // The ids actually ON SCREEN right now, in draw order — the set a keyframe
+  // captures. Resolved against the live children rather than against `visible`,
+  // so an id left over from a deleted drawing cannot be captured.
+  shownIds() {
+    return this.group.children
+      .filter((o) => o.visible)
+      .map((o) => o.userData.annotation?.id)
+      .filter(Boolean);
+  }
+
+  ids() {
+    return this.group.children.map((o) => o.userData.annotation?.id).filter(Boolean);
+  }
+
+  #applyVisible(obj) {
+    const id = obj.userData.annotation?.id;
+    obj.visible = !this.visible || this.visible.has(id);
   }
 
   // An end passed to addLine/addArrow is either a floor point ({x, z}) or a
@@ -381,8 +579,18 @@ export class Drawings {
     return this.#commit(this.#build(ann, opts.preview), ann, opts.preview);
   }
 
+  // `pos` takes the same two end forms the segments do — a floor point
+  // ({x, z}) or a joint anchor ({ fig, joint }) — through the same #end, so a
+  // text's position is the a-end case of it and nothing here is a parallel
+  // path. An anchored text gets TEXT_LIFT by default (words go ABOVE the joint,
+  // not inside it); a floor text gets no lift unless one is asked for, which is
+  // what keeps every text authored before this byte-identical.
   addText(pos, text, yaw = 0, opts = {}) {
-    const ann = this.#styled({ type: 'text', pos: [pos.x, pos.z], text, yaw }, opts);
+    const base = this.#end(pos, { type: 'text', text, yaw }, 'pos');
+    const lift = opts.lift ?? (base.posAt ? TEXT_LIFT : 0);
+    // A plain floor text keeps the record it has always had (no `lift` key at
+    // all), so nothing about the old shape — or an old saved file — changes.
+    const ann = this.#styled(lift ? { ...base, lift } : base, opts);
     return this.#commit(this.#build(ann, opts.preview), ann, opts.preview);
   }
 
@@ -402,6 +610,10 @@ export class Drawings {
     parent.add(next);
     parent.children.splice(parent.children.indexOf(next), 1);
     parent.children.splice(at, 0, next);
+    // The rebuilt object is born visible; the filter has to be re-stamped on
+    // it, or restyling a drawing that a keyframe has filtered out would bring
+    // it back on screen.
+    if (parent === this.group) this.#applyVisible(next);
     if (this.selected === obj) {
       this.selected = next;
       this.refreshHandles();
@@ -431,7 +643,12 @@ export class Drawings {
         new THREE.Vector3(ann.center[0] + ann.radius, DRAW_Y, ann.center[1]),
       ];
     }
-    return [new THREE.Vector3(ann.pos[0], DRAW_Y, ann.pos[1])];
+    // Text: its one position, wherever that is right now — on the floor, or up
+    // in the air over a joint. Via endWorld + lift, so the handle is ON the
+    // words rather than on the floor beneath them.
+    const p = this.endWorld(ann, 'pos');
+    p.y += ann.lift ?? 0;
+    return [p];
   }
 
   // Drag handle `index` of `obj` to floor point `p` — or, with `anchor` =
@@ -452,7 +669,15 @@ export class Drawings {
       const r = Math.max(Math.hypot(p.x - ann.center[0], p.z - ann.center[1]), 0.02);
       return this.#replace(obj, { ...ann, radius: r });
     }
-    return this.#replace(obj, { ...ann, pos: [p.x, p.z] });
+    // Text takes the same two end forms as a segment's, through the same #end:
+    // dropped on a joint it anchors (and takes the default lift if it had
+    // none), dropped on the floor it detaches. A lift the text already has is
+    // KEPT through a floor move — the handle system is floor-plane oriented, so
+    // a drag is a move in x/z and height is not one of the things it says.
+    const next = { ...ann, pos: [...(ann.pos ?? [0, 0])] };
+    this.#end(anchor || p, next, 'pos');
+    if (next.posAt && !(next.lift > 0)) next.lift = TEXT_LIFT;
+    return this.#replace(obj, next);
   }
 
   // ----------------------------------------------------------- selection
@@ -507,8 +732,11 @@ export class Drawings {
   }
 
   // The committed annotation under the ray (its root object), or null.
+  // Filtered to what is SHOWN: three's raycaster does not consult `visible`,
+  // and a drawing hidden by a keyframe's filter must not take a click — you
+  // cannot select, restyle or re-shape what you cannot see.
   pickAt(raycaster) {
-    const hit = raycaster.intersectObjects(this.group.children, true)[0];
+    const hit = raycaster.intersectObjects(this.group.children.filter((o) => o.visible), true)[0];
     if (!hit) return null;
     for (let n = hit.object; n; n = n.parent) {
       if (n.parent === this.group) return n;
@@ -558,5 +786,55 @@ export class Drawings {
 
   get count() {
     return this.group.children.length;
+  }
+
+  // ---------------------------------------------------------- serialization
+  // A diagram is authored work and must survive a reload, an export and an
+  // import. The records already ARE the drawings (#build is the only path from
+  // one to the other), so there is nothing to serialize but them — and nothing
+  // to restore but a rebuild. This is why an anchored end stores its dancer as
+  // an INDEX and not as a Figure: a record is plain JSON by construction.
+  //
+  // Deep-copied on the way out so a caller that holds the result (localStorage,
+  // an export payload, a keyframe) cannot be rewritten under it by a later
+  // restyle — the live records are mutated in place nowhere, but a handed-out
+  // reference into the scene is a trap waiting for the first time they are.
+  toJSON() {
+    return JSON.parse(JSON.stringify(this.list()));
+  }
+
+  // Rebuild the whole diagram from `list`, replacing whatever is on the floor.
+  // Records go through #styled, so one saved before colour/width/ids existed
+  // gains them here rather than rebuilding into a broken shape; the serial is
+  // then carried past every id that arrived, so the next drawing authored in
+  // this session cannot collide with a restored one. Returns how many landed.
+  fromJSON(list) {
+    this.clear();
+    // A filter names ids that have just ceased to exist; the incoming diagram
+    // is whole until a keyframe asks for part of it.
+    this.visible = null;
+    if (!Array.isArray(list)) return 0;
+    // Bump the serial over EVERY incoming id before minting any, or a legacy
+    // record with no id could be handed one that a record later in the same
+    // file already holds.
+    for (const raw of list) {
+      const n = /^d(\d+)$/.exec(raw?.id ?? '');
+      if (n) this.serial = Math.max(this.serial, Number(n[1]));
+    }
+    for (const raw of list) {
+      if (!raw || !TYPES.has(raw.type)) continue;
+      // #build reads these without asking; a record missing its own geometry
+      // is not a drawing, and silently skipping it keeps the rest of the file.
+      if ((raw.type === 'line' || raw.type === 'arrow') && !(raw.a && raw.b)) continue;
+      if (raw.type === 'circle' && !(raw.center && Number.isFinite(raw.radius))) continue;
+      // A text needs somewhere to be: its floor point (every text ever saved
+      // has one, and an anchored one keeps it filled in beside the anchor) or,
+      // for a hand-written record, the anchor alone — endWorld tolerates a
+      // missing floor pair, so that one still builds.
+      if (raw.type === 'text' && !((raw.pos || raw.posAt) && typeof raw.text === 'string')) continue;
+      const ann = this.#styled(JSON.parse(JSON.stringify(raw)));
+      this.#commit(this.#build(ann, false), ann, false);
+    }
+    return this.count;
   }
 }

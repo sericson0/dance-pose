@@ -598,13 +598,14 @@ export class Labels {
   }
 
   // Place every shown label: returns [{ label, side, x, y, yFrac, ax, ay, w }].
-  // `top` reserves room for the clip title. All px.
+  // `top` reserves room for the clip title, `bottom` for the caption band at
+  // the foot of the frame (studio.drawCaption). All px.
   //
   // `record` marks the LIVE overlay pass. An export redraws everything at its
   // own resolution through the same code, so anything kept for the pointer to
   // hit-test against has to come from the pass the user is actually looking at
   // — the same rule studio.titleBox follows.
-  layout(ctx, camera, w, h, { top = 0, right = 0, record = false } = {}) {
+  layout(ctx, camera, w, h, { top = 0, bottom = 0, right = 0, record = false } = {}) {
     const font = this.size * h;
     const rowH = font * 1.75;
     const pad = font * 0.9;
@@ -630,7 +631,7 @@ export class Labels {
     // uses below, so a drag decides the same way the layout would.
     if (record) this.mid = mid;
     const wUse = w - right; // `right` px are covered (the sidebar, in window frame)
-    const slots = Math.max(1, Math.floor((h - top - pad * 2) / rowH));
+    const slots = Math.max(1, Math.floor((h - top - bottom - pad * 2) / rowH));
     for (const p of placed) {
       const fz = this.frozen?.get(p.label.id);
       p.side = fz?.side ?? p.label.force ?? (p.ax < mid ? 'left' : 'right');
@@ -674,9 +675,10 @@ export class Labels {
         if (p.fixedY === null) y = p.y + rowH;
       }
       const free = col.filter((p) => p.fixedY === null);
-      const over = free.length ? free[free.length - 1].y - (h - pad - rowH / 2) : 0;
+      const floor = h - bottom - pad - rowH / 2;
+      const over = free.length ? free[free.length - 1].y - floor : 0;
       if (over > 0) {
-        let limit = h - pad - rowH / 2;
+        let limit = floor;
         for (let i = free.length - 1; i >= 0; i--) {
           free[i].y = Math.min(free[i].y, limit);
           limit = free[i].y - rowH;
