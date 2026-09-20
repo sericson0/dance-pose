@@ -212,21 +212,54 @@ pinPendingMarker.visible = false;
 scene.add(pinPendingMarker);
 
 // -------------------------------------------------------- balance visuals
+// The COG drop line is a TUBE, not a THREE.Line. WebGL ignores
+// LineBasicMaterial.linewidth on every desktop driver, so a line has exactly
+// one width and "make it thicker" is not expressible at all; a cylinder scaled
+// per frame is. The dashes come from an alpha map repeating along the tube,
+// with the repeat re-derived from its length each frame so a dash stays the
+// same size however tall the dancer's COG sits.
+const DROP_DASH_PERIOD = 0.05; // metres per dash + gap
+const DROP_UNIT = new THREE.CylinderGeometry(1, 1, 1, 10, 1, true);
+DROP_UNIT.translate(0, 0.5, 0); // base at the origin, growing up +y
+
+function dashAlphaMap() {
+  const c = document.createElement('canvas');
+  c.width = 4;
+  c.height = 16;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, 4, 16);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, 4, 10); // ~60% dash, 40% gap
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  return tex;
+}
+
+// What the COG line's width slider offers, in metres (diameter).
+const COG_LINE_MIN = 0.002;
+const COG_LINE_MAX = 0.03;
+const COG_LINE_NAMES = { leader: 'Leader', follower: 'Follower', couple: 'Couple' };
+
 class BalanceViz {
-  constructor(colorHex) {
+  constructor(colorHex, key) {
     this.group = new THREE.Group();
     this.color = new THREE.Color(colorHex);
+    this.key = key; // 'leader' | 'follower' | 'couple', for click routing
     this.front = false; // draw the COG indicator in front of the dancers
+    this.lineWidth = 0.006;
+    this.lineColor = null; // null = the dancer's own colour
 
     this.cogBall = new THREE.Mesh(
       new THREE.SphereGeometry(0.022, 14, 10),
       new THREE.MeshBasicMaterial({ color: colorHex }),
     );
     this.cogBall.userData.viz = this; // click routing (see handleClick)
-    this.dropLine = new THREE.Line(
-      new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
-      new THREE.LineDashedMaterial({ color: colorHex, dashSize: 0.03, gapSize: 0.02, transparent: true, opacity: 0.8 }),
-    );
+    this.dropLine = new THREE.Mesh(DROP_UNIT, new THREE.MeshBasicMaterial({
+      color: colorHex, transparent: true, opacity: 0.85,
+      alphaMap: dashAlphaMap(), alphaTest: 0.4, side: THREE.DoubleSide,
+    }));
+    this.dropLine.userData.viz = this; // the line is clickable too — see cogHit
     this.marker = new THREE.Mesh(
       new THREE.RingGeometry(0.02, 0.036, 24),
       new THREE.MeshBasicMaterial({ color: 0x5fce7f, side: THREE.DoubleSide }),
@@ -246,11 +279,14 @@ class BalanceViz {
 
   update({ cog, hull, margin }) {
     this.cogBall.position.copy(cog);
-    const pts = this.dropLine.geometry.attributes.position;
-    pts.setXYZ(0, cog.x, cog.y, cog.z);
-    pts.setXYZ(1, cog.x, 0.002, cog.z);
-    pts.needsUpdate = true;
-    this.dropLine.computeLineDistances();
+    // Stand the tube from the floor up to the COG: one scale + one position,
+    // no geometry work. The alpha map's repeat follows the height so the dash
+    // pitch stays constant instead of stretching with the dancer.
+    const len = Math.max(cog.y - 0.002, 1e-4);
+    const r = this.lineWidth / 2;
+    this.dropLine.position.set(cog.x, 0.002, cog.z);
+    this.dropLine.scale.set(r, len, r);
+    this.dropLine.material.alphaMap.repeat.set(1, len / DROP_DASH_PERIOD);
     this.marker.position.set(cog.x, 0.003, cog.z);
     this.marker.material.color.set(margin !== null && margin > 0 ? 0x5fce7f : 0xe0645f);
 
@@ -287,11 +323,33 @@ class BalanceViz {
     this.cogBall.scale.setScalar(this.front ? 1.35 : 1);
     this.marker.scale.setScalar(this.front ? 1.25 : 1);
   }
+
+  // The drop line's own look. `width` is a diameter in metres; `color` null
+  // hands it back to the dancer's identity colour, which is what the ball, the
+  // hull and the stats panel all use to say WHOSE balance this is — so it is a
+  // deliberate opt-out rather than a value to be overwritten silently.
+  setLineStyle({ width, color } = {}) {
+    if (Number.isFinite(width)) {
+      this.lineWidth = THREE.MathUtils.clamp(width, COG_LINE_MIN, COG_LINE_MAX);
+    }
+    if (color !== undefined) this.lineColor = color;
+    this.dropLine.material.color.set(this.lineColor ?? this.color);
+    // Apply the radius NOW rather than waiting for the next balance pass: the
+    // viz only updates on a solve frame, and a width slider that does nothing
+    // until the dancer next moves reads as a broken slider.
+    this.dropLine.scale.x = this.lineWidth / 2;
+    this.dropLine.scale.z = this.lineWidth / 2;
+    return this.lineStyle();
+  }
+
+  lineStyle() {
+    return { width: this.lineWidth, color: this.lineColor ?? `#${this.color.getHexString()}` };
+  }
 }
 
-const vizLeader = new BalanceViz(0x7fb3e8);
-const vizFollower = new BalanceViz(0xe89ab8);
-const vizCouple = new BalanceViz(0xffe08a);
+const vizLeader = new BalanceViz(0x7fb3e8, 'leader');
+const vizFollower = new BalanceViz(0xe89ab8, 'follower');
+const vizCouple = new BalanceViz(0xffe08a, 'couple');
 scene.add(vizLeader.group, vizFollower.group, vizCouple.group);
 
 // ------------------------------------------------- dissociation visual
@@ -391,7 +449,8 @@ scene.add(dissocLeader.group, dissocFollower.group);
 // Floor annotations (Draw mode): lines / arrows / circles / text for teaching
 // diagrams — step directions, giro circles, labels. See draw.js.
 const drawings = new Drawings();
-scene.add(drawings.group, drawings.previewGroup);
+drawings.setFigures([leader, follower]); // an annotation stores a dancer by index
+scene.add(drawings.group, drawings.previewGroup, drawings.handleGroup);
 
 // ------------------------------------------------- pose interpolation (A→B)
 // Component-wise joint lerp is safe: both endpoints respect the joint limits,
@@ -473,13 +532,37 @@ function groundInterpFeet(figure, fa, fb, t) {
   figure.group.updateMatrixWorld(true);
 }
 
+// How long each segment of a keyframe chain lasts, in seconds. A keyframe's
+// own `dur` is the time it takes to reach the NEXT one, so the last keyframe
+// has no say (nothing follows it) and a chain that carries no durations at all
+// — every A/B pair, every sequence saved before this existed — falls back to
+// the shared tempo and behaves exactly as it did.
+function segSeconds(states) {
+  const out = [];
+  for (let i = 0; i < states.length - 1; i++) {
+    const d = Number(states[i]?.dur);
+    out.push(Number.isFinite(d) && d > 0 ? d : SEQ_SEG_SECONDS);
+  }
+  return out;
+}
+
+function statesSeconds(states) {
+  return segSeconds(states).reduce((a, b) => a + b, 0);
+}
+
 // Pose the couple at t ∈ [0, 1] along a chain of couple states — the A→B
-// lerp generalized to any number of keyframes (equal time per segment). The
-// scrubber/player of both the A/B compare and the movement sequence land here.
+// lerp generalized to any number of keyframes. `t` is a fraction of the whole
+// chain's RUNNING TIME, so a keyframe held longer occupies more of the
+// scrubber; with equal durations this is exactly the old equal-time split.
+// The scrubber/player of both the A/B compare and the movement sequence land here.
 function applyStatesT(states, t) {
   const segs = states.length - 1;
-  const u = THREE.MathUtils.clamp(t, 0, 1) * segs;
-  const i = Math.min(Math.floor(u), segs - 1);
+  const durs = segSeconds(states);
+  const total = durs.reduce((a, b) => a + b, 0);
+  let time = THREE.MathUtils.clamp(t, 0, 1) * total;
+  let i = 0;
+  while (i < segs - 1 && time > durs[i]) { time -= durs[i]; i++; }
+  const u = i + THREE.MathUtils.clamp(time / durs[i], 0, 1);
   const sA = states[i];
   const sB = states[i + 1];
   // Foot anchors first: measuring applies the endpoint poses, which the
@@ -492,8 +575,11 @@ function applyStatesT(states, t) {
   });
 }
 
-// Tempo shared by the A→B player and the sequence player (seconds per segment).
+// Default tempo of the A→B player and of a new keyframe (seconds per segment);
+// a keyframe can override it with its own `dur`, within these bounds.
 const SEQ_SEG_SECONDS = 2.4;
+const SEQ_MIN_SECONDS = 0.2;
+const SEQ_MAX_SECONDS = 30;
 
 // Floor trace of the three COGs along the A→B / sequence movement, vertex-
 // colored by balance: the entity's own color while balanced, red where it
@@ -818,6 +904,13 @@ function floorPointAtPointer(out = new THREE.Vector3()) {
 // Accept {x,z} / {x,y,z} / Vector3 and pin it to the floor plane.
 function toFloorV3(p) {
   return new THREE.Vector3(p.x ?? 0, 0, p.z ?? 0);
+}
+
+// A drawing END: a joint anchor ({ fig, joint }) passes through untouched, and
+// anything else is read as a floor point. ONE rule, so the scripted API, the
+// click authoring and a handle drag all accept the same two forms.
+function drawEnd(p) {
+  return (p && p.joint) ? p : toFloorV3(p);
 }
 
 // Yaw that makes floor text at `pos` read right-way-up from the camera.
@@ -1461,6 +1554,7 @@ const app = {
     this.pinPending = null; // a half-authored pin dies with its mode
     pinPendingMarker.visible = false;
     this.cancelDraw();      // …and so does a half-drawn annotation
+    this.selectDrawing(null); // …and a drawing's endpoint handles
     studio.hover = null;    // …and the Label mode's cursor preview
     this.deselect();
     // Move hips needs no click: the handle appears right away on the
@@ -1549,6 +1643,15 @@ const app = {
       this.status('Pin cancelled — the first spot was released.', 'info');
       return 'pin';
     }
+    if (this.drawSelected) {
+      this.selectDrawing(null);
+      this.status('Drawing deselected.', 'info');
+      return 'drawing';
+    }
+    if (this.cogLineSelected) {
+      this.selectCogLine(null);
+      return 'cogline';
+    }
     if (this.selected || this.ikState || this.swivelState || this.caressState) {
       this.deselect();
       this.status('Selection cleared.', 'info');
@@ -1574,6 +1677,10 @@ const app = {
     container.parentElement.classList.add('presenting');
     this.setMode('rotate'); // no gizmos, no half-authored shapes on screen
     this.deselect();
+    // The joint pick spheres go with the rest of the editing chrome: in the
+    // skeleton and muscle views they are translucent blobs ringing every joint,
+    // which belong to posing, not to a slide. They stay clickable.
+    this.setPickSpheresVisible(false);
     if (this.ui?.setFrameMode) this.ui.setFrameMode('slide'); else this.setFrame('slide');
     document.documentElement.requestFullscreen?.().catch(() => {
       // Fullscreen needs a user gesture and can be refused by policy; the
@@ -1598,6 +1705,7 @@ const app = {
     if (this.ui?.setFrameMode) this.ui.setFrameMode(frame); else this.setFrame(frame);
     if (this.presentSaved?.mode) this.setMode(this.presentSaved.mode);
     this.presentSaved = null;
+    this.setPickSpheresVisible(true);
     if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
     window.dispatchEvent(new Event('resize'));
     if (this.ui) this.ui.onPresentChanged?.();
@@ -1605,6 +1713,15 @@ const app = {
 
   togglePresent() {
     if (this.presenting) this.exitPresent(); else this.enterPresent();
+  },
+
+  // Show/hide every dancer's joint pick spheres. Hiding also drops the hover
+  // state, or the dancer the cursor happened to be over would keep its whole
+  // ghosted joint set on screen (setHover styles the set once, on entry).
+  setPickSpheresVisible(on) {
+    clearHover();
+    for (const f of this.figures) f.setPickVisible(on);
+    requestRender();
   },
 
   // Step the deck. `delta` is +1/-1; the ends are walls, not a wrap — a
@@ -1640,15 +1757,62 @@ const app = {
     drawings.clearPreview();
   },
 
-  addDrawLine(a, b) {
-    const o = drawings.addLine(toFloorV3(a), toFloorV3(b));
+  // The chalk colour and stroke width the NEXT shape is drawn in. With a
+  // drawing selected this restyles that one instead — the swatch is where you
+  // look to change a colour, so it would be a poor tool if it only ever
+  // applied to a shape that does not exist yet.
+  setDrawStyle({ color, width } = {}) {
+    drawings.setStyle({ color, width });
+    const sel = drawings.selected;
+    if (sel) drawings.restyle(sel, { color, width });
+    // A half-drawn shape survives a style change — the next pointermove
+    // redraws its rubber band in the new look.
     this.ui?.onDrawingsChanged?.();
+    requestRender();
+    return { ...drawings.style };
+  },
+
+  get drawStyle() { return { ...drawings.style }; },
+
+  // Select a committed drawing (an Object3D from app.draw.group, or null to
+  // deselect) — its endpoint handles appear, and the toolbar follows its look.
+  selectDrawing(obj) {
+    const sel = drawings.select(obj);
+    if (sel) {
+      const { color, width } = sel.userData.annotation;
+      drawings.setStyle({ color, width });
+    }
+    this.ui?.onDrawSelectionChanged?.(sel);
+    requestRender();
+    return sel;
+  },
+
+  get drawSelected() { return drawings.selected; },
+
+  // Drag one end of the selected shape. `index` is its position in
+  // Drawings.handlePoints — 0/1 for the two ends of a line or arrow, centre/rim
+  // for a circle. Scriptable so the gesture can be verified without a pointer.
+  moveDrawHandle(obj, index, point, anchor = null) {
+    const o = drawings.moveHandle(obj, index, point ? toFloorV3(point) : null, anchor);
+    this.ui?.onDrawingsChanged?.();
+    requestRender();
+    return o;
+  },
+
+  // `a`/`b` are floor points ({x, z}) or JOINT ANCHORS ({ fig, joint }) — the
+  // latter pins that end to a dancer, so the line leaves the floor and rides
+  // the pose. `fig` takes an index or 'leader'/'follower'.
+  addDrawLine(a, b) {
+    const o = drawings.addLine(drawEnd(a), drawEnd(b));
+    this.ui?.onDrawingsChanged?.();
+    requestRender();
     return o;
   },
 
   addDrawArrow(a, b) {
-    const o = drawings.addArrow(toFloorV3(a), toFloorV3(b));
+    const o = drawings.addArrow(drawEnd(a), drawEnd(b));
     this.ui?.onDrawingsChanged?.();
+    requestRender();
     return o;
   },
 
@@ -1668,13 +1832,30 @@ const app = {
 
   removeLastDrawing() {
     drawings.removeLast();
+    this.ui?.onDrawSelectionChanged?.(drawings.selected);
     this.ui?.onDrawingsChanged?.();
+    requestRender();
+  },
+
+  // Delete the selected drawing. Annotations sit outside the pose undo stack,
+  // but ⌫ Last is right there and a drawing is one gesture to redraw, so this
+  // deletes without a dialog (the bulk Clear is the one that asks).
+  removeSelectedDrawing() {
+    const sel = drawings.selected;
+    if (!sel) return false;
+    drawings.remove(sel);
+    this.ui?.onDrawSelectionChanged?.(null);
+    this.ui?.onDrawingsChanged?.();
+    requestRender();
+    return true;
   },
 
   clearDrawings() {
     this.cancelDraw();
     drawings.clear();
+    this.ui?.onDrawSelectionChanged?.(null);
     this.ui?.onDrawingsChanged?.();
+    requestRender();
   },
 
   // ------------------------------------------------------------ COG highlight
@@ -1688,6 +1869,40 @@ const app = {
 
   cogHighlight() {
     return { leader: vizLeader.front, follower: vizFollower.front, couple: vizCouple.front };
+  },
+
+  // --------------------------------------------------------- COG line style
+  // Which COG drop line the View panel's width/colour controls act on, or null
+  // for all three. Set by clicking a line in the 3D view; Esc clears it.
+  cogLineSelected: null,
+
+  selectCogLine(which) {
+    this.cogLineSelected = this.cogViz[which] ? which : null;
+    // Whatever is being styled has to be visible to style it.
+    if (this.cogLineSelected) this.cogViz[this.cogLineSelected].setFront(true);
+    this.ui?.onCogLineChanged?.(this.cogLineSelected);
+    this.status(this.cogLineSelected
+      ? `${COG_LINE_NAMES[this.cogLineSelected]} COG line selected — set its width and colour in the View panel. Esc deselects.`
+      : 'COG line deselected — width and colour now apply to all of them.', 'info');
+    requestRender();
+    return this.cogLineSelected;
+  },
+
+  // `width` is a diameter in metres, `color` a hex string (null = back to the
+  // dancer's own colour). Applies to the selected line, else to all three.
+  setCogLineStyle({ width, color } = {}) {
+    const targets = this.cogLineSelected
+      ? [this.cogViz[this.cogLineSelected]]
+      : Object.values(this.cogViz);
+    for (const v of targets) v.setLineStyle({ width, color });
+    this.ui?.onCogLineChanged?.(this.cogLineSelected);
+    requestRender();
+    return this.cogLineStyle();
+  },
+
+  cogLineStyle() {
+    const v = this.cogViz[this.cogLineSelected] ?? vizLeader;
+    return v.lineStyle();
   },
 
   // Raise/lower the pelvis (hip-height slider). A rigid root compensation
@@ -2486,15 +2701,40 @@ const app = {
 
   // Insert the current couple pose as a keyframe (appended by default).
   seqAdd(index = this.seqStates.length) {
-    this.seqStates.splice(index, 0, this.getCoupleState(`Keyframe ${this.seqStates.length + 1}`));
+    const state = this.getCoupleState(`Keyframe ${this.seqStates.length + 1}`);
+    state.dur = SEQ_SEG_SECONDS; // seconds to reach the NEXT keyframe
+    this.seqStates.splice(index, 0, state);
     this.onSeqChanged();
   },
 
-  // Overwrite keyframe i with the current couple pose.
+  // Overwrite keyframe i with the current couple pose. Its DURATION is timing,
+  // not pose, so re-recording the pose must not silently reset it.
   seqUpdate(i) {
     if (!this.seqStates[i]) return;
+    const { dur } = this.seqStates[i];
     this.seqStates[i] = this.getCoupleState(this.seqStates[i].name);
+    if (dur != null) this.seqStates[i].dur = dur;
     this.onSeqChanged();
+  },
+
+  // How long keyframe i takes to reach the next one, in seconds. The LAST
+  // keyframe has no next, so its value is carried but never played.
+  seqSetDuration(i, secs) {
+    if (!this.seqStates[i]) return;
+    const d = Number(secs);
+    if (!Number.isFinite(d) || d <= 0) return;
+    this.seqStates[i].dur = Math.min(Math.max(d, SEQ_MIN_SECONDS), SEQ_MAX_SECONDS);
+    this.onSeqChanged();
+  },
+
+  seqDuration(i) {
+    const d = Number(this.seqStates[i]?.dur);
+    return Number.isFinite(d) && d > 0 ? d : SEQ_SEG_SECONDS;
+  },
+
+  // Running time of the whole timeline, in seconds (what Play and ⏺ take).
+  seqSeconds() {
+    return this.seqStates.length >= 2 ? statesSeconds(this.seqStates) : 0;
   },
 
   // A keyframe is not pose state, so the undo stack (couple poses only) cannot
@@ -2575,7 +2815,7 @@ const app = {
     // wake on the first recording of a page, and the button used to read
     // "⏺ Recording…" throughout while capturing nothing. The clip recorder
     // already showed "⏺ Preparing…" here; this mirrors it.
-    const job = { states, t: 0, secs: SEQ_SEG_SECONDS * (states.length - 1), rec: null, arming: true };
+    const job = { states, t: 0, secs: statesSeconds(states), rec: null, arming: true };
     this.recording = job;
     if (this.ui) this.ui.onRecordingChanged();
     studio.whenEncoderReady().then(() => {
@@ -2630,8 +2870,11 @@ function hideGizmos() {
   const hidden = [];
   // The pick spheres are click targets, not anatomy: faint blobs on every joint
   // in skeleton view, so they stay out of exported pictures with the gizmos.
+  // The drawings themselves stay in shot (they ARE the teaching diagram); their
+  // endpoint handles are editing chrome and go with the gizmos.
   for (const o of [tcontrols, turnControls, ikTarget, swivelTarget, caressTarget, hipsTarget,
-    handleStrain, pins.group, pinPendingMarker, ...leader.pickSpheres, ...follower.pickSpheres]) {
+    handleStrain, pins.group, pinPendingMarker, drawings.handleGroup, drawings.previewGroup,
+    ...leader.pickSpheres, ...follower.pickSpheres]) {
     if (o.visible) { hidden.push(o); o.visible = false; }
   }
   return () => { for (const o of hidden) o.visible = true; };
@@ -2939,6 +3182,11 @@ let titleHover = false;
 // colour picker.
 let labelDrag = false;
 let labelHover = false;
+// A floor drawing's endpoint handle, armed by hover for the same reason the
+// title and the callout pills are: OrbitControls listens on this canvas too and
+// would already have started a camera rotate by the time our pointerdown ran.
+let drawHandleHover = null;
+let drawHandleDrag = null;
 const DOUBLE_TAP_MS = 400;
 let labelTap = { id: null, t: 0 };
 const canvasPoint = (e) => {
@@ -2950,10 +3198,16 @@ const canvasPoint = (e) => {
 let downPos = null;
 renderer.domElement.addEventListener('pointerdown', (e) => {
   downPos = [e.clientX, e.clientY];
-  if (titleHover && studio.beginTitleDrag(...canvasPoint(e))) titleDrag = true;
+  if (drawHandleHover) drawHandleDrag = { ...drawHandleHover };
+  else if (titleHover && studio.beginTitleDrag(...canvasPoint(e))) titleDrag = true;
   else if (labelHover && studio.beginLabelDrag(...canvasPoint(e))) labelDrag = true;
 });
 renderer.domElement.addEventListener('pointerup', (e) => {
+  if (drawHandleDrag) {
+    drawHandleDrag = null;
+    downPos = null;
+    return; // the handle took this gesture; it must not also author a shape
+  }
   if (titleDrag) {
     titleDrag = false;
     studio.endTitleDrag();
@@ -3013,11 +3267,21 @@ let hoverFigure = null;
 // The pick sphere's opacity when not hovered: faintly shown in skeleton view,
 // invisible (but still clickable) otherwise — mirrors Figure.setLayers.
 function restingOpacity(figure) {
-  return figure.layers && figure.layers.skeleton ? 0.22 : 0;
+  return (figure.picksVisible !== false && figure.layers && figure.layers.skeleton) ? 0.22 : 0;
 }
 
 function styleSphere(sphere, figure, { ghost = false, lit = false } = {}) {
   const { jointName } = sphere.userData;
+  // Presenting: the spheres are off the slide entirely, so no hover, selection
+  // or strain state may draw one back in. Checked here rather than at each
+  // call site, since every restyle path in the app funnels through this.
+  if (figure.picksVisible === false) {
+    sphere.material.emissive.set(0x000000);
+    sphere.material.opacity = 0;
+    sphere.material.depthTest = true;
+    sphere.renderOrder = 0;
+    return;
+  }
   const isSel = app.selected && app.selected.figure === figure && app.selected.jointName === jointName;
   // A joint the user just drove into its anatomical limit wears the app's
   // "anatomy says no" amber (see flagJointLimit). It is read here rather than
@@ -3159,6 +3423,23 @@ renderer.domElement.addEventListener('pointerleave', () => {
   if (labelHover && !labelDrag) { labelHover = false; orbit.enabled = true; }
 });
 renderer.domElement.addEventListener('pointermove', (e) => {
+  // Before the click-vs-drag guard below: a handle drag IS a drag, and the
+  // moves that carry it all arrive with downPos set.
+  if (drawHandleDrag) {
+    pointerRay(e);
+    // An end dropped on a joint attaches there; anywhere else it lands on the
+    // floor, which is also how an anchored end is detached again.
+    const type = drawHandleDrag.obj?.userData.annotation?.type;
+    const anchor = (type === 'line' || type === 'arrow') ? jointAnchorAtPointer() : null;
+    const p = anchor ? null : floorPointAtPointer();
+    if (anchor || p) {
+      // moveHandle rebuilds the shape from its annotation, so the object (and
+      // its handles) are replaced each move — track the replacement or the
+      // rest of the drag edits a disposed drawing.
+      drawHandleDrag.obj = app.moveDrawHandle(drawHandleDrag.obj, drawHandleDrag.index, p, anchor);
+    }
+    return;
+  }
   if (titleDrag) {
     studio.dragTitleTo(...canvasPoint(e));
     requestRender(); // overlay-only change; the solve loop may be idling
@@ -3209,12 +3490,33 @@ renderer.domElement.addEventListener('pointermove', (e) => {
   }
 
   if (app.mode === 'draw') {
-    clearHover();
-    renderer.domElement.style.cursor = 'crosshair';
-    if (app.drawPending) {
-      const p = floorPointAtPointer();
-      if (p) drawings.showPreview(app.drawTool, app.drawPending, p);
+    // An endpoint handle of the selected drawing takes the cursor: orbiting is
+    // held off so a press-and-drag moves the end instead of the camera. Like
+    // the title's, it is ASSIGNED every move rather than toggled on the edge,
+    // so a gesture that ends elsewhere can't leave orbiting switched off.
+    drawHandleHover = app.drawPending ? null : drawings.handleHit(raycaster);
+    orbit.enabled = !drawHandleHover;
+    if (drawHandleHover) {
+      clearHover();
+      renderer.domElement.style.cursor = 'grab';
+      return;
     }
+    // A joint under the cursor is an ANCHOR target for a line or an arrow. The
+    // pick spheres are invisible in body view until something ghosts them, so
+    // this borrows the rotate/drag hover: you can only aim at what you can see.
+    const anchorable = app.drawTool === 'line' || app.drawTool === 'arrow';
+    const jhit = anchorable ? jointSphereHit() : null;
+    if (jhit) setHover(jhit.object.userData.figure, jhit.object);
+    else clearHover();
+    if (app.drawPending) {
+      renderer.domElement.style.cursor = jhit ? 'pointer' : 'crosshair';
+      const end = jhit ? jointAnchorAtPointer() : floorPointAtPointer();
+      if (end) drawings.showPreview(app.drawTool, app.drawPending, end);
+      return;
+    }
+    // Over a finished drawing the click selects it rather than starting a new
+    // shape, so the cursor says so.
+    renderer.domElement.style.cursor = (jhit || drawings.pickAt(raycaster)) ? 'pointer' : 'crosshair';
     return;
   }
 
@@ -3255,9 +3557,15 @@ renderer.domElement.addEventListener('pointermove', (e) => {
 // dancers. A highlighted (in-front) ball wins the click outright — it is what
 // the user sees over everything else — otherwise the nearest of ball vs.
 // whatever the mode would pick wins, so joint/figure picking stays intact.
+// The ball OR its drop line: both are the same indicator, and a user who wants
+// to act on "the COG line" aims at the line. Being a tube rather than a
+// THREE.Line, it is something a ray can actually hit.
 function cogBallHit() {
-  const balls = [vizLeader, vizFollower, vizCouple].map((v) => v.cogBall).filter((b) => b.visible);
-  return raycaster.intersectObjects(balls, false)[0] ?? null;
+  const parts = [];
+  for (const v of [vizLeader, vizFollower, vizCouple]) {
+    if (v.cogBall.visible) parts.push(v.cogBall, v.dropLine);
+  }
+  return raycaster.intersectObjects(parts, false)[0] ?? null;
 }
 
 function cogWinsClick(cogHit, otherHit) {
@@ -3265,8 +3573,16 @@ function cogWinsClick(cogHit, otherHit) {
   return cogHit.object.userData.viz.front || !otherHit || cogHit.distance <= otherHit.distance;
 }
 
+// A click on the BALL keeps its old meaning — draw this indicator in front of
+// the dancers. A click on the LINE selects it instead, so the View panel's
+// width and colour controls act on that one dancer's line rather than on all
+// three; it is also drawn in front, since you have to see what you are styling.
 function toggleCogHit(hit) {
   const viz = hit.object.userData.viz;
+  if (hit.object === viz.dropLine) {
+    app.selectCogLine(viz.key === app.cogLineSelected ? null : viz.key);
+    return;
+  }
   viz.setFront(!viz.front);
 }
 
@@ -3282,24 +3598,68 @@ const DRAW_NEXT = {
 };
 
 function handleDrawClick() {
-  const p = floorPointAtPointer();
-  if (!p) { app.cancelDraw(); return; }
+  // A click on a finished drawing picks it up for editing — its ends get
+  // handles and the toolbar's swatch/width follow its look. Only while nothing
+  // is half-authored: mid-shape the click belongs to the shape being drawn, or
+  // a line crossing an earlier one could never be finished.
+  if (!app.drawPending) {
+    const hit = drawings.pickAt(raycaster);
+    if (hit) {
+      app.selectDrawing(hit);
+      app.status('Drawing selected — drag the ball at either end to move it (onto a joint to attach it there, onto the floor to detach), or recolour/resize it in the toolbar. Del removes it.', 'info');
+      return;
+    }
+    if (app.drawSelected) app.selectDrawing(null);
+  }
+  // A line or arrow end landing on a JOINT anchors there instead of on the
+  // floor, which is what lets a teaching line run through a dancer and stay
+  // with them. The floor stays the fallback, so nothing about the old gesture
+  // changes; circles and text are floor diagrams by nature and ignore this.
+  const joint = (app.drawTool === 'line' || app.drawTool === 'arrow') ? jointAnchorAtPointer() : null;
+  const p = joint ? null : floorPointAtPointer();
+  if (!joint && !p) { app.cancelDraw(); return; }
   if (app.drawTool === 'text') {
     const text = window.prompt('Label to write on the floor:');
     if (text && text.trim()) app.addDrawText(p, text.trim());
     return;
   }
   if (!app.drawPending) {
-    app.drawPending = p.clone();
-    drawings.showPreview(app.drawTool, app.drawPending, p);
-    app.status(DRAW_NEXT[app.drawTool] ?? 'Click the second point to finish. (Esc cancels.)', 'info');
+    app.drawPending = joint ?? p.clone();
+    drawings.showPreview(app.drawTool, app.drawPending, app.drawPending);
+    app.status(joint
+      ? `Anchored to the ${app.figures[joint.fig].name.toLowerCase()}'s ${jointWords(joint.joint)} — click the other end. (Esc cancels.)`
+      : (DRAW_NEXT[app.drawTool] ?? 'Click the second point to finish. (Esc cancels.)'), 'info');
     return;
   }
   const a = app.drawPending;
+  const b = joint ?? p;
   app.cancelDraw();
-  if (app.drawTool === 'line') app.addDrawLine(a, p);
-  else if (app.drawTool === 'arrow') app.addDrawArrow(a, p);
+  if (app.drawTool === 'line') app.addDrawLine(a, b);
+  else if (app.drawTool === 'arrow') app.addDrawArrow(a, b);
   else if (app.drawTool === 'circle') app.addDrawCircle(a, a.distanceTo(p));
+}
+
+// The joint pick sphere under the cursor, whichever dancer it belongs to.
+function jointSphereHit() {
+  const visible = app.visibleFigures();
+  return raycaster.intersectObjects(visible.flatMap((f) => f.pickSpheres), false)[0] ?? null;
+}
+
+// The joint under the cursor as a drawing anchor ({ fig, joint }), or null.
+// Deliberately NOT routed through clickTargetJoint: that resolves an endpoint
+// to its parent for SELECTION (hand_L → wrist_L), and an anchor wants the point
+// the user actually aimed at — a line to the hand should end at the hand.
+function jointAnchorAtPointer() {
+  const hit = jointSphereHit();
+  if (!hit) return null;
+  const { figure, jointName } = hit.object.userData;
+  return { fig: app.figures.indexOf(figure), joint: jointName };
+}
+
+// "wrist_L" → "left wrist", for the status line.
+function jointWords(name) {
+  const side = /_L$/.test(name) ? 'left ' : (/_R$/.test(name) ? 'right ' : '');
+  return `${side}${name.replace(/_[LR]$/, '').replace(/_/g, ' ')}`;
 }
 
 // The atlas labels of the HIGHLIGHTED muscle under the cursor, or null.
@@ -3560,7 +3920,9 @@ function animate() {
     const segs = app.seqStates.length - 1;
     if (segs < 1) app.seqPlaying = false;
     else {
-      app.seqT = Math.min(1, app.seqT + dt / (SEQ_SEG_SECONDS * segs));
+      // Per-keyframe durations: the player advances through the chain's own
+      // running time, so a keyframe given 6 s really takes 6 s.
+      app.seqT = Math.min(1, app.seqT + dt / statesSeconds(app.seqStates));
       applyStatesT(app.seqStates, app.seqT);
       if (app.seqTick) app.seqTick(app.seqT);
       if (app.seqT >= 1) {
@@ -3656,6 +4018,11 @@ function animate() {
   leader.syncAtlasNodes();
   follower.syncAtlasNodes();
 
+  // Floor drawings whose ends are pinned to joints ride the dancers. After
+  // syncAtlasNodes, because an anchored end reads `surfacePos` — the node the
+  // visible body is welded to, which is the atlas node on a seated limb joint.
+  if (drawings.anchoredCount) drawings.updateAnchored();
+
   // Deform bi-articular muscles to the current pose (no-op unless the muscle
   // layer is showing). Runs after clampToFloor so joint matrices are current.
   leader.updateMuscleSkin();
@@ -3741,6 +4108,17 @@ document.addEventListener('fullscreenchange', () => {
 // Never reached while presenting: the capture handler above consumes Escape.
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') app.cancelPending();
+});
+
+// Delete removes the selected floor drawing. Scoped to Draw mode with a
+// drawing actually selected, and never while typing into a field.
+window.addEventListener('keydown', (e) => {
+  if (e.key !== 'Delete' && e.key !== 'Backspace') return;
+  if (app.mode !== 'draw' || !app.drawSelected) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA') && t.type !== 'range') return;
+  e.preventDefault();
+  if (app.removeSelectedDrawing()) app.status('Drawing removed.', 'info');
 });
 
 window.addEventListener('keydown', (e) => {

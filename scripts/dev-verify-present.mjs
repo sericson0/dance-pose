@@ -91,6 +91,40 @@ if (on.canvasW <= framedWindowed.canvasW) {
 }
 console.log(`--- 16:9 frame: ${framedWindowed.canvasW}px windowed → ${on.canvasW}px presenting`);
 
+// ---- 1b. The joint pick spheres are editing chrome and leave the slide with
+// the rest of it. They are translucent blobs ringing every joint in the
+// skeleton and muscle views, so this is the difference between a slide of a
+// dancer and a slide of the tool. Three ways they could creep back: a layer
+// switch mid-deck (Figure.setLayers writes the resting opacity), the cursor
+// resting on a dancer (hover ghosts the whole joint set in), and the exit,
+// which has to give them back.
+const spheres = () => page.evaluate(() => {
+  const op = window.__app.leader.pickSpheres.map((s) => s.material.opacity);
+  return Math.max(...op);
+});
+const setLayer = (m) => page.evaluate((mode) => {
+  const el = document.getElementById('layer-mode');
+  el.value = mode;
+  el.dispatchEvent(new Event('change'));
+}, m);
+await setLayer('skeleton');
+await sleep(500);
+const picksPresenting = await spheres();
+if (picksPresenting !== 0) problems.push(`the pick spheres are still drawn while presenting (opacity ${picksPresenting})`);
+await setLayer('muscle');
+await sleep(300);
+await setLayer('skeleton');
+await sleep(300);
+const picksAfterLayer = await spheres();
+if (picksAfterLayer !== 0) problems.push(`a layer switch mid-deck re-lit the pick spheres (opacity ${picksAfterLayer})`);
+await page.mouse.move(750, 450);
+await sleep(250);
+await page.mouse.move(752, 452);
+await sleep(250);
+const picksAfterHover = await spheres();
+if (picksAfterHover !== 0) problems.push(`hovering a dancer while presenting re-lit the pick spheres (opacity ${picksAfterHover})`);
+console.log(`--- Pick spheres while presenting: ${picksPresenting} (layer switch ${picksAfterLayer}, hover ${picksAfterHover})`);
+
 // ---- 2. THE KEY TEST: presenter keys step the deck and pose nobody.
 // ArrowRight/PageDown are bound to nudging a joint outside present mode, so a
 // leaked keystroke would silently deform the dancer mid-lesson.
@@ -150,6 +184,16 @@ if (!off.sidebar || !off.topbar || !off.hint) problems.push('leaving did not bri
 if (off.frame !== before.frame) problems.push(`frame is ${off.frame} after leaving, expected ${before.frame}`);
 if (off.canvasW !== before.canvasW) problems.push(`frame width ${off.canvasW}px after leaving, expected ${before.canvasW}px`);
 if (off.btn.includes('End')) problems.push('the Present button still reads "End" after leaving');
+// …including the pick spheres. Asked for in the skeleton view, where they are
+// visible at rest: the deck's own slides carry a layer, so whichever one was
+// last shown decides what is on screen here.
+await setLayer('skeleton');
+await sleep(500);
+const picksAfterExit = await spheres();
+if (Math.abs(picksAfterExit - 0.22) > 1e-6) {
+  problems.push(`leaving present mode left the pick spheres at opacity ${picksAfterExit}, expected 0.22`);
+}
+console.log(`--- Pick spheres after leaving: ${picksAfterExit}`);
 
 // ---- 5. Outside present mode the same keys nudge again, as they always did.
 await page.evaluate(() => {

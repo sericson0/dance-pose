@@ -104,6 +104,12 @@ const _qB = new THREE.Quaternion();
 const _tA = new THREE.Vector3();
 const _tB = new THREE.Vector3();
 const _scl = new THREE.Vector3();
+const _dC = new THREE.Matrix4();
+const _qC = new THREE.Quaternion();
+const _tC = new THREE.Vector3();
+// …and for the per-toe hinge offset in syncAtlasNodes.
+const _toeO = new THREE.Vector3();
+const _toeQ = new THREE.Quaternion();
 
 // Flesh clearance around each joint (fraction of height) used for floor
 // contact; the foot soles are handled separately via FOOT_CORNERS.
@@ -135,13 +141,31 @@ const HEEL_OUTLINE_EDGE_OPACITY = 0.85;
 // toe pads sit at/just past its tip, so they bound the shoe in any pitch.
 const CORNER_NODES = new Set(['toes_L', 'toes_R', 'toe_L', 'toe_R']);
 
-// Fraction of the toes bone cloud that counts as "lying against the
-// metatarsals" when #mtpCenter locates the MTP joint. A fraction rather than a
-// distance threshold, and the answer barely depends on it: 5%, 10%, 15% and
-// 25% of the toes cloud put the joint centre within 4 mm of each other on both
-// avatars, because the interphalangeal joints are far enough from the ankle
-// cluster never to compete for the nearest band.
-const MTP_BAND = 0.10;
+// Fraction of a bone cloud that counts as "lying against" the bone it
+// articulates on, when #articulationCenter locates a joint face. A fraction
+// rather than a distance threshold, because the two feet's joint spaces differ
+// (the follower's heel pitch closes her talocrural gap to under 4 mm while the
+// leader's stays wider, so a fixed threshold finds 946 verts on one and 37 on
+// the other). See #articulationCenter for how little the answer depends on it.
+const ARTICULATION_BAND = 0.10;
+
+// Which toe (1 = hallux … 5 = little toe) an atlas foot phalanx belongs to, or
+// 0. GLTFLoader sanitises the names to "Proximal_phalanx_of_fifth_finger_of_footr".
+const TOE_ORDINALS = ['first', 'second', 'third', 'fourth', 'fifth'];
+const toeDigitOf = (boneName) => {
+  const m = /(first|second|third|fourth|fifth)_?finger_?of_?foot/i.exec(boneName);
+  return m ? TOE_ORDINALS.indexOf(m[1].toLowerCase()) + 1 : 0;
+};
+
+// Half-width of the band over which a long toe tendon hands over from the
+// metatarsus to its toe, as a fraction of that toe's length. Flesh is rigid on
+// its bone and only the crossing deforms, so it is short — but not a knife
+// edge, or the tendon kinks at the joint line instead of bending round it.
+const TOE_TAIL_BAND = 0.18;
+// A long muscle counts as REACHING the toes (and gets a toe tail at all) only
+// if at least this many of its vertices commit to one — the CONTACT rule that
+// governs MUSCLE_INSERT, applied to the third joint a two-node row cannot name.
+const TOE_TAIL_MIN_VERTS = 12;
 
 // Body-view capsule radii per segment (fractions of height).
 const BODY_RADII = {
@@ -234,6 +258,12 @@ export class Figure {
     // swinging apart as a bend opens (see #buildAtlasNodes / syncAtlasNodes).
     this.atlasNodes = {};
     this.pickSpheres = [];
+    // The joint pick spheres are EDITING chrome, not anatomy. Present mode
+    // takes them off screen outright (setPickVisible) — a slide is a picture of
+    // a dancer, not of the tool — and setLayers honours the flag so switching
+    // layer mid-deck can't bring them back. They stay clickable either way;
+    // raycasting ignores opacity.
+    this.picksVisible = true;
     this.layerMeshes = { skeleton: [], body: [], muscle: [] };
     // Translucent shoe/heel outline meshes, shown only when the body avatar is
     // hidden (skeleton / muscle views). Empty for a flat-shoed figure.
@@ -274,6 +304,16 @@ export class Figure {
 
   #build() {
     const H = this.height;
+    // Figure-local geometry corrections applied to the BONES hanging on an
+    // endpoint node after they were baked (the endpoint fit, the heel pitch,
+    // the foot narrowing), keyed by joint node. #refitEndpointMuscles replays
+    // them onto the muscle tissue welded to those same nodes, which is baked
+    // separately and would otherwise stay behind. Reset here, not in the
+    // constructor, so setHeight's rebuild starts clean too.
+    this._endpointFix = new Map();
+    // One entry per toe: its phalanx meshes and the metatarsal head they hinge
+    // about (see #buildToeDigits; read every frame by syncAtlasNodes).
+    this._toeDigits = [];
 
     // Joint hierarchy. ANY heeled figure raises its RIG ankle node (and, riding
     // them, the toes) by the heel height: a real heel lifts the ankle joint off
@@ -365,10 +405,10 @@ export class Figure {
     // De-splay the skeletal hands/feet onto the clothed body's orientation so
     // the three layers coincide at the extremities (see #alignEndpointGeometry).
     if (this.skeletonMesh && this.bodyMesh) this.#alignEndpointGeometry();
-    // The foot's fit MOVES the forefoot out from under the toes node, so put the
-    // MTP hinge back on the metatarsal heads before anything pivots about it —
-    // #applyHeel's ball-break included.
-    if (this.skeletonMesh) this.#reseatToesPivot();
+    // The foot's fit MOVES the foot out from under its own nodes, so put the
+    // ankle and MTP pivots back on their joint faces before anything pivots
+    // about them — #applyHeel's ball-break included.
+    if (this.skeletonMesh) this.#reseatFootPivots();
     // A heeled figure: pitch the skeletal foot up at the heel so the bare bones
     // sit inside the shoe, draw the wedge, and (fake heel only) relocate the
     // balance corners to the raised, pitched foot.
@@ -384,8 +424,19 @@ export class Figure {
     // 4.6 mm → 0.3, matching the flat-shoed leader). Skipped where neither ran,
     // since the first pass is then already exact.
     if (this.skeletonMesh && (this._heelLift || this._moldedHeel || this.footNarrow !== 1)) {
-      this.#reseatToesPivot();
+      this.#reseatFootPivots();
     }
+    // The toes node is ONE hinge and the five MTP joints are not in a line, so
+    // give each toe its own — and hand the long tendons lying on the toes over
+    // to them. After the last re-seat (it needs the final forefoot) and before
+    // the muscle refit (which has to know which tissue belongs to the toes).
+    if (this.skeletonMesh) this.#buildToeDigits();
+    // Every pass above moved BONES only, leaving the muscles and tendons welded
+    // to those same nodes behind in the raw atlas position (the plantar tendons
+    // hanging in mid-air under the metatarsals). Replay the same maps onto the
+    // muscle layer — last, so it picks up the fit, the heel pitch and the
+    // narrowing in one go.
+    if (this.skeletonMesh) this.#refitEndpointMuscles();
     this.setLayers({ skeleton: false, body: true, muscle: false });
     // Tripwire: warn (don't block) if the live calibration has drifted from the
     // frozen snapshot in rigCalibration.js. The hard gate is dev-verify-calibration.mjs.
@@ -474,9 +525,13 @@ export class Figure {
     // through the merge so the rendered geometry stays addressable per bone
     // (see userData.boneRanges below) — landmarks.js selects verts by bone, and
     // a merged mesh with no name map would only be addressable per node.
+    // A TOE's phalanges get a mesh of their own per digit (key suffix 1–5, 0 =
+    // everything else) rather than merging into one forefoot: each toe hinges
+    // about its own metatarsal head (see #buildToeDigits), which one merged
+    // mesh could not do. Four extra draw calls a foot.
     const groups = new Map();
     const stash = (nodeName, material, geom, name, side) => {
-      const key = `${nodeName}|${material}`;
+      const key = `${nodeName}|${material}|${/^toes/.test(nodeName) ? toeDigitOf(name) : 0}`;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push({ geom, name, side });
     };
@@ -511,7 +566,7 @@ export class Figure {
     }
 
     for (const [key, parts] of groups) {
-      const [nodeName, material] = key.split('|');
+      const [nodeName, material, digit] = key.split('|');
       const merged = mergeGeometries(parts.map((p) => p.geom), false);
       // Vertex ranges per source bone, in merge order — mergeGeometries
       // concatenates, so a running offset is exact. This is what lets a
@@ -528,6 +583,7 @@ export class Figure {
       if (!merged) continue;
       const mesh = new THREE.Mesh(merged, this.materials[material]);
       mesh.userData.boneRanges = boneRanges;
+      if (+digit) mesh.userData.toeDigit = +digit;
       this.addMesh(nodeName, mesh, 'skeleton', true, this.atlasNodes[nodeName] || null);
     }
   }
@@ -596,6 +652,19 @@ export class Figure {
   syncAtlasNodes() {
     for (const name in this.atlasNodes) {
       this.atlasNodes[name].quaternion.copy(this.nodes[name].quaternion);
+    }
+    // Each toe hinges about its OWN metatarsal head, not the toes node (see
+    // #buildToeDigits). The mesh still hangs on that node and takes its
+    // rotation R, so turning it about its own pivot c instead of the node's
+    // origin is one translation in the node's frame: R(x + o) = c + R(x − c)
+    // gives o = R⁻¹c − c, which is zero at rest.
+    for (const td of this._toeDigits) {
+      _toeO.copy(td.pivot).applyQuaternion(_toeQ.copy(td.node.quaternion).invert()).sub(td.pivot);
+      td.meshes.forEach((mesh, i) => {
+        const e = mesh.matrix.copy(td.rest[i]).elements;
+        e[12] += _toeO.x; e[13] += _toeO.y; e[14] += _toeO.z;
+        mesh.matrixWorldNeedsUpdate = true;
+      });
     }
   }
 
@@ -903,8 +972,16 @@ export class Figure {
     let cloud = this._boneClouds.get(node);
     if (cloud) return cloud;
     const meshes = node.children.filter((c) => c.isMesh && c.userData.boneRanges);
+    cloud = this.#meshCloud(meshes, gInv);
+    this._boneClouds.set(node, cloud);
+    return cloud;
+  }
+
+  // The surface of `meshes` as a flat figure-local xyz array, sub-sampled to
+  // about `target` points.
+  #meshCloud(meshes, gInv, target = 3000) {
     const total = meshes.reduce((n, m) => n + m.geometry.attributes.position.count, 0);
-    const step = Math.max(1, Math.floor(total / 3000));
+    const step = Math.max(1, Math.floor(total / target));
     const out = [];
     const v = new THREE.Vector3();
     const M = new THREE.Matrix4();
@@ -916,9 +993,7 @@ export class Figure {
         out.push(v.x, v.y, v.z);
       }
     }
-    cloud = Float32Array.from(out);
-    this._boneClouds.set(node, cloud);
-    return cloud;
+    return Float32Array.from(out);
   }
 
   // The deeper (child) of two hierarchy-adjacent joint nodes — the joint the
@@ -966,6 +1041,20 @@ export class Figure {
   updateMuscleSkin() {
     if (!this._skinMuscles.length || !this.layers?.muscle || !this.group.visible) return;
     const gInv = _gInv.copy(this.group.matrixWorld).invert();
+    // Each toe's rigid delta since bind, as a dual quaternion: the toes node's
+    // frame shifted onto that toe's own hinge (the same offset syncAtlasNodes
+    // gives its phalanges), so a tendon's tail stays on the toe it lies along.
+    for (const td of this._toeDigits) {
+      _toeO.copy(td.pivot).applyQuaternion(_toeQ.copy(td.node.quaternion).invert()).sub(td.pivot);
+      _dC.makeTranslation(_toeO.x, _toeO.y, _toeO.z).premultiply(td.node.matrixWorld)
+        .premultiply(gInv).multiply(td.inv).decompose(_tC, _qC, _scl);
+      const q = td.dq;
+      q[0] = _qC.x; q[1] = _qC.y; q[2] = _qC.z; q[3] = _qC.w;
+      q[4] = 0.5 * (_tC.x * _qC.w + _tC.y * _qC.z - _tC.z * _qC.y);
+      q[5] = 0.5 * (-_tC.x * _qC.z + _tC.y * _qC.w + _tC.z * _qC.x);
+      q[6] = 0.5 * (_tC.x * _qC.y - _tC.y * _qC.x + _tC.z * _qC.w);
+      q[7] = 0.5 * (-_tC.x * _qC.x - _tC.y * _qC.y - _tC.z * _qC.z);
+    }
     for (const sm of this._skinMuscles) {
       // Rigid delta of each joint since bind, in figure-local space.
       const dA = _dA.multiplyMatrices(gInv, sm.nodeA.matrixWorld).multiply(sm.invA);
@@ -992,15 +1081,25 @@ export class Figure {
       const geom = sm.mesh.geometry;
       const parr = geom.attributes.position.array;
       const narr = geom.attributes.normal.array;
-      const { bindPos, bindNrm, weight } = sm;
+      const { bindPos, bindNrm, weight, tail } = sm;
       for (let i = 0, j = 0; i < weight.length; i++, j += 3) {
-        const wb = weight[i];
+        let wb = weight[i];
         const wa = 1 - wb;
+        // A toe tail hands part of nodeB's share on to the toe it lies along.
+        const wc = tail ? wb * tail.w[i] : 0;
+        wb -= wc;
         // Blend real + dual parts, then renormalize the real part.
         let rx = arx * wa + brx * wb, ry = ary * wa + bry * wb;
         let rz = arz * wa + brz * wb, rw = arw * wa + brw * wb;
         let dx = adx * wa + bdx * wb, dy = ady * wa + bdy * wb;
         let dz = adz * wa + bdz * wb, dw = adw * wa + bdw * wb;
+        if (wc > 0) {
+          const c = tail.digits[tail.idx[i]].dq;
+          // Same hemisphere as A, like B above.
+          const f = arx * c[0] + ary * c[1] + arz * c[2] + arw * c[3] < 0 ? -wc : wc;
+          rx += c[0] * f; ry += c[1] * f; rz += c[2] * f; rw += c[3] * f;
+          dx += c[4] * f; dy += c[5] * f; dz += c[6] * f; dw += c[7] * f;
+        }
         const inv = 1 / (Math.hypot(rx, ry, rz, rw) || 1);
         rx *= inv; ry *= inv; rz *= inv; rw *= inv;
         dx *= inv; dy *= inv; dz *= inv; dw *= inv;
@@ -1421,6 +1520,13 @@ export class Figure {
         // general 3×3 and the mesh matrix is written directly.
         const L = X ? X.clone() : new THREE.Matrix4().makeRotationFromQuaternion(R)
           .premultiply(new THREE.Matrix4().makeScale(S, S, S));
+        // The same map written out in FIGURE-local form: p -> A + L(p - A) + T.
+        // The bones below consume it as a node-local matrix; the MUSCLES that
+        // ride these nodes are baked in figure-local space and need it there.
+        const F = new THREE.Matrix4()
+          .makeTranslation(A.x + T.x, A.y + T.y, A.z + T.z)
+          .multiply(L)
+          .multiply(new THREE.Matrix4().makeTranslation(-A.x, -A.y, -A.z));
         for (const base of spec.rotNodes) {
           const nodeName = `${base}${side}`;
           // Transform geometry about the pivot A, then seat it with T. A mesh
@@ -1430,6 +1536,7 @@ export class Figure {
           // — the hand rides the atlas wrist node, whose origin is that pivot);
           // T is a figure-local displacement = node-local at rest.
           this.#seatNode(nodeName).getWorldPosition(P).applyMatrix4(gInv);
+          this.#recordEndpointFix(nodeName, F);
           off.copy(P).sub(A).applyMatrix4(L).add(A).sub(P)
             .add(T);
           for (const mesh of this.layerMeshes.skeleton) {
@@ -1439,6 +1546,142 @@ export class Figure {
           }
         }
       }
+    }
+  }
+
+  // Record a figure-local geometry correction that has just been applied to the
+  // BONES hanging on `nodeName`, so #refitEndpointMuscles can replay it onto the
+  // muscle tissue welded to that same node. Composes, because the foot is moved
+  // three times (endpoint fit -> heel pitch -> narrowing) and each pass acts on
+  // the result of the last.
+  #recordEndpointFix(nodeName, F) {
+    const prev = this._endpointFix.get(nodeName);
+    this._endpointFix.set(nodeName, prev ? F.clone().multiply(prev) : F.clone());
+  }
+
+  // Replay the endpoint geometry corrections onto the MUSCLE layer.
+  //
+  // The bones of a hand/foot are moved after they are baked — the endpoint fit
+  // (#alignEndpointGeometry) lays them onto the clothed hand/shoe, then a heeled
+  // foot is pitched (#pitchHeeledFoot) and a narrow one squeezed (#narrowFoot).
+  // Every one of those wrote into `layerMeshes.skeleton` only, so the muscles
+  // and tendons riding the very same nodes stayed in the RAW atlas position
+  // while the bones under them rotated away. For the foot that fit is a
+  // rotation of 18.6 deg (leader) / 13.9 deg (follower) onto the shoe's midline,
+  // a stretch of x1.13 / x0.97 along it and a ~13 mm seat translation, all
+  // pivoting about the ankle — so the error grows with distance from the ankle
+  // and is worst exactly where the plantar tendons run, out under the
+  // metatarsals. That is the reported "yellow tendon arcing under the foot in
+  // mid-air".
+  //
+  // Measured at rest, as the distance from the tissue COMMITTED to the foot
+  // (skin weight > 0.8 toward ankle_*/toes_*) to that node's own bone cloud —
+  // mean / max in mm, leader then follower, right side:
+  //
+  //   Flexor digitorum longus       25.3/45.8  30.6/57.3  ->  2.5/8.0   3.1/10.4
+  //   Flexor hallucis longus        22.4/38.3  24.5/47.9  ->  2.7/9.4   2.9/11.0
+  //   Extensor digitorum longus     24.6/39.9   7.5/14.0  ->  3.4/8.3   3.0/7.1
+  //   Ext. digitorum longus tendons 24.3/33.0  21.0/28.6  ->  3.3/9.0   3.5/9.2
+  //   Extensor hallucis longus      14.7/32.1  14.4/44.0  ->  2.3/7.4   2.6/8.6
+  //   Fibularis longus               9.2/18.0  19.5/26.9  ->  3.9/9.5   4.1/10.1
+  //   (a healthy attachment for comparison: brachialis onto the elbow, 2.7 mm
+  //   mean — the foot ends were an order of magnitude out, their own TIBIA ends
+  //   3-8 mm.)
+  //
+  // Note which instruments were blind to this, since they are the loud ones:
+  // dev-probe-clip-anatomy's contact audit reads the MINIMUM vertex-to-bone
+  // distance, and the ankle's cloud is the whole tarsus + metatarsus, so some
+  // vertex of a 13 cm tendon is always near something — it reported 0.7-1.5 mm
+  // for the worst offender. Anchor/drift read motion in a bone's frame DURING a
+  // clip, and this tissue is rigid on its node, so it scores a perfect 0 while
+  // hanging in the air. Only the DISTRIBUTION of a static rest-pose gap can see
+  // it. dev-verify-foot-muscles.mjs is the gate.
+  //
+  // Two shapes of muscle, and they need different fixes:
+  //  - RIGID belly parented to the node: compose the fix into its mesh matrix,
+  //    exactly as the bone meshes do. (The atlas ships none on an endpoint node
+  //    today; this is here so adding one cannot silently reintroduce the bug.)
+  //  - SKINNED (bi-articular) belly: it hangs off `group` with its bind baked in
+  //    FIGURE-local space, so there is no mesh matrix to compose into — the fix
+  //    goes into the bind positions/normals themselves, blended by the SAME
+  //    weight the skin uses. That blend is what keeps it continuous: the ankle
+  //    end lands on the fitted foot, the tibia end (whose bone did not move)
+  //    stays put, and the transition shears across the band the tendon already
+  //    crosses. Baking it into the bind rather than into `invA`/`invB` is
+  //    deliberate and the alternative was tried: updateMuscleSkin is DUAL-
+  //    QUATERNION, so it `decompose`s each joint delta into a rotation plus a
+  //    translation, and folding a non-rigid map (the fit carries a x1.13
+  //    one-axis stretch) into that delta hands decompose a matrix it cannot
+  //    represent. Baking the bind keeps both deltas identity at rest, which is
+  //    what DQS needs.
+  //
+  // Runs last, after every other foot pass, and touches no rig node and no
+  // calibration field — the frozen snapshot (and dev-verify-calibration) is
+  // unaffected, so no re-bake.
+  #refitEndpointMuscles() {
+    if (!this._endpointFix.size) return;
+    this.group.updateMatrixWorld(true);
+    const gInv = this.group.matrixWorld.clone().invert();
+
+    for (const mesh of this.layerMeshes.muscle) {
+      if (mesh.userData.skinNode !== undefined) continue; // skinned: handled below
+      const F = this._endpointFix.get(this.#nodeNameOf(mesh));
+      if (!F || !mesh.parent) continue;
+      const pl = gInv.clone().multiply(mesh.parent.matrixWorld);
+      mesh.matrixAutoUpdate = false;
+      mesh.matrix.copy(pl.clone().invert().multiply(F).multiply(pl).multiply(mesh.matrix));
+    }
+
+    const p = new THREE.Vector3(); const q = new THREE.Vector3();
+    const n = new THREE.Vector3(); const nq = new THREE.Vector3();
+    const fixOf = (node) => this._endpointFix.get(node.userData.jointName) || null;
+    for (const sm of this._skinMuscles) {
+      const FA = fixOf(sm.nodeA); const FB = fixOf(sm.nodeB);
+      // A toe tail (see #buildToeDigits) lies on the TOES, whose fix is not the
+      // ankle's on a heeled figure: the foot is pitched about the ball and the
+      // toes stay flat, so tail tissue laid on with the ankle's map is pitched
+      // up off the very phalanges it runs along.
+      const tail = sm.tail;
+      const FC = tail ? this._endpointFix.get(tail.fixNode) || null : null;
+      if (!FA && !FB && !FC) continue;
+      // Normals take the inverse-transpose, not the map itself: the fit's
+      // one-axis stretch is not a rotation.
+      const NA = FA && new THREE.Matrix3().getNormalMatrix(FA);
+      const NB = FB && new THREE.Matrix3().getNormalMatrix(FB);
+      const NC = FC && new THREE.Matrix3().getNormalMatrix(FC);
+      const { bindPos, bindNrm, weight } = sm;
+      for (let i = 0, j = 0; i < weight.length; i++, j += 3) {
+        let wb = weight[i]; const wa = 1 - wb;
+        const wc = tail ? wb * tail.w[i] : 0;
+        wb -= wc;
+        p.set(bindPos[j], bindPos[j + 1], bindPos[j + 2]);
+        n.set(bindNrm[j], bindNrm[j + 1], bindNrm[j + 2]);
+        q.copy(p); if (FA) q.applyMatrix4(FA);
+        nq.copy(n); if (NA) nq.applyMatrix3(NA);
+        let x = wa * q.x, y = wa * q.y, z = wa * q.z;
+        let nx = wa * nq.x, ny = wa * nq.y, nz = wa * nq.z;
+        q.copy(p); if (FB) q.applyMatrix4(FB);
+        nq.copy(n); if (NB) nq.applyMatrix3(NB);
+        x += wb * q.x; y += wb * q.y; z += wb * q.z;
+        nx += wb * nq.x; ny += wb * nq.y; nz += wb * nq.z;
+        if (wc > 0) {
+          q.copy(p); if (FC) q.applyMatrix4(FC);
+          nq.copy(n); if (NC) nq.applyMatrix3(NC);
+          x += wc * q.x; y += wc * q.y; z += wc * q.z;
+          nx += wc * nq.x; ny += wc * nq.y; nz += wc * nq.z;
+        }
+        bindPos[j] = x; bindPos[j + 1] = y; bindPos[j + 2] = z;
+        nq.set(nx, ny, nz).normalize();
+        bindNrm[j] = nq.x; bindNrm[j + 1] = nq.y; bindNrm[j + 2] = nq.z;
+      }
+      // The live attributes ARE the bind pose until the first updateMuscleSkin,
+      // and that no-ops while the muscle layer is hidden — which it is here, at
+      // the end of the build. Push the new bind through so the belly is right
+      // the instant the layer is switched on.
+      const { position, normal } = sm.mesh.geometry.attributes;
+      position.array.set(bindPos); position.needsUpdate = true;
+      normal.array.set(bindNrm); normal.needsUpdate = true;
+      sm.mesh.geometry.computeBoundingSphere();
     }
   }
 
@@ -1581,23 +1824,44 @@ export class Figure {
     return { R, S, T };
   }
 
-  // Re-seat the atlas `toes` node onto the MTP joint of the foot AS RENDERED.
+  // Re-seat the atlas `ankle` and `toes` nodes onto their own joint faces in
+  // the foot AS RENDERED.
   //
   // #atlasLimbRest estimates every seated joint from the RAW atlas bones, but
   // the foot is then moved out from under its nodes by #alignEndpointGeometry's
   // axis fit — a rotation of 18.6° (leader) / 13.9° (follower) onto the shoe's
   // midline, a stretch along it, and a ~1.3 cm seat translation. That fit
-  // PIVOTS about the ankle, so the ankle node keeps its own geometry; the toes
-  // node, 13 cm out along the foot, does not. Measured, the metatarsal heads
-  // ended up 3.5–3.8 cm away from the node that is supposed to be the hinge
-  // through them.
+  // PIVOTS about the ankle, so the ankle node keeps its own geometry ALMOST —
+  // it is still carried off by the seat translation T alone — while the toes
+  // node, 13 cm out along the foot, takes the whole rotation as well. Measured,
+  // the metatarsal heads ended up 3.5–3.8 cm from the node that is supposed to
+  // be the hinge through them, and the talocrural joint face 0.9–1.0 cm
+  // (leader) / 1.9–2.0 cm (follower) from the ankle node.
   //
   // The mesh still pivots about the node, so that offset is a crank: the MTP
   // articulation itself TRAVELLED 22 mm at 35° of toe flexion and 43 mm at the
   // −70° extension, carrying the phalanges through the metatarsal heads instead
   // of hinging against them — the visible "the toe clip smashes the foot". A
   // clip's sagittal plane and angle arc are drawn on surfacePos (studio.js), so
-  // the same offset also planted them off the joint they name.
+  // the same offset also planted them off the joint they name. The ankle is the
+  // same failure a third the size: its joint face slid 6.4–7.1 mm (leader) /
+  // 13.8–13.9 mm (follower) at 45° of plantarflexion, the talus shearing across
+  // the tibial plafond.
+  //
+  // THE ANKLE HALF COSTS SOMETHING AND THE TOES HALF DOES NOT — know this
+  // before retuning either. The balance corners live in the RIG ankle's frame
+  // while the drawn foot (bones AND shoe — the body foot bone is parented to
+  // #seatNode) rides the ATLAS one. Both take the same local rotation about
+  // different origins, so a corner and the sole point it was fitted to part
+  // company by (I − R_θ)·(atlas − rig) as the ankle pitches — already ±4 cm
+  // across the ankle's range before any of this, and moving the node onto the
+  // true joint puts it FURTHER from the rig node (30.4 → 35.6 mm leader, 40.5 →
+  // 45.9 follower), scaling that divergence by 13–17%. It is accepted because
+  // the grounding gates are unmoved by it (the corners are what clampToFloor
+  // and the hull read, and they did not move) — but the real fix for that
+  // divergence is migrating the corner tables into the atlas frame, which
+  // CLAUDE.md flags as its own change. The TOES half is free by comparison: the
+  // toe-pad corners hang on the RIG toes node, which this never touches.
   //
   // Nothing on screen moves: each child is shifted back by the same delta, so
   // this changes the PIVOT and only the pivot. Deliberately NOT written back
@@ -1605,48 +1869,57 @@ export class Figure {
   // against, and leaving it be keeps the frozen snapshot (and
   // dev-verify-calibration) valid, exactly as #applyHeel and #narrowFoot do.
   //
-  // Only the foot needs this. The hand's fit pivots about the wrist, and the
-  // wrist is the hand's only seated joint, so its geometry cannot move relative
-  // to its own pivot; the foot is the one endpoint whose fit spans a second
-  // seated joint. #narrowFoot's later squeeze is a pure scale along x about the
-  // foot's sagittal plane, and the MTP is an x hinge — a rotation about x is
+  // Only the foot needs this, and only these two joints. The hand's fit leaves
+  // the wrist as both its pivot and the hand's only seated joint, so T is the
+  // whole error there and it is absorbed by the fit itself; and the knee and
+  // hip are outside every ENDPOINT_FITS entry, so their (deliberately tuned —
+  // see the patella note in CLAUDE.md) estimates must be left alone.
+  // #narrowFoot's later squeeze is a pure scale along x about the foot's
+  // sagittal plane, and both of these are x hinges — a rotation about x is
   // unaffected by its pivot's x — so the few mm it leaves behind cannot reach
-  // the movement. Verified by scripts/dev-verify-toe-pivot.mjs.
-  #reseatToesPivot() {
+  // the movement. Verified by scripts/dev-verify-foot-pivots.mjs.
+  #reseatFootPivots() {
     this.group.updateMatrixWorld(true);
     const gInv = this.group.matrixWorld.clone().invert();
     const movedNodes = new Set();
-    for (const side of ['_L', '_R']) {
-      const node = this.atlasNodes[`toes${side}`];
-      const ankle = this.#seatNode(`ankle${side}`);
-      if (!node || !node.parent || !ankle) continue;
-      // Any cloud sampled before the fit is stale: that geometry has moved.
-      this._boneClouds?.delete(node);
-      this._boneClouds?.delete(ankle);
-      const mtp = this.#mtpCenter(node, ankle, gInv);
-      if (!mtp) continue;
-      // Rest rotations are identity (see #buildAtlasNodes), so the parent's
-      // local axes are the figure axes and this is a plain subtraction — and
-      // for the same reason a child cancels the move by −delta in its own frame.
-      const want = mtp.sub(node.parent.getWorldPosition(new THREE.Vector3()).applyMatrix4(gInv));
-      const delta = want.clone().sub(node.position);
-      if (delta.lengthSq() < 1e-8) continue;
-      node.position.copy(want);
-      for (const child of node.children) {
-        if (child.matrixAutoUpdate) child.position.sub(delta);
-        else {
-          child.matrix.elements[12] -= delta.x;
-          child.matrix.elements[13] -= delta.y;
-          child.matrix.elements[14] -= delta.z;
+    // PARENT FIRST. Moving the ankle shifts every one of its children back by
+    // −delta, and the atlas toes node is one of them, so the forefoot is left
+    // exactly where it was drawn and the MTP pass below is unaffected by it.
+    for (const [base, parBase] of [['ankle', 'knee'], ['toes', 'ankle']]) {
+      for (const side of ['_L', '_R']) {
+        const node = this.atlasNodes[`${base}${side}`];
+        const parent = this.#seatNode(`${parBase}${side}`);
+        if (!node || !node.parent || !parent) continue;
+        // Any cloud sampled before the fit is stale: that geometry has moved.
+        this._boneClouds?.delete(node);
+        this._boneClouds?.delete(parent);
+        const joint = this.#articulationCenter(node, parent, gInv);
+        if (!joint) continue;
+        // Rest rotations are identity (see #buildAtlasNodes), so the parent's
+        // local axes are the figure axes and this is a plain subtraction — and
+        // for the same reason a child cancels the move by −delta in its own frame.
+        const want = joint.sub(node.parent.getWorldPosition(new THREE.Vector3()).applyMatrix4(gInv));
+        const delta = want.clone().sub(node.position);
+        if (delta.lengthSq() < 1e-8) continue;
+        node.position.copy(want);
+        for (const child of node.children) {
+          if (child.matrixAutoUpdate) child.position.sub(delta);
+          else {
+            child.matrix.elements[12] -= delta.x;
+            child.matrix.elements[13] -= delta.y;
+            child.matrix.elements[14] -= delta.z;
+          }
         }
+        movedNodes.add(node);
       }
-      movedNodes.add(node);
+      this.group.updateMatrixWorld(true); // the next pass measures the moved tree
     }
     if (!movedNodes.size) return;
     this.group.updateMatrixWorld(true);
-    // A bi-articular belly crossing the MTP (the long toe-extensor tendons)
+    // A bi-articular belly crossing one of these joints (the long toe-extensor
+    // tendons over the MTP; the whole calf and the Achilles over the ankle)
     // recorded this node's bind matrix when it was skinned. Re-take it, or
-    // updateMuscleSkin reads the re-seat as joint motion and the tendon jumps
+    // updateMuscleSkin reads the re-seat as joint motion and the belly jumps
     // at rest. Valid here because the figure is still in its rest pose.
     const g = this.group.matrixWorld.clone().invert();
     for (const sm of this._skinMuscles) {
@@ -1655,39 +1928,208 @@ export class Figure {
     }
   }
 
-  // Where the phalanges actually meet the metatarsals in the RENDERED foot: the
-  // mean of the toes-cloud points lying closest to the ankle cloud — the
-  // articulation itself, found from both bone groups at once, in figure-local
-  // space.
+  // Where a bone actually meets the one it articulates on, in the RENDERED
+  // geometry: the mean of the child cloud's points lying closest to the parent
+  // cloud — the joint face itself, found from both bone groups at once, in
+  // figure-local space.
   //
   // #atlasLimbRest's rule ("the child verts nearest the PARENT CLUSTER'S
   // CENTROID") is a proxy that holds while the parent is a long bone, but it
-  // biases here because the ankle cluster's centroid sits back in the mid-foot:
-  // re-run on this same geometry it lands 18 mm behind the joint and 22 mm off
+  // biases wherever the parent cluster is a block rather than a shaft: at the
+  // MTP the ankle cluster's centroid sits back in the mid-foot, and re-run on
+  // the same geometry that rule lands 18 mm behind the joint and 22 mm off
   // laterally. Nearest-to-the-CLUSTER has no such lever arm.
-  #mtpCenter(toesNode, ankleNode, gInv) {
-    const ank = this.#boneCloud(ankleNode, gInv);
-    const toe = this.#boneCloud(toesNode, gInv);
-    if (ank.length < 60 || toe.length < 60) return null;
+  //
+  // The band fraction is not a tuned number at the MTP (5/10/15/25% agree to
+  // 4 mm — the interphalangeal joints are far enough from the ankle cluster
+  // never to compete). The TALOCRURAL band is looser, ±10 mm over that same
+  // 5× range, because the malleoli wrap the talus and the contact is a broad
+  // collar rather than the MTP's sharp interface — worth knowing before
+  // treating this number as exact there.
+  #articulationCenter(childNode, parentNode, gInv) {
+    return this.#faceCenter(this.#boneCloud(childNode, gInv), this.#boneCloud(parentNode, gInv));
+  }
+
+  // The same, on two bone clouds directly (a single toe against the foot).
+  #faceCenter(ch, par) {
+    if (par.length < 60 || ch.length < 60) return null;
     const scored = [];
-    for (let i = 0; i < toe.length; i += 3) {
-      const x = toe[i], y = toe[i + 1], z = toe[i + 2];
+    for (let i = 0; i < ch.length; i += 3) {
+      const x = ch[i], y = ch[i + 1], z = ch[i + 2];
       let best = Infinity;
-      for (let k = 0; k < ank.length; k += 3) {
-        const dx = x - ank[k], dy = y - ank[k + 1], dz = z - ank[k + 2];
+      for (let k = 0; k < par.length; k += 3) {
+        const dx = x - par[k], dy = y - par[k + 1], dz = z - par[k + 2];
         const d = dx * dx + dy * dy + dz * dz;
         if (d < best) best = d;
       }
       scored.push([best, i]);
     }
     scored.sort((a, b) => a[0] - b[0]);
-    const k = Math.max(1, Math.round(scored.length * MTP_BAND));
+    const k = Math.max(1, Math.round(scored.length * ARTICULATION_BAND));
     const c = new THREE.Vector3();
     for (let n = 0; n < k; n++) {
       const i = scored[n][1];
-      c.x += toe[i]; c.y += toe[i + 1]; c.z += toe[i + 2];
+      c.x += ch[i]; c.y += ch[i + 1]; c.z += ch[i + 2];
     }
     return c.multiplyScalar(1 / k);
+  }
+
+  // Give each toe its own hinge, and hand the long tendons lying on the toes
+  // over to them.
+  //
+  // `toes_*` is ONE joint, and #reseatFootPivots puts it on the articulation of
+  // the whole phalanx cluster — the MIDDLE of the row of five MTP joints. But
+  // those five are not in a line: the metatarsal break is oblique, the 5th head
+  // sitting ~4 cm behind the 1st along the foot, so a hinge through the middle
+  // is a crank for both ends of the row. Measured per digit, as the travel of
+  // each toe's own joint face in the foot's frame (leader, right; the follower
+  // is the same picture):
+  //
+  //   toe     1     2     3     4     5
+  //   35°    7.8   6.6   2.4   5.4  14.9 mm
+  //  −70°   15.3  12.7   4.7  10.2  28.5 mm
+  //
+  // — the little toe levered clean out of its socket when the foot points,
+  // while the whole-cluster check read 0.2–0.6 mm, because a centroid over five
+  // faces sits still when one end goes up and the other down.
+  //
+  // So each toe's phalanges are their own mesh (#buildMeshSkeleton) and hinge
+  // about their own #faceCenter against the foot. They still hang on the toes
+  // node and take its rotation — five parallel hinges, one angle, which is what
+  // the single `toes` joint means — and syncAtlasNodes turns "about the node"
+  // into "about the toe's own head" with one translation per toe. Nothing moves
+  // at rest, the node itself is untouched (the clothed shoe's toe bone, the
+  // clip's arc and plane, and the rig toes node the toe-pad corners hang on are
+  // all exactly where they were), and no calibration field is written.
+  //
+  // THE TENDONS are the other half, and the same omission one level up. A
+  // skinned belly has two frames, and the long toe muscles spend both of them
+  // getting from the shank to the foot (flexor digitorum/hallucis longus,
+  // extensor hallucis longus: knee → ankle), so the ~5 cm of tendon that runs
+  // on out along the toes had no frame left to follow them with: the toes
+  // flexed 40° away from tendons that stayed dead straight in the ankle's
+  // frame. Each such muscle gets a TAIL — per vertex, which toe it lies along
+  // (nearest toe ray) and how far past that toe's MTP it is — and
+  // updateMuscleSkin blends the toe's frame in as a third term. Which muscles
+  // get one is decided by CONTACT, like MUSCLE_INSERT: anything skinned onto
+  // the foot with real tissue past an MTP, so there is no table to go stale.
+  // The long-extensor TENDONS mesh (ankle → toes) already had the toes as its
+  // second frame; it just takes the per-toe frames and per-toe joint lines in
+  // place of the one node, whose single split line crossed the 5th toe halfway
+  // down its proximal phalanx.
+  //
+  // Runs on the RAW muscle bind (before #refitEndpointMuscles), so the toes are
+  // mapped back through the toes node's endpoint fix to meet it there — and the
+  // refit then lays tail tissue onto the TOES' fix rather than the ankle's. The
+  // two differ on a heeled figure: the foot is pitched about the ball and the
+  // toes stay flat in the toe box, so her tails were being pitched up off them.
+  #buildToeDigits() {
+    this._toeDigits = [];
+    this.group.updateMatrixWorld(true);
+    const G = this.group.matrixWorld;
+    const gInv = G.clone().invert();
+    const p = new THREE.Vector3();
+    for (const side of ['_L', '_R']) {
+      const node = this.atlasNodes[`toes${side}`];
+      const ankle = this.atlasNodes[`ankle${side}`];
+      if (!node || !ankle) continue;
+      this._boneClouds?.delete(ankle); // the heel pitch / narrowing moved it since
+      const foot = this.#boneCloud(ankle, gInv);
+      const toNode = node.matrixWorld.clone().invert().multiply(G); // figure-local → the node's frame
+      const inv = new THREE.Matrix4().multiplyMatrices(gInv, node.matrixWorld).invert();
+      const byDigit = new Map();
+      for (const m of node.children) {
+        const d = m.isMesh && m.userData.toeDigit;
+        if (!d) continue;
+        if (!byDigit.has(d)) byDigit.set(d, []);
+        byDigit.get(d).push(m);
+      }
+      const digits = [];
+      for (const [digit, meshes] of [...byDigit].sort((a, b) => a[0] - b[0])) {
+        const cloud = this.#meshCloud(meshes, gInv, 600);
+        const face = this.#faceCenter(cloud, foot);
+        if (!face) continue;
+        // The toe's ray: from its joint face out through its own middle, as
+        // long as the toe reaches along it.
+        const axis = new THREE.Vector3();
+        for (let i = 0; i < cloud.length; i += 3) axis.add(p.set(cloud[i], cloud[i + 1], cloud[i + 2]));
+        axis.multiplyScalar(3 / cloud.length).sub(face).normalize();
+        let len = 0;
+        for (let i = 0; i < cloud.length; i += 3) {
+          len = Math.max(len, p.set(cloud[i], cloud[i + 1], cloud[i + 2]).sub(face).dot(axis));
+        }
+        // The fit wrote some of these matrices directly (matrixAutoUpdate off);
+        // only a mesh still composing its own may be asked to.
+        for (const m of meshes) {
+          if (m.matrixAutoUpdate) { m.updateMatrix(); m.matrixAutoUpdate = false; }
+        }
+        digits.push({
+          side, digit, node, meshes, inv,
+          rest: meshes.map((m) => m.matrix.clone()),
+          pivot: face.clone().applyMatrix4(toNode),
+          pivotFig: face, axisFig: axis, len,
+          dq: new Float64Array(8),
+        });
+      }
+      if (!digits.length) continue;
+      this._toeDigits.push(...digits);
+      this.#addToeTails(side, node, ankle, digits);
+    }
+  }
+
+  // The tendon half of #buildToeDigits: per vertex of every muscle skinned onto
+  // this foot, the toe it runs along and its share of that toe's frame.
+  #addToeTails(side, toesNode, ankleNode, digits) {
+    // Meet the muscle in ITS space: the bind is still raw atlas, the toes are
+    // already fitted, and the fit is affine, so its inverse carries a toe's
+    // pivot and tip back onto the raw toe exactly.
+    const F = this._endpointFix.get(`toes${side}`);
+    const Finv = F ? F.clone().invert() : new THREE.Matrix4();
+    const rays = digits.map((td) => {
+      const o = td.pivotFig.clone().applyMatrix4(Finv);
+      const tip = td.pivotFig.clone().addScaledVector(td.axisFig, td.len).applyMatrix4(Finv);
+      const len = tip.distanceTo(o);
+      return { o, dir: tip.sub(o).multiplyScalar(1 / Math.max(len, 1e-6)), len };
+    });
+    const v = new THREE.Vector3();
+    for (const sm of this._skinMuscles) {
+      const onToes = sm.nodeB === toesNode;
+      if (!onToes && sm.nodeB !== ankleNode) continue;
+      const n = sm.weight.length;
+      const w = new Float32Array(n);
+      const idx = new Uint8Array(n);
+      let committed = 0;
+      for (let i = 0, j = 0; i < n; i++, j += 3) {
+        v.set(sm.bindPos[j], sm.bindPos[j + 1], sm.bindPos[j + 2]);
+        // Which toe: the nearest RAY, not the nearest bone — a tendon lies
+        // under or over its own toe, and the rays stay ~12 mm apart where the
+        // bones of neighbouring toes nearly touch.
+        let best = Infinity, k = 0, sBest = 0;
+        for (let r = 0; r < rays.length; r++) {
+          const dx = v.x - rays[r].o.x, dy = v.y - rays[r].o.y, dz = v.z - rays[r].o.z;
+          const s = dx * rays[r].dir.x + dy * rays[r].dir.y + dz * rays[r].dir.z;
+          const perp = dx * dx + dy * dy + dz * dz - s * s;
+          if (perp < best) { best = perp; k = r; sBest = s; }
+        }
+        // Tissue nowhere near a toe (the whole shank) is not on one, whatever
+        // its projection says.
+        const ray = rays[k];
+        if (best > ray.len * ray.len || sBest > 1.5 * ray.len) continue;
+        const band = TOE_TAIL_BAND * ray.len;
+        const t = THREE.MathUtils.clamp((sBest + band) / (2 * band), 0, 1);
+        w[i] = t * t * (3 - 2 * t);
+        idx[i] = k;
+        if (w[i] > 0.5) committed++;
+      }
+      if (committed < TOE_TAIL_MIN_VERTS) continue;
+      if (onToes) {
+        // Already ankle → toes: the per-toe joint lines replace the one split
+        // line through the node, and the whole toes share goes to the toe.
+        sm.weight.set(w);
+        w.fill(1);
+      }
+      sm.tail = { digits, w, idx, fixNode: `toes${side}` };
+    }
   }
 
   // Seat a heeled figure's foot inside its shoe: drop the balance corners onto
@@ -1767,6 +2209,9 @@ export class Figure {
         .makeTranslation(ball.x, ball.y, ball.z)
         .multiply(m.makeRotationX(theta))
         .multiply(new THREE.Matrix4().makeTranslation(-ball.x, -ball.y, -ball.z));
+      // The ankle-region MUSCLES ride this same mesh's node, so they take the
+      // same pitch (replayed later, in figure space, by #refitEndpointMuscles).
+      this.#recordEndpointFix(`ankle${side}`, pitch);
       for (const mesh of this.layerMeshes.skeleton) {
         if (this.#nodeNameOf(mesh) !== `ankle${side}`) continue;
         // Re-express the figure-local pitch in the mesh's parent (atlas ankle
@@ -1804,8 +2249,9 @@ export class Figure {
   // matrix already on the mesh, and it runs AFTER the calibration is recorded, so
   // the frozen snapshot (and dev-verify-calibration) is unaffected — no re-bake.
   // The squeeze is perpendicular to the foot's midline, so the foot's aim and
-  // length (what the frame gate checks) are untouched. Skeleton + muscle only;
-  // the clothed shoe is already the right width.
+  // length (what the frame gate checks) are untouched. Skeleton + muscle only
+  // (the muscle half goes through #refitEndpointMuscles); the clothed shoe is
+  // already the right width.
   #narrowFoot(factor) {
     this.group.updateMatrixWorld(true);
     const gInv = this.group.matrixWorld.clone().invert();
@@ -1816,14 +2262,19 @@ export class Figure {
       const squeeze = new THREE.Matrix4().makeTranslation(cx, 0, 0)
         .multiply(m.makeScale(factor, 1, 1))
         .multiply(new THREE.Matrix4().makeTranslation(-cx, 0, 0));
-      for (const layer of ['skeleton', 'muscle']) {
-        for (const mesh of this.layerMeshes[layer]) {
-          const jn = this.#nodeNameOf(mesh);
-          if (jn !== `ankle${side}` && jn !== `toes${side}`) continue;
-          const pl = gInv.clone().multiply(mesh.parent.matrixWorld);
-          mesh.matrixAutoUpdate = false;
-          mesh.matrix.copy(pl.clone().invert().multiply(squeeze).multiply(pl).multiply(mesh.matrix));
-        }
+      // The muscle layer takes the same squeeze, but it is NOT applied here:
+      // a bi-articular belly hangs off `group`, not off a foot node, so this
+      // loop could never see one (measured: it matched zero muscle meshes —
+      // every shipped foot muscle is skinned). Recording it instead puts the
+      // whole muscle side of every foot correction in one place.
+      this.#recordEndpointFix(`ankle${side}`, squeeze);
+      this.#recordEndpointFix(`toes${side}`, squeeze);
+      for (const mesh of this.layerMeshes.skeleton) {
+        const jn = this.#nodeNameOf(mesh);
+        if (jn !== `ankle${side}` && jn !== `toes${side}`) continue;
+        const pl = gInv.clone().multiply(mesh.parent.matrixWorld);
+        mesh.matrixAutoUpdate = false;
+        mesh.matrix.copy(pl.clone().invert().multiply(squeeze).multiply(pl).multiply(mesh.matrix));
       }
     }
   }
@@ -2361,13 +2812,24 @@ export class Figure {
     // view (the bones already show the joints) and invisible-but-clickable
     // otherwise. Raycasting ignores opacity, so picking is unaffected.
     for (const s of this.pickSpheres) {
-      s.material.opacity = skeleton ? 0.22 : 0;
+      s.material.opacity = (skeleton && this.picksVisible) ? 0.22 : 0;
       s.material.depthWrite = false;
       // Restore the resting depth state: hover (main.js) draws the spheres
       // through the opaque avatar, and a layer switch must not strand them there.
       s.material.depthTest = true;
       s.renderOrder = 0;
     }
+  }
+
+  // Show or hide the joint pick spheres wholesale (Present mode hides them).
+  // Routed through setLayers so the resting opacity has ONE definition, and so
+  // the hover/selection restyles in main.js — which consult picksVisible too —
+  // can never re-light a sphere the presenter has taken off the slide.
+  setPickVisible(on) {
+    this.picksVisible = on !== false;
+    // Before the first layer pick (a script calling this at load) there is no
+    // layer state to re-apply; the eventual setLayers reads the flag anyway.
+    if (this.layers) this.setLayers(this.layers);
   }
 
   // Pull a joint back inside its anatomical range. Returns HOW FAR it had to

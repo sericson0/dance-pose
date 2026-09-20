@@ -45,8 +45,11 @@ if (s.lastShown.join() !== 'dancers-section') problems.push(`last-shown = [${s.l
 // ---- 2. Each tab shows exactly its own group, and all 14 are reachable.
 const seen = new Set(v);
 for (const [tab, want] of [
-  ['teach', ['view-section', 'labels-section', 'clips-section', 'highlight-section', 'muscle-section']],
-  ['measure', ['balance-section', 'footmap-section', 'compare-section', 'sequence-section']],
+  // The keyframe timeline is a TEACHING tool (it is what a lesson video is
+  // built from), so it sits with the other slide/clip sections, not with the
+  // measurements. It is last in DOM order, which is also its visual order.
+  ['teach', ['view-section', 'labels-section', 'clips-section', 'highlight-section', 'muscle-section', 'sequence-section']],
+  ['measure', ['balance-section', 'footmap-section', 'compare-section']],
 ]) {
   await page.click(`#sidebar-tabs button[data-tab="${tab}"]`);
   await new Promise((r) => setTimeout(r, 120));

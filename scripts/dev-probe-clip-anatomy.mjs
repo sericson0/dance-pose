@@ -362,9 +362,19 @@ for (const id of ids) {
         let loCut = sorted[k - 1], hiCut = sorted[w.length - k];
         if (minW <= 0.02) loCut = 0.02;
         if (maxW >= 0.98) hiCut = 0.98;
+        // A TOE TAIL (Figure.#buildToeDigits) hands part of nodeB's share on to
+        // a third frame — the toe the tendon lies along — so that tissue is
+        // saturated toward nodeB by `weight` and yet is NOT rigid in nodeB's
+        // frame, by design. Left in the nodeB cluster it reads as the ankle end
+        // coming unglued in every toe clip (measured: 5.7–18.3 mm on the three
+        // long toe muscles, all of it the tail doing its job). Whether the tail
+        // stays on its toe is dev-verify-foot-muscles.mjs's posed check.
+        // (Not for a belly whose nodeB IS the toes — the long-extensor tendons —
+        // where the tail is the whole nodeB share and the cluster would empty.)
+        const tw = /^toes/.test(mu.sm.nodeB.userData.jointName) ? null : mu.sm.tail?.w;
         return {
           ...mu, mesh: undefined, sm: undefined, rigid: false, minW: +minW.toFixed(4), maxW: +maxW.toFixed(4),
-          _keepA: (i) => w[i] <= loCut, _keepB: (i) => w[i] >= hiCut,
+          _keepA: (i) => w[i] <= loCut, _keepB: (i) => w[i] >= hiCut && !(tw && tw[i] > 0.02),
         };
       });
 

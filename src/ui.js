@@ -165,7 +165,7 @@ export function initUI(app) {
     move: 'Click a dancer, then drag the arrows to slide them or the ring to turn them · pick the turn axis in "Turn about"',
     step: 'Click a dancer to walk them one step forward — keep clicking to walk · arrows step and turn',
     pin: 'Click a spot on one dancer, then the matching spot on the other, to hold them together · Esc cancels a half-made pin',
-    draw: 'Pick a shape, then click two points on the floor (Text: one click, then type) · Esc cancels a half-drawn shape',
+    draw: 'Click two points to draw — a JOINT pins that end to the dancer · click a finished shape to select it, then drag an end or recolour it',
     label: 'Click a bone, muscle or joint to name it; click it again to remove the label · the toolbar limits what a click may pick',
   };
   const hintEl = $('hint');
@@ -246,14 +246,33 @@ export function initUI(app) {
 
   const drawUndo = $('draw-undo');
   const drawClear = $('draw-clear');
+  const drawDelete = $('draw-delete');
+  const drawColor = $('draw-color');
+  const drawWidth = $('draw-width');
   drawUndo.addEventListener('click', () => app.removeLastDrawing());
   drawClear.addEventListener('click', () => app.clearDrawings());
+  drawDelete.addEventListener('click', () => app.removeSelectedDrawing());
+  // The swatch and the width slider are ONE control with two meanings, decided
+  // by whether a drawing is selected: restyle that one, or set the look the
+  // next one is drawn in (app.setDrawStyle owns the rule). `input` rather than
+  // `change` so dragging the slider redraws live.
+  drawColor.addEventListener('input', () => app.setDrawStyle({ color: drawColor.value }));
+  drawWidth.addEventListener('input', () => app.setDrawStyle({ width: parseFloat(drawWidth.value) }));
   const syncDrawButtons = () => {
     const empty = app.drawings.length === 0;
     drawUndo.disabled = empty;
     drawClear.disabled = empty;
+    drawDelete.disabled = !app.drawSelected;
+  };
+  // A selected drawing hands its own colour and width to the toolbar, so the
+  // controls always read the thing they would change.
+  const syncDrawStyle = () => {
+    const s = app.drawStyle;
+    drawColor.value = s.color;
+    drawWidth.value = String(s.width);
   };
   syncDrawButtons();
+  syncDrawStyle();
 
   // Collapsible sidebar sections: the heading's button folds it away. The
   // button is what carries the click (and the keyboard: Enter/Space on an <h2>
@@ -403,6 +422,26 @@ export function initUI(app) {
     dissoc: $('show-dissoc').checked,
   });
   ['show-cog', 'show-support', 'show-couple-cog', 'show-dissoc'].forEach((id) => $(id).addEventListener('change', syncViz));
+
+  // The COG plumb line's own look. WebGL cannot widen a line, so the line is a
+  // tube and this slider is its diameter. The controls act on the line you last
+  // CLICKED in the 3D view, or on all three when none is selected — the target
+  // is named beside the label so that is never a guess.
+  const cogLineWidth = $('cog-line-width');
+  const cogLineColor = $('cog-line-color');
+  const cogLineTarget = $('cog-line-target');
+  const syncCogLine = (which = app.cogLineSelected) => {
+    const s = app.cogLineStyle();
+    cogLineWidth.value = String(s.width);
+    cogLineColor.value = s.color;
+    cogLineTarget.textContent = which
+      ? { leader: 'Leader', follower: 'Follower', couple: 'Couple' }[which]
+      : 'all dancers';
+  };
+  cogLineWidth.addEventListener('input', () => app.setCogLineStyle({ width: parseFloat(cogLineWidth.value) }));
+  cogLineColor.addEventListener('input', () => app.setCogLineStyle({ color: cogLineColor.value }));
+  $('cog-line-reset').addEventListener('click', () => app.setCogLineStyle({ color: null }));
+  syncCogLine();
 
   // ---------------------------------------------------------------- labels
   // Anatomy callouts (labels.js). Authoring happens in the 3D view (Label mode)
@@ -1880,11 +1919,37 @@ export function initUI(app) {
       };
       btn('Show', 'Jump the couple to this keyframe', () => app.seqApply(i));
       btn('⟳', 'Overwrite this keyframe with the current pose', () => app.seqUpdate(i));
+      // How long this keyframe takes to reach the next one. The last keyframe
+      // has nothing to travel to, so its box is disabled rather than hidden —
+      // the column stays aligned and the reason is in the tooltip.
+      const dur = document.createElement('input');
+      dur.type = 'number';
+      dur.className = 'seq-dur';
+      dur.min = '0.2';
+      dur.max = '30';
+      dur.step = '0.1';
+      dur.value = String(app.seqDuration(i));
+      dur.disabled = i === n - 1;
+      dur.title = i === n - 1
+        ? 'The last keyframe ends the movement — nothing follows it to travel to.'
+        : `Seconds from keyframe ${i + 1} to ${i + 2}`;
+      dur.addEventListener('change', () => app.seqSetDuration(i, parseFloat(dur.value)));
+      row.appendChild(dur);
+      const unit = document.createElement('span');
+      unit.className = 'seq-dur-unit';
+      unit.textContent = 's';
+      row.appendChild(unit);
       btn('↑', 'Play this keyframe earlier', () => app.seqMove(i, -1), i === 0);
       btn('↓', 'Play this keyframe later', () => app.seqMove(i, 1), i === n - 1);
       btn('✕', 'Delete this keyframe', () => app.seqDelete(i));
       seqList.appendChild(row);
     });
+    if (n >= 2) {
+      const total = document.createElement('div');
+      total.className = 'muted seq-total';
+      total.textContent = `Whole movement: ${app.seqSeconds().toFixed(1)} s`;
+      seqList.appendChild(total);
+    }
     seqRow.hidden = n < 2;
     seqPlay.disabled = n < 2;
     seqClear.disabled = n === 0;
@@ -2302,6 +2367,13 @@ export function initUI(app) {
     },
     // A drawing was added, removed, or cleared.
     onDrawingsChanged: syncDrawButtons,
+    // A drawing was selected or deselected in the 3D view.
+    onDrawSelectionChanged() {
+      syncDrawButtons();
+      syncDrawStyle();
+    },
+    // A COG line was selected/deselected in the 3D view, or restyled.
+    onCogLineChanged: syncCogLine,
     // A label was added, removed, flipped or cleared.
     onLabelsChanged,
     // A lit muscle was clicked in the 3D view, or a callout double-clicked:

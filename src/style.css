@@ -124,6 +124,23 @@ body {
   font-weight: 600; box-shadow: inset 0 -2px 0 rgba(255,255,255,.55);
 }
 .btn-group button:hover:not(.active) { background: var(--panel-2); }
+.btn-group button:disabled { opacity: 0.45; cursor: default; }
+.btn-group button:disabled:hover { background: var(--panel); }
+
+/* A control that lives INSIDE a toolbar button group (the Draw toolbar's chalk
+   swatch and stroke-width slider), so it reads as one strip with the buttons
+   either side of it rather than as a second, floating panel. */
+.btn-group .tool-field {
+  display: flex; align-items: center; gap: 6px;
+  background: var(--panel); color: var(--muted);
+  padding: 4px 8px; font-size: 11.5px;
+  border-left: 1px solid var(--border);
+}
+.btn-group .tool-field input[type="color"] {
+  width: 26px; height: 20px; padding: 0; cursor: pointer;
+  background: none; border: 1px solid var(--border); border-radius: 4px;
+}
+.btn-group .tool-field input[type="range"] { width: 76px; accent-color: var(--accent); }
 
 #sidebar {
   position: absolute; top: 0; right: 0; bottom: 0; width: var(--sidebar-w);
@@ -319,6 +336,13 @@ button.linkish:hover { border: none; color: #fff; }
 .slider-row .lbl .val { color: var(--accent); font-variant-numeric: tabular-nums; }
 .slider-row input[type="range"] { width: 100%; accent-color: var(--accent); }
 .slider-row .range-hint { font-size: 10px; color: var(--muted); display: flex; justify-content: space-between; }
+/* A slider sharing its row with a swatch and a reset (the COG line's style). */
+.inline-row { display: flex; align-items: center; gap: 8px; }
+.inline-row input[type="range"] { flex: 1; }
+.inline-row input[type="color"] {
+  width: 28px; height: 20px; padding: 0; flex: none; cursor: pointer;
+  background: none; border: 1px solid var(--border); border-radius: 4px;
+}
 
 /* Stats */
 .stat-block { margin-bottom: 10px; }
@@ -340,6 +364,12 @@ table.cmp th { color: var(--muted); font-weight: 600; }
 .pose-item { display: flex; align-items: center; gap: 6px; padding: 3px 0; }
 .pose-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pose-item button { padding: 2px 8px; font-size: 11px; }
+/* Per-keyframe duration: narrow, because it holds "2.4" and the row already
+   carries five buttons. The unit sits outside the field so the number itself
+   stays selectable/typable. */
+.seq-dur { width: 46px; padding: 2px 4px; font-size: 11px; }
+.seq-dur-unit { color: var(--muted); font-size: 11px; margin-left: -2px; }
+.seq-total { padding-top: 4px; }
 
 /* Labels list */
 #label-detail button { padding: 4px 10px; font-size: 11.5px; }

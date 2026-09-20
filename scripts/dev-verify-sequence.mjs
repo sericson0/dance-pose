@@ -208,6 +208,79 @@ await page.evaluate(() => {
 await new Promise((r) => setTimeout(r, 400));
 await page.screenshot({ path: `${outDir}/dissociation-top.png` });
 
+// ---- per-keyframe DURATION: how long a keyframe takes to reach the next one.
+// The regression guard is the reduction: with every duration equal this has to
+// reproduce the old equal-time-per-segment split exactly, so t = 0.5 of a
+// three-keyframe chain still lands on the middle keyframe.
+const knee = (t) => page.evaluate((tt) => {
+  const app = window.__app;
+  app.applySeqT(tt);
+  return app.leader.nodes.knee_L.rotation.x * 180 / Math.PI;
+}, t);
+const durSetup = await page.evaluate(() => {
+  const app = window.__app;
+  app.setSeqStates([]);
+  app.applyPreset(1);
+  app.seqAdd();
+  app.leader.setJointDegrees({ knee_L: { x: 70 } });
+  app.seqAdd();
+  app.leader.setJointDegrees({ knee_L: { x: 10 } });
+  app.seqAdd();
+  return { durs: app.seqStates.map((s) => s.dur), total: app.seqSeconds() };
+});
+if (Math.abs(durSetup.total - 4.8) > 1e-9) problems.push(`default total ${durSetup.total}s, want 4.8 (two 2.4 s segments)`);
+const midEqual = await knee(0.5);
+if (Math.abs(midEqual - 70) > 1.5) problems.push(`equal durations: t=0.5 gave knee ${midEqual.toFixed(1)}°, want the middle keyframe's 70°`);
+const weighted = await page.evaluate(() => {
+  const app = window.__app;
+  app.seqSetDuration(0, 6); // first segment 6 s, second still 2.4
+  return { total: app.seqSeconds() };
+});
+if (Math.abs(weighted.total - 8.4) > 1e-9) problems.push(`weighted total ${weighted.total}s, want 8.4`);
+// t = 0.5 of 8.4 s is 4.2 s, still 70% of the way through the FIRST segment.
+const midWeighted = await knee(0.5);
+const wantWeighted = 70 * (4.2 / 6);
+if (Math.abs(midWeighted - wantWeighted) > 1.5) {
+  problems.push(`weighted t=0.5 knee ${midWeighted.toFixed(1)}°, want ~${wantWeighted.toFixed(1)}° — the duration is not weighting the timeline`);
+}
+const durUi = await page.evaluate(() => {
+  const app = window.__app;
+  const box = document.querySelectorAll('#seq-list .seq-dur')[1];
+  box.value = '0.5';
+  box.dispatchEvent(new Event('change'));
+  app.seqUpdate(1); // re-record that keyframe's POSE
+  const boxes = [...document.querySelectorAll('#seq-list .seq-dur')];
+  return {
+    durs: app.seqStates.map((s) => s.dur),
+    lastDisabled: boxes.at(-1).disabled,
+    total: document.querySelector('#seq-list .seq-total')?.textContent ?? null,
+  };
+});
+if (durUi.durs[1] !== 0.5) problems.push(`the row's duration box did not take: ${JSON.stringify(durUi.durs)}`);
+// ⟳ re-records the POSE; the duration is timing, and must survive it.
+if (durUi.durs[0] !== 6) problems.push(`"⟳ update" reset a duration: ${JSON.stringify(durUi.durs)}`);
+if (!durUi.lastDisabled) problems.push('the last keyframe has an editable duration — nothing follows it to travel to');
+console.log('--- durations:', JSON.stringify({ ...durUi, midEqual: +midEqual.toFixed(1), midWeighted: +midWeighted.toFixed(1) }));
+
+// …and the player really takes that long.
+const played = await page.evaluate(async () => {
+  const app = window.__app;
+  app.setSeqStates([]);
+  app.applyPreset(1);
+  app.seqAdd();
+  app.leader.setJointDegrees({ knee_L: { x: 70 } });
+  app.seqAdd();
+  app.seqSetDuration(0, 1.0);
+  const t0 = performance.now();
+  await new Promise((res) => app.playSeq(null, res));
+  return { secs: (performance.now() - t0) / 1000, asked: app.seqSeconds() };
+});
+if (Math.abs(played.secs - played.asked) > 0.35) {
+  problems.push(`a ${played.asked}s sequence played in ${played.secs.toFixed(2)}s`);
+}
+console.log(`--- duration playback: asked ${played.asked}s, took ${played.secs.toFixed(2)}s`);
+await page.evaluate(() => window.__app.setSeqStates([]));
+
 if (problems.length) console.log('\nPROBLEMS:\n' + problems.join('\n'));
 console.log('\n' + (errors.length ? `CONSOLE ERRORS:\n${errors.join('\n')}` : 'No console errors.'));
 await browser.close();
