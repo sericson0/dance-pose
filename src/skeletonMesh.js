@@ -218,7 +218,87 @@ const TRUNK_SHEETS = new Set([
 // suits maximus ruins medius (origin 0 → 32 mm) and minimus (0 → 14). Biasing
 // the contact ratio toward the pelvis, to keep more of the buttock on the bone,
 // tears the insertion off instead (2 → 15 mm at a 0.6 exponent, 72 mm at 0.3).
-const CONTACT_SHEETS = new Set(['Gluteus maximus muscle.r'].map(norm));
+//
+// THE ROTATOR CUFF AND TERES MAJOR ARE HERE FOR THE MIRROR-IMAGE REASON, and it
+// is worth stating separately because the failure looked nothing like maximus's
+// on the numbers. They arise on the blade and insert on the humerus, so the
+// table rows are right; what broke is that `#addSkinnedMuscle` measures along
+// `b - a` and sizes its window as a fraction of |b - a|. When these five rode
+// `chest`, that axis ran roughly DOWN the fibres (36-54°) over a 96-154 mm
+// projection and worked. Moving them to `scapula` — which was correct, and fixed
+// the blade sliding out from under motionless muscle — left the axis running
+// ACROSS them: teres major's fibres sit 80.0° off it and subscapularis's 80.7°,
+// so each belly projects onto only 34-53 mm of a 165.7 mm inter-node distance
+// while the window is sized off the whole of it. The window then swallows the
+// belly: 42% of teres major and 52% of subscapularis end up at mid-weight, i.e.
+// committed to neither bone, and at `sh_flex`/`sh_abd` the scapula renders as
+// BARE BONE while the untouched side stays clothed (measured before the switch:
+// teres major 228 mm of contact tissue leaving the blade with a worst edge of
+// +86 mm, subscapularis 169 mm / +38 mm).
+//
+// Contact weighting is the right instrument because it needs no axis at all —
+// which is the whole reason it exists — and a fibre direction 80° off the
+// inter-node line is exactly the case an axial split cannot express. Note the
+// diagnosis did NOT come from stretch or drift, both of which read clean here
+// (subscapularis x0.915..1.048): see dev-probe-muscle-anchor.mjs.
+const CONTACT_SHEETS = new Set([
+  'Gluteus maximus muscle.r',
+  'Supraspinatus muscle.r', 'Infraspinatus muscle.r', 'Subscapularis muscle.r',
+  'Teres major muscle.r', 'Teres minor muscle.r',
+  'Latissimus dorsi.r',
+].map(norm));
+
+// A contact sheet whose ORIGIN spreads over more bones than the one node it
+// rides. Two-bone skinning can only FOLLOW two frames, and that stays true — the
+// sheet still follows `node` — but "which bone is this tissue lying on" is a
+// separate question, and answering it against `node`'s bones alone misreads any
+// tissue lying on a neighbour as lying on nothing.
+//
+// LATISSIMUS DORSI is why this exists. It rides `chest`, but it arises from the
+// T7-L5 spinous processes, the thoracolumbar fascia and the iliac crest, so most
+// of its origin is on `spine` and `pelvis`. Against the chest cloud alone, tissue
+// on the iliac crest is ~15 cm from the ribs and — with the arm hanging — a
+// similar distance from the humerus, so contact would hand a third of it to the
+// arm. Pooling the three clouds puts it a few mm from "the origin" and it stays
+// on the back.
+//
+// What contact FIXES here is the insertion. The axial split measures latissimus
+// along chest→shoulder, which points UP and out, while its tendon runs DOWN the
+// humerus — so the further down the shaft the insertion tissue lay, the LESS
+// committed to the humerus it was: 0.94 at 50-75 mm below the joint, 0.77 at
+// 75-100, 0.53 at 100-125, with 11 of 1054 vertices fully on the bone. At 170°
+// of flexion 63% of the tissue touching the humerus left it by more than 20 mm
+// (max 196, mean 47). The other axis is no way out — measured along the humerus,
+// the lumbar origin projects further "distal" than the insertion itself and 71%
+// of the sheet welds to the arm (see #addSkinnedMuscle) — which is exactly the
+// bind contact weighting exists to escape: it needs no axis.
+//
+// `window` is the second half, and PLAIN CONTACT WITHOUT IT IS WORSE THAN THE BUG.
+// Latissimus lies over other muscle (erector spinae, serratus), so most of the
+// sheet stands 10-30 mm off bone; the raw ratio reads that stand-off as ~14%
+// humeral, and 14% of a 170° swing is ~40 mm — the sheet went forward THROUGH
+// the ribcage, ribs and lumbar vertebrae showing through it, while both END
+// metrics read beautifully. [lo, hi] remaps the ratio so tissue at or below `lo`
+// is wholly the trunk's and at or above `hi` wholly the humerus's. Swept, at
+// 170° flexion (back sheet = the 735 verts within 40 mm of the trunk and clear
+// of the humerus; insertion = the 108 touching the humerus):
+//   axial split   back 0.0 mm   insertion max 196 / mean 47, 63% > 20 mm
+//   [0, 1]        back THROUGH THE RIBS   insertion 10.5 / 2.0
+//   [0.2, 0.95]   back max 53 mm          insertion  6.8 / 0.8   worst edge 141
+//   [0.35, 0.9]   back max 0.2 mm         insertion  2.0 / 0.1   worst edge 169
+//   [0.5, 0.9]    back 0.0 mm             insertion  3.8 / 0.3   worst edge 202
+// 0.35 is the loosest window that still holds the back still. The worst edge is
+// the axillary bridge taking the arm's whole ~25 cm of travel over a short free
+// length; it renders as a continuous band up to the humerus (the posterior
+// axillary fold), where the axial split left a wisp hanging in mid-air behind
+// the arm. NOT fixed, and not new: in wide ABDUCTION the bridge bows ~10 cm
+// lateral of the arm, because DQS carries mid-weight tissue round the shoulder
+// on an arc where a taut tendon would take the chord — the same two-bone limit
+// as gluteus maximus's sling. Judge any retune on the BACK SHEET and on
+// screenshots, never on the end metrics alone.
+const CONTACT_OPTS = new Map(Object.entries({
+  'Latissimus dorsi.r': { origin: ['chest', 'spine', 'pelvis'], window: [0.35, 0.9] },
+}).map(([name, opts]) => [norm(name), opts]));
 
 // Girdle sheets now RIDE the scapula (so the blade carries them), but they are
 // back/chest-wall muscles and must keep highlighting with the Torso part. Without
@@ -282,12 +362,32 @@ const MUSCLE_INSERT = new Map(Object.entries({
     'Rectus femoris.r', 'Sartorius muscle.r', 'Gracilis muscle.r',
     'Long head of biceps femoris.r', 'Semitendinosus muscle.r', 'Semimembranosus muscle.r',
   ],
-  // Shank muscles crossing to the foot (triceps surae + the ankle/toe movers)
-  // → their distal end follows the ankle. Gastrocnemius is the classic
-  // two-joint muscle: it rides the knee and inserts across the ankle.
+  // Shank muscles crossing to the foot (the ankle/toe movers) → their distal
+  // end follows the ankle. The triceps surae is NOT here: it reaches the foot
+  // through the Achilles, which is, and the two heads of gastrocnemius ride
+  // `hip` and spend their crossing on the knee.
+  //
+  // THE SOLEUS BELONGS TO THAT DIVISION OF LABOUR TOO, and putting it here was
+  // the quadriceps bug wearing a different hat. Measured at rest it sits 85.3 mm
+  // from the ankle bone cluster and 111.9 mm from the calcaneus — it never
+  // reaches the foot at all — so by the CONTACT rule above it must not be
+  // skinned across the joint. Skinned to the ankle regardless, the sliding
+  // window parked its far weight band on mid-belly tissue and the foot towed it
+  // bodily through the arc: at 45° of plantarflexion 40% of its vertices moved
+  // (max 84.8 mm, mean 28.7 mm) measured in the TIBIA's own frame, curling the
+  // lower half of the belly off the shank and opening a 44.0 mm gap between the
+  // soleus and its own Achilles (0.0 mm at rest). That is the "calf popping off
+  // in plantarflexion" report. The Achilles already reaches the calcaneus at
+  // 2.4 mm and already does the crossing, so the `insert` slot bought nothing.
+  //
+  // Note which metrics were BLIND to this, because they are the ones the probe
+  // prints loudest: stretch read x0.947..x1.016 and drift 0.0-0.1 mm, both
+  // perfect. The belly was not being stretched, it was being TRANSPORTED — rigid
+  // in the foot's frame, which is exactly what "drift" measures as success. Only
+  // the CONTACT audit, and per-vertex motion read in the bone the tissue rests
+  // on, can see it. Same blind spot as the pre-fix quadriceps.
   ankle: [
     'Calcaneal tendon.r',
-    'Soleus muscle.r',
     'Tibialis anterior muscle.r', 'Tibialis posterior muscle.r',
     'Fibularis longus muscle.r', 'Fibularis brevis muscle.r',
     'Extensor digitorum longus.r', 'Extensor hallucis longus.r',
@@ -297,7 +397,7 @@ const MUSCLE_INSERT = new Map(Object.entries({
   // end follows the elbow, so the biceps stretches as the elbow flexes.
   elbow: [
     'Common tendon of biceps brachii.r', 'Common tendon of triceps brachii.r',
-    'Long head of biceps brachii.r', 'Short head of biceps brachii.r', 'Brachialis muscle.r',
+    'Brachialis muscle.r',
     'Long head of triceps brachii.r', 'Lateral head of triceps brachii.r',
     'Medial head of triceps brachii.r',
   ],
@@ -361,7 +461,10 @@ export function classifyMuscle(rawName) {
   // part even though they ride the pelvis node.
   if (TRUNK_SHEETS.has(n)) return { node, insert, spread: true, ride: 'spine' };
   if (GIRDLE_SHEETS.has(n)) return { node, insert, ride: 'spine' };
-  if (insert && CONTACT_SHEETS.has(n)) return { node, insert, contact: true };
+  if (insert && CONTACT_SHEETS.has(n)) {
+    const opts = CONTACT_OPTS.get(n);
+    return { node, insert, contact: true, contactOrigin: opts?.origin, contactWindow: opts?.window };
+  }
   return insert ? { node, insert } : { node };
 }
 
@@ -418,7 +521,7 @@ export async function loadMuscleMeshes(url) {
     muscles.push({
       name: o.name, label: muscleLabel(o.name),
       node: cls.node, insert: cls.insert, spread: cls.spread, contact: cls.contact,
-      ride: cls.ride, geometry: g,
+      contactOrigin: cls.contactOrigin, contactWindow: cls.contactWindow, ride: cls.ride, geometry: g,
     });
   });
   gltf.scene.traverse((o) => { if (o.isMesh) o.geometry.dispose(); });

@@ -66,7 +66,13 @@ export const FRAMES = {
 const ELBOW_90 = { elbow: { x: -71 } };             // rest already bends 19°
 const FOOT_UP = { hip: { x: -55 }, knee: { x: 65 } }; // foot clear of the floor
 
-const BICEPS = ['Biceps brachii', 'Long head of biceps brachii', 'Short head of biceps brachii'];
+// The biceps acts on the elbow THROUGH its common tendon, for the same reason
+// the quadriceps and the calf do: both heads stop ~26 mm short of the forearm,
+// so they ride the humerus and only the tendon crosses (see the `elbow` group in
+// MUSCLE_INSERT). Without the tendon in the callout an elbow row would highlight
+// only the half that cannot move there.
+const BICEPS = ['Biceps brachii', 'Long head of biceps brachii', 'Short head of biceps brachii',
+  'Common tendon of biceps brachii'];
 const TRICEPS = ['Triceps brachii', 'Long head of triceps brachii', 'Lateral head of triceps brachii', 'Medial head of triceps brachii'];
 // The thigh groups act on the KNEE through their tendons, in the same way the
 // calf acts on the ankle through the Achilles: the bellies stop well short of
@@ -84,6 +90,14 @@ const QUADS_KNEE = [...QUADS, 'Quadriceps common tendon and patellar ligament'];
 // highlight only the half that cannot move there.
 const GASTROC = ['Gastrocnemius', 'Lateral head of gastrocnemius', 'Medial head of gastrocnemius',
   'Calcaneal tendon'];
+// The soleus is the other half of the triceps surae and needs the same
+// treatment for the same reason: it stops 85 mm short of the ankle, so it rides
+// the shank rigidly and the Achilles carries it across (see the `ankle` group in
+// MUSCLE_INSERT). Naming the tendon here is what keeps this callout pointing at
+// something that can move. The callout still reads "Soleus" and still anchors on
+// the soleus belly — `applyMovers` hangs it on the first named belly that
+// resolves — so the tendon only joins the lit set, where GASTROC already puts it.
+const SOLEUS = ['Soleus', 'Soleus', 'Calcaneal tendon'];
 const ILIOPSOAS = ['Iliopsoas', 'Iliacus', 'Psoas major'];
 const ADDUCTORS = ['Adductors', 'Adductor longus', 'Adductor magnus', 'Adductor brevis'];
 const RHOMBOIDS = ['Rhomboids', 'Rhomboid major', 'Rhomboid minor'];
@@ -245,7 +259,7 @@ export const MOVEMENTS = [
   { id: 'an_pf', group: 'Ankle & foot', title: 'Ankle plantarflexion', plane: 'sagittal', frame: 'foot', pair: 'an_df',
     base: FOOT_UP, marker: ['ankle', 'toes'],
     drive: [{ joint: 'ankle', axis: 'x', to: 45 }],
-    movers: [GASTROC, 'Soleus', 'Tibialis posterior', 'Fibularis longus'] },
+    movers: [GASTROC, SOLEUS, 'Tibialis posterior', 'Fibularis longus'] },
   { id: 'an_inv', group: 'Ankle & foot', title: 'Foot inversion', plane: 'frontal', frame: 'foot', pair: 'an_ev',
     base: FOOT_UP, marker: { node: 'ankle', axis: 'x' },
     drive: [{ joint: 'ankle', axis: 'z', to: -20 }],
@@ -333,7 +347,7 @@ export const MOVEMENTS = [
     drive: [{ joint: 'ankle', axis: 'x', to: 40 }, { joint: 'toes', axis: 'x', to: -40 },
       { joint: 'ankle_L', axis: 'x', to: 40 }, { joint: 'toes_L', axis: 'x', to: -40 },
       { joint: 'ankle_R', axis: 'x', to: 40 }, { joint: 'toes_R', axis: 'x', to: -40 }],
-    movers: [GASTROC, 'Soleus', 'Flexor hallucis longus', 'Tibialis posterior', 'Fibularis longus'] },
+    movers: [GASTROC, SOLEUS, 'Flexor hallucis longus', 'Tibialis posterior', 'Fibularis longus'] },
 ];
 
 export const MOVEMENT_BY_ID = Object.fromEntries(MOVEMENTS.map((m) => [m.id, m]));
