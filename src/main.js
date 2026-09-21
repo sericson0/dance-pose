@@ -14,6 +14,7 @@ import {
   ContactPins, nearestJointNode, spotNode, STRAIN_COLOR, makeStrainLine, setStrainLine,
 } from './pins.js';
 import { resolveBodyCollision, bodyClearance, bodyContacts } from './collision.js';
+import { ElbowHold, captureArm, solveElbow, ELBOW_TOL } from './armFrame.js';
 import { Drawings } from './draw.js';
 import { createStudio } from './studio.js';
 import { initUI } from './ui.js';
@@ -200,6 +201,23 @@ const embrace = new Embrace(leader, follower);
 // holds, paradas), also re-applied every frame. See pins.js.
 const pins = new ContactPins(leader, follower);
 scene.add(pins.group);
+
+// "Fix elbows": a dancer's two elbows held where they are in the room while
+// the body turns under them — the shoulder part of a pivot. See armFrame.js.
+const elbowHold = new ElbowHold();
+scene.add(elbowHold.group);
+// A pose applied OUTRIGHT (a preset, an undo, a slide, a scrub) takes the hold
+// with it — but not at the instant it lands: the couple constraints then get a
+// frame or two to settle the new pose (the close-embrace pull and collision
+// slide a dancer several cm), and elbows captured before that would be held in
+// the room while the body was moved out from under them. So the loop
+// re-captures for this many frames instead of holding.
+let holdRecaptureFrames = 0;
+function recaptureElbowHold() {
+  if (!elbowHold.count) return;
+  elbowHold.recapture();
+  holdRecaptureFrames = 3;
+}
 
 // The first spot of a pin being authored in Pin-spots mode, awaiting its
 // partner spot: a marker that rides the clicked body part until the second
@@ -1034,6 +1052,7 @@ function trailLine(pts, baseHex) {
   }));
 }
 
+let trailReplaying = false;
 function updateCogTrail() {
   for (const line of [...trailGroup.children]) {
     line.geometry.dispose();
@@ -1042,6 +1061,10 @@ function updateCogTrail() {
   }
   const states = app.trailStates();
   if (!states) return;
+  // The replay below ends by putting back the very pose it started from, so it
+  // is not "a pose applied outright" and must not re-capture the elbow hold —
+  // mid-edit that would take the elbows' DRIFTED position as the new target.
+  trailReplaying = true;
   const saved = app.getCoupleState('__trail');
   const series = { a: [], b: [], couple: [] };
   const segs = states.length - 1;
@@ -1063,6 +1086,7 @@ function updateCogTrail() {
     series.couple.push({ x: rep.cog.x, z: rep.cog.z, ok: rep.margin !== null && rep.margin > 0 });
   }
   app.applyCoupleState(saved);
+  trailReplaying = false;
   trailGroup.add(
     trailLine(series.a, 0x7fb3e8),
     trailLine(series.b, 0xe89ab8),
@@ -1268,6 +1292,12 @@ function trunkTwistBudget(figure, dYaw) {
 // A hips twist stops when the SPINE, not the hips, has run out: turning
 // further would saturate the chest and start carrying the shoulders round —
 // the one thing the ocho dissociation is defined by not doing.
+// The frame turn's clamp, said out loud on the same terms as the hips twist's.
+function reportFrameTurn(figure, wanted, applied) {
+  if (Math.abs(wanted) < 1e-6 || Math.abs(applied) > Math.abs(wanted) - 1e-4) return;
+  app.status(`${figure.name}'s frame can't turn further — the shoulder blades and shoulders are at their limit`, 'limit');
+}
+
 function reportHipsTwist(figure, wanted, applied) {
   if (Math.abs(wanted) - Math.abs(applied) < 1e-4) return;
   const { total, spent } = trunkTwistBudget(figure, wanted);
@@ -1336,6 +1366,13 @@ function pointerRay(e) {
 const _floorPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 function floorPointAtPointer(out = new THREE.Vector3()) {
   return raycaster.ray.intersectPlane(_floorPlane, out);
+}
+
+// …and where it meets the horizontal plane at height `y` (0 = the floor).
+const _levelPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+function planePointAtPointer(y = 0, out = new THREE.Vector3()) {
+  _levelPlane.constant = -y;
+  return raycaster.ray.intersectPlane(_levelPlane, out);
 }
 
 // Accept {x,z} / {x,y,z} / Vector3 and pin it to the floor plane.
@@ -1910,7 +1947,7 @@ const app = {
   canRecord: typeof MediaRecorder !== 'undefined',
   mode: 'rotate',
   chainMode: 'open', // 'open' (move distal) | 'closed' (anchor foot, move proximal)
-  drawTool: 'line', // Draw-mode sub-tool: 'line' | 'arrow' | 'circle' | 'text'
+  drawTool: 'line', // Draw-mode sub-tool: 'line' | 'arrow' | 'circle' | 'text' | 'facing'
   drawPending: null, // first corner of a two-click shape, awaiting the second
   draw: drawings, // the Drawings instance (verification introspects its group)
   cogViz: { leader: vizLeader, follower: vizFollower, couple: vizCouple },
@@ -2236,10 +2273,12 @@ const app = {
   // drawing selected this restyles that one instead — the swatch is where you
   // look to change a colour, so it would be a poor tool if it only ever
   // applied to a shape that does not exist yet.
-  setDrawStyle({ color, width } = {}) {
-    drawings.setStyle({ color, width });
+  // `extend` (metres) runs a line or arrow on past both of its points — the
+  // same one-control-two-meanings rule as the colour and the width.
+  setDrawStyle({ color, width, extend } = {}) {
+    drawings.setStyle({ color, width, extend });
     const sel = drawings.selected;
-    if (sel) drawings.restyle(sel, { color, width });
+    if (sel) drawings.restyle(sel, { color, width, extend });
     // A half-drawn shape survives a style change — the next pointermove
     // redraws its rubber band in the new look.
     this.ui?.onDrawingsChanged?.();
@@ -2254,8 +2293,11 @@ const app = {
   selectDrawing(obj) {
     const sel = drawings.select(obj);
     if (sel) {
-      const { color, width } = sel.userData.annotation;
+      const { type, color, width, extend } = sel.userData.annotation;
       drawings.setStyle({ color, width });
+      // Only a segment HAS an extension; selecting a circle must not zero the
+      // slider the next line will be drawn with.
+      if (type === 'line' || type === 'arrow') drawings.setStyle({ extend: extend ?? 0 });
     }
     this.ui?.onDrawSelectionChanged?.(sel);
     requestRender();
@@ -2313,6 +2355,23 @@ const app = {
     const at = end.joint ? anchorFigure(end)?.surfacePos?.(end.joint) : end;
     return this.afterDrawAdded(
       drawings.addText(end, String(text), yaw ?? (at ? textYawFromCamera(at) : 0), opts));
+  },
+
+  // A FACING arrow on a committed line/arrow (its Object3D from
+  // app.draw.group, or its id): level with the floor, square to the line, from
+  // its midpoint — a line across the hip bones, then this to show where the
+  // hips point. `opts.len` is the signed length in metres; without it the arrow
+  // takes the side the dancer faces (see Drawings.addFacing).
+  addDrawFacing(line, opts = {}) {
+    const o = drawings.addFacing(line, opts);
+    return o ? this.afterDrawAdded(o) : null;
+  },
+
+  flipDrawFacing(obj = drawings.selected) {
+    const o = drawings.flipFacing(obj);
+    this.ui?.onDrawingsChanged?.();
+    requestRender();
+    return o;
   },
 
   removeLastDrawing() {
@@ -2567,7 +2626,9 @@ const app = {
   hipsRiseLimit: null,
 
   // Which handle the Move-hips gizmo offers: 'slide' translates the pelvis,
-  // 'twist' turns it under a still chest (see pivotHips).
+  // 'twist' turns it under a still chest (see pivotHips), 'frame' turns the
+  // ARM FRAME about a still chest (see turnFrame) — the three pieces a pivot is
+  // assembled from, which is why they share a toolbar.
   hipsTool: 'slide',
 
   setHipsTool(tool) {
@@ -2624,6 +2685,122 @@ const app = {
     figure.syncAtlasNodes();
     figure.group.updateMatrixWorld(true);
     return d;
+  },
+
+  // Turn the ARM FRAME about a still trunk: the two elbows orbit the
+  // chest's vertical axis as ONE RIGID PAIR — same height, same distance apart,
+  // the forearms and hands carried round with them — while the shoulder blades
+  // (one protracting, the other retracting) and the shoulder joints pay for it.
+  // It is the upper-body half of a pivot: in an embrace the frame belongs to
+  // the couple, so when a dancer's trunk turns against it, THIS is the motion
+  // the shoulders make. (`setElbowsFixed` is the same motion from the other
+  // frame: the elbows stay in the room and the body turns under them.)
+  //
+  // Absolute, not incremental: the elbows are captured once in the CHEST's
+  // frame and every call re-derives the pose from that base and the total yaw,
+  // so a long drag cannot drift and turning back retraces the way out. The
+  // base is re-captured when anything else has re-posed those arms since (the
+  // signature check) — another tool, a preset, the embrace re-settling.
+  //
+  // Returns the yaw actually applied: when the blades and shoulders run out of
+  // range the elbows can no longer reach their rigid targets, and the turn
+  // backs off (bisection on the elbow residual) to the last angle that holds
+  // the frame together rather than letting it deform.
+  frameState: null,
+
+  turnFrame(figure, dYaw) {
+    this.markEdit(figure);
+    figure.group.updateMatrixWorld(true);
+    const chest = figure.nodes.chest;
+    const sig = () => FRAME_JOINTS.map((n) => {
+      const r = figure.nodes[n].rotation;
+      return `${r.x.toFixed(6)},${r.y.toFixed(6)},${r.z.toFixed(6)}`;
+    }).join('|');
+    let st = this.frameState;
+    if (!st || st.figure !== figure || st.sig !== sig()) {
+      const inv = chest.matrixWorld.clone().invert();
+      const qInv = chest.getWorldQuaternion(new THREE.Quaternion()).invert();
+      st = { figure, yaw: 0, arms: {} };
+      for (const side of ['L', 'R']) {
+        const arm = captureArm(figure, side);
+        st.arms[side] = {
+          pos: arm.pos.clone().applyMatrix4(inv),     // chest-local: survives the
+          quat: qInv.clone().multiply(arm.quat),      // dancer being moved mid-turn
+          ref: arm.ref,
+        };
+      }
+      this.frameState = st;
+    }
+    const pivot = chest.getWorldPosition(new THREE.Vector3());
+    const chestQ = chest.getWorldQuaternion(new THREE.Quaternion());
+    const turn = new THREE.Quaternion();
+    const apply = (yaw) => {
+      turn.setFromAxisAngle(_UP, yaw);
+      let miss = 0;
+      for (const side of ['L', 'R']) {
+        const a = st.arms[side];
+        const target = a.pos.clone().applyMatrix4(chest.matrixWorld)
+          .sub(pivot).applyQuaternion(turn).add(pivot);
+        const quat = turn.clone().multiply(chestQ).multiply(a.quat);
+        miss = Math.max(miss, solveElbow(figure, side, target, quat, a.ref));
+      }
+      return miss;
+    };
+    // Tighter than the hold's strain threshold: this is the rigidity of the
+    // frame itself, and 8 mm of give at the clamp reads as the elbows drifting.
+    const TOL = ELBOW_TOL / 4;
+    const from = st.yaw;
+    let to = from + dYaw;
+    if (apply(to) > TOL) {
+      let lo = from;
+      let hi = to;
+      for (let i = 0; i < 8; i++) {
+        const mid = (lo + hi) / 2;
+        if (apply(mid) > TOL) hi = mid; else lo = mid;
+      }
+      to = lo;
+      apply(to);
+    }
+    st.yaw = to;
+    st.sig = sig();
+    st.stamp = performance.now();
+    figure.syncAtlasNodes();
+    figure.group.updateMatrixWorld(true);
+    // A dancer whose elbows are also FIXED has just had them moved on purpose:
+    // the hold follows, or it would drag them straight back next frame.
+    if (elbowHold.has(figure)) elbowHold.recapture(figure);
+    return to - from;
+  },
+
+  // "Fix elbows": hold `figure`'s two elbows where they are IN THE ROOM while
+  // other joints (or the whole figure) move — turn the chest, twist the hips or
+  // pivot the dancer on the support foot, and the shoulders and shoulder blades
+  // absorb it. `figure` is a Figure, an index, or 'leader' / 'follower'.
+  setElbowsFixed(figure, on) {
+    const fig = typeof figure === 'string'
+      ? this.figures[figure === 'follower' ? 1 : 0]
+      : (typeof figure === 'number' ? this.figures[figure] : figure);
+    if (!fig) return false;
+    const was = elbowHold.has(fig);
+    const now = elbowHold.set(fig, !!on);
+    if (was !== now) this.ui?.onElbowsFixedChanged?.();
+    return now;
+  },
+
+  elbowsFixed(figure) {
+    const fig = typeof figure === 'string'
+      ? this.figures[figure === 'follower' ? 1 : 0]
+      : (typeof figure === 'number' ? this.figures[figure] : figure);
+    return elbowHold.has(fig);
+  },
+
+  // The hold's live targets, for verification: [{ figure, side, pos }].
+  elbowHoldTargets() {
+    const out = [];
+    for (const [fig, h] of elbowHold.held) {
+      for (const side of ['L', 'R']) out.push({ figure: this.figures.indexOf(fig), side, pos: h[side].pos.toArray() });
+    }
+    return out;
   },
 
   setChainMode(mode) {
@@ -3121,13 +3298,14 @@ const app = {
       figure.group.updateMatrixWorld(true);
       const contacts = footContactsBySide(figure);
       this.hipsPlant = { L: contacts.L.length > 0, R: contacts.R.length > 0 };
-      figure.worldPos('pelvis', hipsTarget.position);
+      // The frame turn's ring sits at the CHEST, the axis the elbows orbit.
+      figure.worldPos(this.hipsTool === 'frame' ? 'chest' : 'pelvis', hipsTarget.position);
       hipsTarget.rotation.set(0, 0, 0);
       hipsTarget.userData.figure = figure;
       hipsTarget.visible = true;
       this.hipsState = { figure, last: hipsTarget.position.clone(), lastYaw: 0 };
       tcontrols.attach(hipsTarget);
-      if (this.hipsTool === 'twist') {
+      if (this.hipsTool === 'twist' || this.hipsTool === 'frame') {
         tcontrols.setMode('rotate');
         tcontrols.showY = true;
         tcontrols.showX = tcontrols.showZ = false;
@@ -3154,6 +3332,7 @@ const app = {
     // posed before the preset (see embraceEditing).
     this.lastEditedFigure = null;
     preset.apply(leader, follower);
+    recaptureElbowHold(); // a pose that arrives whole moves the hold with it
     // Move hips keeps offering its handle across pose changes.
     if (this.mode === 'hips') this.setMode('hips');
     if (this.ui) this.ui.onPoseChanged();
@@ -3203,6 +3382,10 @@ const app = {
       state.meta.masses.forEach((m, i) => { this.figures[i].mass = m; });
     }
     state.figures.forEach((pose, i) => this.figures[i].setPose(pose));
+    // A pose applied outright takes the elbow hold with it (see
+    // ElbowHold.recapture) — except the COG trail's own restore, which puts
+    // back the pose it started from in the middle of whatever edit caused it.
+    if (!trailReplaying) recaptureElbowHold();
     // Only a slide carries a view. A pose-only state — every file saved before
     // slides existed, plus A/B snapshots, keyframes and undo entries — leaves
     // the layer, camera and labels exactly where the user has them.
@@ -3229,6 +3412,7 @@ const app = {
     // here, so this is a no-op on that path.
     this.interpT = t;
     applyStatesT([this.interpStates.A, this.interpStates.B], t);
+    recaptureElbowHold();
   },
 
   // Play A→B. `from` overrides the resume rule for scripts: 0 replays from the
@@ -3594,8 +3778,11 @@ const app = {
     // is dropped only when its LAST owner does.
     this.onSeqChanged(); // invalidates the cache, so the union below is the survivors'
     const orphans = (removed?.kf?.own ?? []).filter((id) => !ownedDrawIds().has(id));
+    // …with the facing arrows standing on them, which leave the floor with
+    // their line (Drawings.remove cascades) and so must come back with it.
+    const going = drawings.withDependents(orphans);
     const records = drawings.list()
-      .filter((a) => orphans.includes(a.id))
+      .filter((a) => going.includes(a.id))
       .map((a) => JSON.parse(JSON.stringify(a)));
     if (records.length) {
       for (const o of [...drawings.group.children]) {
@@ -4005,6 +4192,7 @@ const app = {
     if (this.selected || this.ikState) this.deselect();
     this.seqT = t;
     applyStatesT(this.seqStates, t, { ease: this.seqEase() });
+    recaptureElbowHold();
   },
 
   // Play the sequence, carrying on from wherever the scrubber sits (see
@@ -4177,7 +4365,7 @@ function hideGizmos() {
   // The drawings themselves stay in shot (they ARE the teaching diagram); their
   // endpoint handles are editing chrome and go with the gizmos.
   for (const o of [tcontrols, turnControls, ikTarget, swivelTarget, caressTarget, hipsTarget,
-    handleStrain, pins.group, pinPendingMarker, drawings.handleGroup, drawings.previewGroup,
+    handleStrain, pins.group, elbowHold.group, pinPendingMarker, drawings.handleGroup, drawings.previewGroup,
     ...leader.pickSpheres, ...follower.pickSpheres]) {
     if (o.visible) { hidden.push(o); o.visible = false; }
   }
@@ -4372,7 +4560,16 @@ function applyHandleChange() {
     if (app.ui) app.ui.refreshJointValues();
   } else if (app.hipsState && tcontrols.object === hipsTarget) {
     const { figure, last } = app.hipsState;
-    if (app.hipsTool === 'twist') {
+    if (app.hipsTool === 'frame') {
+      // Frame turn: the ring's delta orbits the elbows about the chest. Wound
+      // back to what was applied, like the hips twist, so the ring cannot run
+      // away from a frame that has stopped.
+      const want = hipsTarget.rotation.y - app.hipsState.lastYaw;
+      const applied = app.turnFrame(figure, want);
+      reportFrameTurn(figure, want, applied);
+      app.hipsState.lastYaw += applied;
+      hipsTarget.rotation.y = app.hipsState.lastYaw;
+    } else if (app.hipsTool === 'twist') {
       // Hips twist: the ring's delta yaws the pelvis under a still chest. The
       // trunk's counter-twist range clamps it, so wind the handle back to what
       // was actually applied or the ring runs away from the body.
@@ -4755,7 +4952,9 @@ renderer.domElement.addEventListener('pointermove', (e) => {
     // floor, which is also how an anchored end is detached again.
     const type = drawHandleDrag.obj?.userData.annotation?.type;
     const anchor = ANCHOR_TOOLS.has(type) ? jointAnchorAtPointer() : null;
-    const p = anchor ? null : floorPointAtPointer();
+    // The plane the handle travels in: the floor, except for a facing arrow's
+    // tip, which lives at its line's height (Drawings.handlePlaneY).
+    const p = anchor ? null : planePointAtPointer(drawings.handlePlaneY(drawHandleDrag.obj));
     if (anchor || p) {
       // moveHandle rebuilds the shape from its annotation, so the object (and
       // its handles) are replaced each move — track the replacement or the
@@ -4936,12 +5135,28 @@ function handleDrawClick() {
   // a line crossing an earlier one could never be finished.
   if (!app.drawPending) {
     const hit = drawings.pickAt(raycaster);
+    // The Facing tool's one click lands ON a line: that line gets an arrow
+    // square to it, level with the floor. Anything else under the cursor is
+    // selected as usual, so the tool never becomes a trap.
+    const hitType = hit?.userData.annotation?.type;
+    if (app.drawTool === 'facing' && (hitType === 'line' || hitType === 'arrow')) {
+      const made = app.addDrawFacing(hit);
+      if (made) {
+        app.selectDrawing(made);
+        app.status('Facing arrow added — drag the ball at its tip to lengthen it, or across the line to flip it.', 'info');
+      }
+      return;
+    }
     if (hit) {
       app.selectDrawing(hit);
       app.status('Drawing selected — drag the ball at either end to move it (onto a joint to attach it there, onto the floor to detach), or recolour/resize it in the toolbar. Del removes it.', 'info');
       return;
     }
     if (app.drawSelected) app.selectDrawing(null);
+    if (app.drawTool === 'facing') {
+      app.status('Facing: click a LINE you have drawn (say, hip bone to hip bone) — it gets an arrow square to it, level with the floor.', 'info');
+      return;
+    }
   }
   // An end landing on a JOINT anchors there instead of on the floor, which is
   // what lets a teaching line run through a dancer and stay with them — and,
@@ -5194,6 +5409,18 @@ function embraceEditing() {
   return settled;
 }
 
+// Is `figure`'s arm frame being turned right now (Move hips → Frame)? True for
+// the drag and the same short hold an edit gets, so the embrace does not snatch
+// the arms back between two pointermoves.
+function frameTurning(figure) {
+  const st = app.frameState;
+  return !!st && st.figure === figure && st.stamp
+    && (gizmoDragging() || performance.now() - st.stamp < EDIT_HOLD_MS);
+}
+
+// The joints a frame turn / elbow hold drives, per dancer.
+const FRAME_JOINTS = ['scapula_L', 'shoulder_L', 'elbow_L', 'scapula_R', 'shoulder_R', 'elbow_R'];
+
 // The one arm the user is posing right now, as { figure, side } for body
 // collision (so it can't be pushed through the partner) — null unless the edit
 // targets an arm joint. See resolveBodyCollision.
@@ -5364,13 +5591,42 @@ function animate() {
   leader.clampToFloor();
   follower.clampToFloor();
 
+  // The elbow hold is live except while a pose is being PLAYED at the dancers
+  // (a sequence, A→B, a capture, a clip): the player rewrites the arms every
+  // frame, so the hold follows instead of fighting it, and picks up again from
+  // wherever the playback leaves the elbows.
+  const holdLive = elbowHold.count > 0 && holdRecaptureFrames <= 0
+    && !(studio.clipActive || app.seqPlaying || app.interpPlaying || app.recording);
+  if (holdRecaptureFrames > 0) { holdRecaptureFrames--; requestSim(2); }
   if (!held) {
-    embrace.maintainHands(editing);
+    // An arm the elbow hold or a live frame turn is driving belongs to it; the
+    // embrace treats it as it treats an arm the user is posing.
+    embrace.maintainHands(editing, (figure) => (holdLive && elbowHold.has(figure))
+      || frameTurning(figure));
 
     // Contact pins, limb half: an adapting arm/leg re-solves so its pinned spot
     // reaches the partner's. After the embrace hands so a pin on an embrace arm
     // deliberately wins (the pin is the more specific intent).
     pins.maintainLimbs(editing?.figure ?? null);
+  }
+  // Fixed elbows, LAST: the most specific intent on those arms, so it has the
+  // final word over the embrace hands and an arm pin. Runs in Anchor mode too —
+  // it moves nobody but the dancer's own arms.
+  if (elbowHold.count) {
+    if (holdLive) {
+      elbowHold.maintain(editing);
+      // Said only while the user is actually moving something: the constraint
+      // runs every frame, and a standing message about a pose nobody is
+      // touching would never clear.
+      const s = performance.now() - app.editStamp < EDIT_HOLD_MS ? elbowHold.strained() : null;
+      if (s) {
+        app.status(`${s.figure.name}'s ${s.side === 'L' ? 'left' : 'right'} elbow can't stay there — the shoulder is at its limit`, 'limit');
+      }
+    } else {
+      elbowHold.recapture();
+    }
+    // Editing chrome: off the slide with the rest (Present, and so a capture).
+    elbowHold.group.visible = !app.presenting;
   }
   pins.updateVisuals();
   if (app.pinPending) {
@@ -5652,6 +5908,19 @@ window.addEventListener('keydown', (e) => {
     nudgeHistory();
     // Hips-twist: ←/→ turn the pelvis under the still chest instead of sliding
     // the handle; the other keys still slide/raise it.
+    if (handle === hipsTarget && app.hipsTool === 'frame') {
+      // Frame turn: ←/→ orbit the elbows about the chest; the ring has no
+      // position to nudge, so the other keys are simply swallowed.
+      if (k === 'ArrowLeft' || k === 'ArrowRight') {
+        const want = (k === 'ArrowLeft' ? 1 : -1) * NUDGE_TURN * coarse;
+        const applied = app.turnFrame(app.hipsState.figure, want);
+        reportFrameTurn(app.hipsState.figure, want, applied);
+        app.hipsState.lastYaw += applied;
+        hipsTarget.rotation.y = app.hipsState.lastYaw;
+        if (app.ui) app.ui.refreshJointValues();
+      }
+      return;
+    }
     if (handle === hipsTarget && app.hipsTool === 'twist'
         && (k === 'ArrowLeft' || k === 'ArrowRight')) {
       const want = (k === 'ArrowLeft' ? 1 : -1) * NUDGE_TURN * coarse;

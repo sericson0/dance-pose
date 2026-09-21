@@ -414,9 +414,23 @@ export class Embrace {
   // The arm frame. `editing` is { figure, jointName } (or null): if the user
   // is posing one of the four embrace arms, that arm is left alone — on the
   // open side the clasp follows its hand and only the partner's arm re-solves.
-  maintainHands(editing) {
+  //
+  // `owns(figure, side)` extends that to arms another constraint is holding
+  // (the elbow hold and the frame turn — armFrame.js): an owned arm is treated
+  // exactly like an edited one, so a dancer whose elbows are fixed keeps her
+  // hands where they are and the PARTNER's open-side hand comes to meet hers,
+  // instead of the two solves dragging one arm back and forth every frame.
+  maintainHands(editing, owns = null) {
     if (!this.hands) { this.heldPartially = false; return; }
-    const edited = this.#editedArm(editing);
+    const userEdited = this.#editedArm(editing);
+    const owned = (key) => key === userEdited
+      || !!owns?.(this.figure(ARMS[key].role), ARMS[key].wrist.slice(-1));
+    // Both open-side hands spoken for: there is no free arm to bring to the
+    // other, so the clasp is left exactly as its two owners have it.
+    const openBoth = owned('leaderOpen') && owned('followerOpen');
+    const edited = openBoth ? null
+      : owned('leaderOpen') ? 'leaderOpen'
+        : owned('followerOpen') ? 'followerOpen' : null;
     const t = this.palmGap() / 2;
 
     // Open side: palms joined around the shared clasp point — the leader's
@@ -424,7 +438,9 @@ export class Embrace {
     // both hands' fingers aimed up the clasp's tilted vertical and the palm
     // surfaces facing each other across it (his toward her, hers toward
     // him).
-    if (edited === 'leaderOpen' || edited === 'followerOpen') {
+    if (openBoth) {
+      // nothing to solve on the open side
+    } else if (edited === 'leaderOpen' || edited === 'followerOpen') {
       const arm = ARMS[edited];
       const palm = handCenter(this.figure(arm.role), arm.wrist.slice(-1));
       const out = this.#claspOutward();
@@ -469,13 +485,13 @@ export class Embrace {
     // flag is what ui.js reads to say the arms have been released.
     this.heldPartially = !this.#facing();
     if (this.heldPartially) return;
-    if (edited !== 'leaderClosed') {
+    if (!owned('leaderClosed')) {
       this.#solveArm('leaderClosed', this.closedTargetWorld('leaderClosed'));
       const dir = this.follower.worldPos('chest')
         .sub(handCenter(this.leader, 'R'));
       if (dir.lengthSq() > 1e-8) this.#pronate(this.leader, ARMS.leaderClosed, dir.normalize());
     }
-    if (edited !== 'followerClosed') {
+    if (!owned('followerClosed')) {
       this.#solveArm('followerClosed', this.closedTargetWorld('followerClosed'));
       // Same rule as his: a palm resting on a back faces INTO the body, so aim
       // it at the partner's chest node — the torso axis, which is square to

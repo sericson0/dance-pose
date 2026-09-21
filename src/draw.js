@@ -32,6 +32,21 @@
 // driven by the CAMERA, not by the pose, so main.js runs it on view-only
 // frames too. See the note on updateBillboards.
 //
+// A segment can be EXTENDED past its two points (`extend`, metres each way): a
+// line through the hips is about the AXIS the hips define, and an axis that
+// stops at the bones is hard to compare with the floor or the partner. The
+// record's ends stay where they were authored — the handles, the anchors and a
+// facing arrow's midpoint all read the true ends — only the drawn stroke runs
+// on. Absent means 0, so every record saved before it is byte-identical.
+//
+// A FACING arrow (`type: 'facing'`) is the one shape defined by ANOTHER shape:
+// `of` names a line, and the arrow springs from that line's midpoint, parallel
+// to the floor and perpendicular to the line — "the hips are this line, and
+// THIS is where they point". It stores only a signed length (the sign picks
+// which of the two perpendiculars), so it cannot disagree with its line: it is
+// re-placed whenever the line is, rides the dancer if the line does, and goes
+// when the line goes.
+//
 // Every record also carries a stable `id`. A diagram is authored work — it
 // survives a reload (toJSON/fromJSON, saved by ui.js) and a sequence keyframe
 // may name a subset of it (`kf.draw`), so a drawing needs a name that outlives
@@ -55,6 +70,16 @@ const TEXT_H = 0.16;         // world height of a text line at the default width
 // is no lift handle: the floor-plane handle system cannot express a height, and
 // the joint list already gives the user the choice that matters.
 const TEXT_LIFT = 0.25;
+
+// A facing arrow's default length and the shortest a handle drag may leave it
+// (metres). Long enough to read past the body it springs from — the hip line's
+// midpoint is inside the pelvis, ~12 cm from the front of the belly.
+const FACING_LEN = 0.4;
+const FACING_MIN = 0.08;
+
+// How far a stroke may run on past each of its points (the toolbar's Extend
+// slider), in metres.
+export const DRAW_EXTEND_RANGE = { min: 0, max: 1, step: 0.02 };
 
 // The stroke width the toolbar offers, in metres: thin enough to annotate a
 // single foot, fat enough to read from the back of a room.
@@ -83,7 +108,7 @@ const ANCHORED_RENDER_ORDER = 6;
 // past before it is handed to #build, which otherwise falls through to the text
 // branch and dies on a missing string. Stored files are user data; a corrupt or
 // hand-edited one must cost the drawings it names, not the session.
-const TYPES = new Set(['line', 'arrow', 'circle', 'text']);
+const TYPES = new Set(['line', 'arrow', 'circle', 'text', 'facing']);
 
 // One unit-cylinder, reused by every 3D stroke: a tube from (0,0,0) to (0,1,0)
 // of radius 1, so a stroke is a scale + a rotation + a position, and moving with
@@ -96,6 +121,21 @@ const _up = new THREE.Vector3(0, 1, 0);
 const _dir = new THREE.Vector3();
 const _pa = new THREE.Vector3();
 const _pb = new THREE.Vector3();
+const _fwd = new THREE.Vector3();
+const _q = new THREE.Quaternion();
+
+// Run a stroke on past both of its points by `ext` metres, in place. The
+// direction is the segment's own (3D for an anchored one), so an extended line
+// is the same line, longer.
+function extendEnds(a, b, ext) {
+  if (!(ext > 0)) return;
+  _dir.subVectors(b, a);
+  const len = _dir.length();
+  if (len < 1e-6) return;
+  _dir.divideScalar(len);
+  a.addScaledVector(_dir, -ext);
+  b.addScaledVector(_dir, ext);
+}
 
 // Lay a unit tube/cone mesh along a → b (both THREE.Vector3).
 function placeAlong(mesh, a, b, radius, { fromEnd = false, length = null } = {}) {
@@ -134,7 +174,7 @@ export class Drawings {
     this.handleGroup.name = 'drawing-handles';
     // The look the NEXT shape is authored in (the Draw toolbar's swatch and
     // width slider write here).
-    this.style = { ...DEFAULT_DRAW_STYLE };
+    this.style = { ...DEFAULT_DRAW_STYLE, extend: 0 };
     this.selected = null;
     // The dancers an anchored end may ride, by index (0 = leader). Stored as
     // indices in the annotation so a sequence/JSON round trip survives.
@@ -203,8 +243,26 @@ export class Drawings {
     return ann?.type === 'text' && !!(ann.posAt || (ann.lift ?? 0) > 0);
   }
 
+  // The record with this id, or null. A facing arrow finds its line this way
+  // every time it is placed, so it holds no reference that a #replace (which
+  // swaps the line's Object3D on every restyle or end drag) could leave stale.
+  #annById(id) {
+    if (!id) return null;
+    for (const o of this.group.children) {
+      if (o.userData.annotation?.id === id) return o.userData.annotation;
+    }
+    return null;
+  }
+
+  // Must this shape be re-placed when the POSE changes? Its own anchors — or,
+  // for a facing arrow, its line's.
+  #rides(ann) {
+    if (ann?.type === 'facing') return Drawings.anchored(this.#annById(ann.of));
+    return Drawings.anchored(ann);
+  }
+
   get anchoredCount() {
-    return this.group.children.filter((o) => Drawings.anchored(o.userData.annotation)).length;
+    return this.group.children.filter((o) => this.#rides(o.userData.annotation)).length;
   }
 
   // How many shapes must re-aim when the CAMERA moves. Deliberately a separate
@@ -215,9 +273,10 @@ export class Drawings {
       + this.previewGroup.children.filter((o) => o.userData.billboard).length;
   }
 
-  setStyle({ color, width } = {}) {
+  setStyle({ color, width, extend } = {}) {
     if (color) this.style.color = color;
     if (Number.isFinite(width)) this.style.width = width;
+    if (Number.isFinite(extend)) this.style.extend = Math.max(0, extend);
     return this.style;
   }
 
@@ -258,13 +317,23 @@ export class Drawings {
   // every later edit — restyle and moveHandle both build their new record off
   // the old one, so a keyframe's reference to a drawing survives being
   // recoloured, re-weighted or dragged by an end.
-  #styled(ann, { color, width } = {}) {
-    return {
+  //
+  // `extend` is deliberately NOT defaulted from the running style here: this
+  // also runs on every RESTORED record, and a line saved without an extension
+  // must not pick up whatever the toolbar's slider happens to read. The add*
+  // methods pass the running value explicitly; a record with none keeps no key.
+  #styled(ann, { color, width, extend } = {}) {
+    const next = {
       ...ann,
       id: ann.id || this.#nextId(),
       color: color ?? ann.color ?? this.style.color,
       width: width ?? ann.width ?? this.style.width,
     };
+    if (ann.type === 'line' || ann.type === 'arrow') {
+      const ext = extend ?? ann.extend ?? 0;
+      if (ext > 0) next.extend = ext; else delete next.extend;
+    }
+    return next;
   }
 
   // The one place an annotation becomes geometry. Callers never build meshes
@@ -275,30 +344,29 @@ export class Drawings {
     // An anchored line/arrow is real 3D geometry, laid out by #placeAnchored
     // (which also runs every frame). Built once as unit meshes: the dancer
     // moving only ever changes a transform.
-    if ((ann.type === 'line' || ann.type === 'arrow') && Drawings.anchored(ann)) {
+    if (ann.type === 'facing'
+      || ((ann.type === 'line' || ann.type === 'arrow') && Drawings.anchored(ann))) {
       const g = new THREE.Group();
       const mat = this.#material({
         preview, color,
         mat: { depthTest: false, side: THREE.FrontSide, polygonOffset: false },
       });
       g.add(new THREE.Mesh(UNIT_TUBE, mat));
-      if (ann.type === 'arrow') g.add(new THREE.Mesh(UNIT_CONE, mat));
+      if (ann.type !== 'line') g.add(new THREE.Mesh(UNIT_CONE, mat));
       g.userData.anchored = true;
       this.#placeAnchored(g, ann);
       return g;
     }
     if (ann.type === 'line') {
       const g = new THREE.Group();
-      const a = { x: ann.a[0], z: ann.a[1] };
-      const b = { x: ann.b[0], z: ann.b[1] };
+      const [a, b] = this.#flatEnds(ann);
       g.add(this.#stroke(a, b, w, this.#material({ preview, color })));
       return g;
     }
     if (ann.type === 'arrow') {
       const mat = this.#material({ preview, color });
       const g = new THREE.Group();
-      const a = { x: ann.a[0], z: ann.a[1] };
-      const b = { x: ann.b[0], z: ann.b[1] };
+      const [a, b] = this.#flatEnds(ann);
       const dir = new THREE.Vector3(b.x - a.x, 0, b.z - a.z);
       const len = dir.length();
       // The head scales with the stroke, or a fat line grows a pinhead and a
@@ -401,6 +469,33 @@ export class Drawings {
     return mesh;
   }
 
+  // The DRAWN ends of a floor segment: its two points, run on by `extend`.
+  #flatEnds(ann) {
+    const a = new THREE.Vector3(ann.a[0], 0, ann.a[1]);
+    const b = new THREE.Vector3(ann.b[0], 0, ann.b[1]);
+    extendEnds(a, b, ann.extend ?? 0);
+    return [a, b];
+  }
+
+  // Where a facing arrow springs from and where it points, from its line's LIVE
+  // ends: the midpoint, and up × (b − a) — horizontal by construction, and
+  // perpendicular to the line however the line is tilted (a hip line on a
+  // dancer with a dropped hip still yields a level arrow). Returns false when
+  // there is nothing to stand on: the line is gone, or it is vertical and has
+  // no horizontal perpendicular.
+  #facingFrame(ann, mid, dir) {
+    const line = this.#annById(ann.of);
+    if (!line) return false;
+    this.endWorld(line, 'a', _pa);
+    this.endWorld(line, 'b', _pb);
+    mid.addVectors(_pa, _pb).multiplyScalar(0.5);
+    dir.subVectors(_pb, _pa);
+    dir.crossVectors(_up, dir); // up × (b − a)
+    if (dir.lengthSq() < 1e-10) return false;
+    dir.normalize();
+    return true;
+  }
+
   // Lay an anchored shape's unit meshes between its two live end points. Called
   // at build time and again every frame the dancers move — nothing here
   // allocates, so it is safe in the render loop.
@@ -416,10 +511,24 @@ export class Drawings {
       return;
     }
     const r = (ann.width ?? LINE_W) / 2;
-    this.endWorld(ann, 'a', _pa);
-    this.endWorld(ann, 'b', _pb);
     const [tube, head] = obj.children;
-    if (ann.type === 'arrow') {
+    if (ann.type === 'facing') {
+      const mid = new THREE.Vector3();
+      const dir = new THREE.Vector3();
+      // A facing arrow with no line to stand on draws nothing, rather than
+      // pointing somewhere arbitrary.
+      const ok = this.#facingFrame(ann, mid, dir);
+      tube.visible = ok;
+      head.visible = ok;
+      if (!ok) return;
+      _pa.copy(mid);
+      _pb.copy(mid).addScaledVector(dir, ann.len);
+    } else {
+      this.endWorld(ann, 'a', _pa);
+      this.endWorld(ann, 'b', _pb);
+      extendEnds(_pa, _pb, ann.extend ?? 0);
+    }
+    if (ann.type !== 'line') {
       const len = _pa.distanceTo(_pb);
       // The head scales with the stroke and is capped on a short arrow, exactly
       // as the flat one is — a fat line must not grow a pinhead.
@@ -468,7 +577,7 @@ export class Drawings {
   updateAnchored() {
     for (const o of this.group.children) {
       const ann = o.userData.annotation;
-      if (Drawings.anchored(ann)) this.#placeAnchored(o, ann);
+      if (this.#rides(ann)) this.#placeAnchored(o, ann);
     }
     for (const o of this.previewGroup.children) {
       const ann = o.userData.annotation;
@@ -476,7 +585,7 @@ export class Drawings {
     }
     // The handles ride along, but by moving the meshes — rebuilding them every
     // frame would churn geometry for a drag that is already in flight.
-    if (this.selected && Drawings.anchored(this.selected.userData.annotation)) this.#syncHandles();
+    if (this.selected && this.#rides(this.selected.userData.annotation)) this.#syncHandles();
   }
 
   #commit(obj, annotation, preview) {
@@ -564,14 +673,74 @@ export class Drawings {
 
   addLine(a, b, opts = {}) {
     const base = this.#end(b, this.#end(a, { type: 'line' }, 'a'), 'b');
-    const ann = this.#styled(base, opts);
+    const ann = this.#styled(base, { ...opts, extend: opts.extend ?? this.style.extend });
     return this.#commit(this.#build(ann, opts.preview), ann, opts.preview);
   }
 
   addArrow(a, b, opts = {}) {
     const base = this.#end(b, this.#end(a, { type: 'arrow' }, 'a'), 'b');
-    const ann = this.#styled(base, opts);
+    const ann = this.#styled(base, { ...opts, extend: opts.extend ?? this.style.extend });
     return this.#commit(this.#build(ann, opts.preview), ann, opts.preview);
+  }
+
+  // A FACING arrow on `line` (a committed line/arrow object, or its id): from
+  // the line's midpoint, level with the floor, square to the line. `opts.len`
+  // is the SIGNED length — the sign picks which of the two perpendiculars. With
+  // none given the arrow takes the side the dancer FACES when the line is
+  // pinned to one (the trunk segment the anchor hangs off supplies "forward",
+  // so a hip line on twisted hips points where the HIPS point, not where the
+  // chest does); an unanchored line has no front, and takes the positive side.
+  // Either way, dragging the tip across the line flips it.
+  addFacing(line, opts = {}) {
+    const parent = typeof line === 'string'
+      ? this.#annById(line) : line?.userData?.annotation;
+    if (!parent || (parent.type !== 'line' && parent.type !== 'arrow')) return null;
+    let len = opts.len;
+    if (!Number.isFinite(len) || len === 0) {
+      len = FACING_LEN;
+      const mid = new THREE.Vector3();
+      const dir = new THREE.Vector3();
+      if (this.#facingFrame({ of: parent.id }, mid, dir)
+        && this.#forwardOf(parent, _fwd) && dir.dot(_fwd) < 0) len = -len;
+    }
+    const ann = this.#styled({ type: 'facing', of: parent.id, len }, opts);
+    return this.#commit(this.#build(ann, opts.preview), ann, opts.preview);
+  }
+
+  // The horizontal "forward" of the dancer a line is pinned to, or false. Read
+  // off the nearest TRUNK segment above the anchor joint (pelvis for a hip,
+  // chest for a shoulder) — the figure's own root would miss a dissociation,
+  // which is exactly the thing a facing arrow is drawn to show.
+  #forwardOf(ann, out) {
+    const at = ann.aAt || ann.bAt;
+    const fig = at && this.figures[at.fig];
+    if (!fig?.nodes?.[at.joint]) return false;
+    const trunk = ['pelvis', 'spine', 'chest', 'neck', 'head'].map((n) => fig.nodes[n]);
+    let node = fig.nodes[at.joint];
+    while (node && !trunk.includes(node)) node = node.parent;
+    (node ?? fig.group).getWorldQuaternion(_q);
+    out.set(0, 0, 1).applyQuaternion(_q);
+    out.y = 0;
+    if (out.lengthSq() < 1e-8) return false;
+    out.normalize();
+    return true;
+  }
+
+  // `ids` plus the facing arrows standing on them — what actually leaves the
+  // floor when those drawings are removed, so a caller that means to put them
+  // BACK (the Undo of a keyframe delete) holds the whole set.
+  withDependents(ids) {
+    const set = new Set(ids);
+    for (const a of this.list()) if (a.type === 'facing' && set.has(a.of)) set.add(a.id);
+    return [...set];
+  }
+
+  // The facing arrows standing on the drawing with this id.
+  #dependents(id) {
+    return this.group.children.filter((o) => {
+      const a = o.userData.annotation;
+      return a?.type === 'facing' && a.of === id;
+    });
   }
 
   addCircle(center, radius, opts = {}) {
@@ -613,7 +782,15 @@ export class Drawings {
     // The rebuilt object is born visible; the filter has to be re-stamped on
     // it, or restyling a drawing that a keyframe has filtered out would bring
     // it back on screen.
-    if (parent === this.group) this.#applyVisible(next);
+    if (parent === this.group) {
+      this.#applyVisible(next);
+      // A line that has just been re-shaped carries its facing arrows with it —
+      // now, not at the next solve frame (main.js renders on demand, and a
+      // floor line rides no pose, so nothing else would ever re-place them).
+      for (const dep of this.#dependents(annotation.id)) {
+        this.#placeAnchored(dep, dep.userData.annotation);
+      }
+    }
     if (this.selected === obj) {
       this.selected = next;
       this.refreshHandles();
@@ -636,6 +813,14 @@ export class Drawings {
     if (!ann) return [];
     if (ann.type === 'line' || ann.type === 'arrow') {
       return [this.endWorld(ann, 'a'), this.endWorld(ann, 'b')];
+    }
+    if (ann.type === 'facing') {
+      // One handle, at the tip: dragging it sets the length and, across the
+      // line, the side.
+      const mid = new THREE.Vector3();
+      const dir = new THREE.Vector3();
+      if (!this.#facingFrame(ann, mid, dir)) return [];
+      return [mid.addScaledVector(dir, ann.len)];
     }
     if (ann.type === 'circle') {
       return [
@@ -664,6 +849,17 @@ export class Drawings {
       this.#end(anchor || p, next, index === 0 ? 'a' : 'b');
       return this.#replace(obj, next);
     }
+    if (ann.type === 'facing') {
+      // The tip slides along the perpendicular only: project the drag onto it.
+      // Signed, so carrying the tip across the line flips the arrow; held off
+      // zero, or the arrow collapses into its own line and cannot be grabbed.
+      const mid = new THREE.Vector3();
+      const dir = new THREE.Vector3();
+      if (!p || !this.#facingFrame(ann, mid, dir)) return obj;
+      let len = (p.x - mid.x) * dir.x + (p.z - mid.z) * dir.z;
+      if (Math.abs(len) < FACING_MIN) len = (len < 0 || (len === 0 && ann.len < 0) ? -1 : 1) * FACING_MIN;
+      return this.#replace(obj, { ...ann, len });
+    }
     if (ann.type === 'circle') {
       if (index === 0) return this.#replace(obj, { ...ann, center: [p.x, p.z] });
       const r = Math.max(Math.hypot(p.x - ann.center[0], p.z - ann.center[1]), 0.02);
@@ -678,6 +874,25 @@ export class Drawings {
     this.#end(anchor || p, next, 'pos');
     if (next.posAt && !(next.lift > 0)) next.lift = TEXT_LIFT;
     return this.#replace(obj, next);
+  }
+
+  // The height of the horizontal plane a handle is dragged in. Every other
+  // handle lands on the FLOOR (that is how an anchored end is detached), but a
+  // facing arrow's tip lives at its line's height — dragged against the floor
+  // plane, a tip at hip height would run away from the cursor by the parallax
+  // of a metre of air.
+  handlePlaneY(obj) {
+    const ann = obj?.userData.annotation;
+    if (ann?.type !== 'facing') return 0;
+    const mid = new THREE.Vector3();
+    return this.#facingFrame(ann, mid, new THREE.Vector3()) ? mid.y : 0;
+  }
+
+  // Point a facing arrow out of the other side of its line.
+  flipFacing(obj) {
+    const ann = obj?.userData.annotation;
+    if (ann?.type !== 'facing') return obj;
+    return this.#replace(obj, { ...ann, len: -ann.len });
   }
 
   // ----------------------------------------------------------- selection
@@ -760,8 +975,13 @@ export class Drawings {
     }
   }
 
+  // A line takes its facing arrows with it: an arrow "perpendicular to" a line
+  // that no longer exists says nothing, and would sit in the list drawing
+  // nothing (⌫ Last would then appear to do nothing too).
   remove(obj) {
     if (!obj || obj.parent !== this.group) return false;
+    const id = obj.userData.annotation?.id;
+    if (id) for (const dep of this.#dependents(id)) this.remove(dep);
     if (this.selected === obj) this.select(null);
     this.group.remove(obj);
     disposeObject(obj);
@@ -822,7 +1042,21 @@ export class Drawings {
       if (n) this.serial = Math.max(this.serial, Number(n[1]));
     }
     for (const raw of list) this.#restoreOne(raw);
+    this.#settleFacings();
     return this.count;
+  }
+
+  // A facing arrow is built before anyone can promise its line exists — a file
+  // may list it first, and a restore may bring back the arrow alone. So once a
+  // batch has landed: drop the arrows that still have no line, and place the
+  // rest against the lines they now can find.
+  #settleFacings() {
+    for (const o of [...this.group.children]) {
+      const ann = o.userData.annotation;
+      if (ann?.type !== 'facing') continue;
+      if (!this.#annById(ann.of)) this.remove(o);
+      else this.#placeAnchored(o, ann);
+    }
   }
 
   // Put records BACK on the floor without touching the ones already there —
@@ -840,6 +1074,7 @@ export class Drawings {
     }
     let added = 0;
     for (const raw of list) if (this.#restoreOne(raw)) added++;
+    this.#settleFacings();
     return added;
   }
 
@@ -856,6 +1091,7 @@ export class Drawings {
     // for a hand-written record, the anchor alone — endWorld tolerates a
     // missing floor pair, so that one still builds.
     if (raw.type === 'text' && !((raw.pos || raw.posAt) && typeof raw.text === 'string')) return null;
+    if (raw.type === 'facing' && !(typeof raw.of === 'string' && Number.isFinite(raw.len) && raw.len !== 0)) return null;
     const ann = this.#styled(JSON.parse(JSON.stringify(raw)));
     return this.#commit(this.#build(ann, false), ann, false);
   }

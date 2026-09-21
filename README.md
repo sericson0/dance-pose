@@ -26,6 +26,9 @@ hosted anywhere (or opened via `npm run preview`).
 | Pose a whole limb | **Drag hand/foot** mode → click a hand or foot → drag the target; the arm/leg follows with natural elbow/knee bend |
 | Move / turn a dancer | **Move figure** / **Turn figure** modes → click a dancer → drag |
 | Move the couple as one | tick **Move as couple** in the top bar, then Move/Turn either dancer — the partner follows, the embrace turns as a unit |
+| Turn the arm frame (the shoulder part of a pivot) | **Move hips** mode → **Frame** → drag the ring at the chest: both elbows orbit the chest as one rigid pair (same height, same spacing) while the shoulder blades and shoulders absorb it |
+| Keep the elbows still and turn the body under them | Embrace section → **Fix elbows** (leader / follower), then rotate the chest, twist the hips or pivot the dancer — untick to release |
+| Show a body line and where it faces | **Draw** mode → **Line**, click two joints (say, both hips); **Extend** runs it on past them; **⊥ Facing** + a click on the line adds a floor-parallel arrow square to it |
 | Undo a change | **↩ Undo** button or `Ctrl+Z` (works for gizmo drags, sliders, presets, loads) |
 | Re-ground the feet | **Feet to floor** button — drops the shown dancers' feet back to the floor, soles flat |
 | Crouch / rise | select the pelvis → "Hip height" slider |

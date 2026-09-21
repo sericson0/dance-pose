@@ -178,7 +178,7 @@ export function initUI(app) {
   // Planted feet belong to the hips SLIDE; the twist turns the legs and feet
   // round with the pelvis on purpose, so the choice does not apply there.
   const syncHipsPlant = () => {
-    hipsPlantBox.hidden = app.mode !== 'hips' || app.hipsTool === 'twist';
+    hipsPlantBox.hidden = app.mode !== 'hips' || app.hipsTool !== 'slide';
   };
   const selectMode = (mode) => {
     setActive(modeButtons, (b) => b.dataset.mode === mode);
@@ -250,6 +250,8 @@ export function initUI(app) {
   const drawHide = $('draw-hide');
   const drawColor = $('draw-color');
   const drawWidth = $('draw-width');
+  const drawExtend = $('draw-extend');
+  const drawFlip = $('draw-flip');
   const drawOwn = $('draw-own');
   const drawFocusTag = $('draw-focus-tag');
   // Claim / release the SELECTED drawing for the focused keyframe. This is the
@@ -303,11 +305,16 @@ export function initUI(app) {
   // `change` so dragging the slider redraws live.
   drawColor.addEventListener('input', () => app.setDrawStyle({ color: drawColor.value }));
   drawWidth.addEventListener('input', () => app.setDrawStyle({ width: parseFloat(drawWidth.value) }));
+  drawExtend.addEventListener('input', () => app.setDrawStyle({ extend: parseFloat(drawExtend.value) }));
+  drawFlip.addEventListener('click', () => app.flipDrawFacing());
   const syncDrawButtons = () => {
     const empty = app.drawings.length === 0;
     drawUndo.disabled = empty;
     drawClear.disabled = empty;
     drawDelete.disabled = !app.drawSelected;
+    // Flip belongs to a facing arrow alone, so it is only on the bar while one
+    // is selected — the toolbar is the most crowded strip in the app.
+    drawFlip.hidden = app.drawSelected?.userData.annotation?.type !== 'facing';
     // With nothing selected the button is the way back: it clears the filter
     // outright, so it is armed whenever there IS one, not only when a drawing
     // happens to be off screen (a full-set filter still silently excludes every
@@ -339,6 +346,7 @@ export function initUI(app) {
     const s = app.drawStyle;
     drawColor.value = s.color;
     drawWidth.value = String(s.width);
+    drawExtend.value = String(s.extend ?? 0);
   };
   syncDrawButtons();
   syncDrawStyle();
@@ -440,6 +448,17 @@ export function initUI(app) {
     app.setAnchor(embraceAnchor.checked);
     embraceAnchorHint.hidden = !embraceAnchor.checked;
   });
+  // Fix elbows: a per-dancer hold on both elbows (app.setElbowsFixed). The
+  // boxes are re-read from the app rather than trusted, so a script or a
+  // future caller that flips the hold cannot leave a box lying about it.
+  const elbowFix = [$('elbow-fix-0'), $('elbow-fix-1')];
+  const syncElbowFix = () => elbowFix.forEach((box, i) => { box.checked = app.elbowsFixed(i); });
+  elbowFix.forEach((box, i) => box.addEventListener('change', () => {
+    app.setElbowsFixed(i, box.checked);
+    if (box.checked) {
+      app.status(`${app.figures[i].name}'s elbows are fixed in place — turn the chest, twist the hips or pivot the dancer, and the shoulders absorb it. Untick to release.`, 'info');
+    }
+  }));
   const showButtons = [...document.querySelectorAll('#show-buttons button')];
   for (const btn of showButtons) {
     btn.addEventListener('click', () => {
@@ -3594,6 +3613,10 @@ export function initUI(app) {
     onHipsPlantChanged() {
       plantL.checked = app.hipsPlant.L;
       plantR.checked = app.hipsPlant.R;
+    },
+    // The elbow hold was switched on or off by something other than its box.
+    onElbowsFixedChanged() {
+      syncElbowFix();
     },
     // The sequence keyframes changed (add/update/reorder/delete/import).
     onSequenceChanged() {

@@ -171,7 +171,16 @@ export const PRESETS = [
     // what was built in Anchor mode. See the constant's comment for why this
     // is authored for the constraints-off view and shifts when the embrace
     // constraints are engaged.
+    //
+    // resetPose FIRST: the captured poses list only the joints that were off
+    // zero when they were exported, and setPose writes only what it is given —
+    // so a joint the capture omits (the right shoulder blade, for one) kept
+    // whatever the user had last done to it, and the "byte-for-byte" pose came
+    // back different after a frame turn or a posed scapula. The pose carries
+    // its own placement, facing and pelvis height, so the reset costs nothing.
     apply(leader, follower) {
+      leader.resetPose();
+      follower.resetPose();
       leader.setPose(CLOSE_EMBRACE_LEADER);
       follower.setPose(CLOSE_EMBRACE_FOLLOWER);
     },

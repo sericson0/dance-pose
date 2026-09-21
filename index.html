@@ -31,11 +31,11 @@
       <div id="mode-buttons" class="btn-group">
         <button data-mode="rotate" class="active" title="Click a joint, then drag the rings to rotate it (within anatomical limits). Keys: ↑↓ flex/extend, ←→ side-to-side, PageUp/PageDown twist — tap to nudge, hold to move. Shift = coarser.">Rotate joints</button>
         <button data-mode="ik" title="Click a hand or foot to drag the whole limb; click the toes to caress the floor (the big toe stays down while the leg reaches); click an elbow or knee to swivel it while the hand/foot and shoulder/hip stay put. Keys: arrows move the handle across the floor (↑ = away from the camera), PageUp/PageDown raise/lower it — tap to nudge, hold to move.">Drag limb</button>
-        <button data-mode="hips" title="Drag the handle at the hips (it appears on its own — click the other dancer to move it there): the whole upper body moves with them (posture unchanged) while the planted feet keep their spot — those legs bend to accommodate. Switch to Twist to turn the hips under a still chest (the dissociation of an ocho pivot). Pick which feet are planted with the toolbar checkboxes. Keys: arrows slide the hips across the floor (←→ twist them in Twist), PageUp/PageDown crouch/rise.">Move hips</button>
+        <button data-mode="hips" title="Drag the handle at the hips (it appears on its own — click the other dancer to move it there): the whole upper body moves with them (posture unchanged) while the planted feet keep their spot — those legs bend to accommodate. Switch to Twist to turn the hips under a still chest (the dissociation of an ocho pivot), or to Frame to turn the arm frame — both elbows as one rigid pair — about a still chest (the shoulder part of a pivot). Pick which feet are planted with the toolbar checkboxes. Keys: arrows slide the hips across the floor (←→ twist them in Twist, turn the frame in Frame), PageUp/PageDown crouch/rise.">Move hips</button>
         <button data-mode="move" title="Click a figure, then drag the arrows to slide it on the floor or the ring around them to spin it about the support foot, the centre of gravity, or its own centre. Arrow keys nudge: ↑↓ forward/back, ←→ turn. Shift = coarser.">Move figure</button>
         <button data-mode="step" title="Click a dancer to take a walking step forward — keep clicking to walk. Arrow keys: ↑↓ step forward/back, ←→ turn. Turn on 'Move as couple' to walk the pair together.">Walk / step</button>
         <button data-mode="pin" title="Pin a spot on one dancer to a spot on the other: click the first spot, then the matching spot on the partner. Pinned spots stay together through moves, steps and turns — author a custom hold, or a parada's foot contact. Manage pins in the sidebar.">Pin spots</button>
-        <button data-mode="draw" title="Draw teaching diagrams: pick Line / Arrow / Circle / Text, then click two points (Text: one click, then type the label). A line or arrow end clicked on a JOINT is pinned to the dancer and rides the pose — hover a dancer and the joints light up. Pick the chalk colour and stroke width in the toolbar. Click a finished drawing to select it — drag the ball at either end to move it (onto a joint to attach, onto the floor to detach), restyle it with the swatch/slider, Del to remove it. Esc cancels a half-drawn shape.">Draw</button>
+        <button data-mode="draw" title="Draw teaching diagrams: pick Line / Arrow / Circle / Text, then click two points (Text: one click, then type the label). A line or arrow end clicked on a JOINT is pinned to the dancer and rides the pose — hover a dancer and the joints light up. Pick the chalk colour and stroke width in the toolbar; Extend runs a line on past both of its points, and ⊥ Facing + a click on a line adds an arrow square to it, level with the floor (a line across the hips, then where the hips point). Click a finished drawing to select it — drag the ball at either end to move it (onto a joint to attach, onto the floor to detach), restyle it with the swatch/slider, Del to remove it. Esc cancels a half-drawn shape.">Draw</button>
         <button data-mode="label" title="Name the anatomy: click a bone, muscle or joint to give it a callout label (click it again to remove it). Bones show in the Skeleton layer, muscles in the Muscles layer; joints can be labelled in any layer. Labels are saved into photos and videos. Manage them in the sidebar's Labels section.">Label</button>
       </div>
       <div id="label-tools" class="btn-group" hidden>
@@ -49,8 +49,11 @@
         <button data-tool="arrow" title="Two clicks: tail, then tip. Click a finished arrow to move either end.">Arrow</button>
         <button data-tool="circle" title="Two clicks: center, then a point on the rim. Click a finished circle to move it or resize it.">Circle</button>
         <button data-tool="text" title="One click on the floor, then type the label">Text</button>
+        <button data-tool="facing" title="One click ON A LINE you have drawn: it gets an arrow from its midpoint, level with the floor and square to the line — draw a line across the hip bones, then this shows where the hips point. It follows the line, so it rides the dancer too. Drag the ball at its tip to lengthen it, or across the line to flip it.">⊥ Facing</button>
         <label class="tool-field" title="Chalk colour. With a drawing selected this recolours it; otherwise it sets the colour of the next one."><input type="color" id="draw-color" value="#ffd27f" /></label>
         <label class="tool-field" title="Stroke width (text size follows it). With a drawing selected this resizes it; otherwise it sets the width of the next one."><span>Size</span><input type="range" id="draw-width" min="0.006" max="0.06" step="0.002" value="0.02" /></label>
+        <label class="tool-field" title="Run a line or arrow on PAST both of its points, in the same direction — a line pinned hip to hip becomes the whole hip axis. With a line selected this extends that one; otherwise it sets the next one. The ends (and their handles) stay where you put them."><span>Extend</span><input type="range" id="draw-extend" min="0" max="1" step="0.02" value="0" /></label>
+        <button id="draw-flip" hidden title="Point the selected facing arrow out of the other side of its line">⇄ Flip</button>
         <!-- Shown only while a keyframe is focused (✎ on its row): the tag says
              where a new shape is being filed, and the toggle claims or releases
              the SELECTED one for that keyframe. -->
@@ -64,6 +67,7 @@
       <div id="hips-tools" class="btn-group" hidden>
         <button data-hips-tool="slide" class="active" title="Drag the handle to move the hips; the posture rides along unchanged">Slide</button>
         <button data-hips-tool="twist" title="Drag the ring to turn the hips while the chest and shoulders stay facing where they are — tango dissociation, the pivot of an ocho">Twist</button>
+        <button data-hips-tool="frame" title="Drag the ring at the chest to turn the ARM FRAME while the trunk stays still — the shoulder part of a pivot. The two elbows orbit the chest as one rigid pair (same height, same distance apart, forearms and hands carried with them) while the shoulder blades and shoulder joints absorb the turn. ←→ nudge it. To keep the elbows still and turn the BODY instead, tick 'Fix elbows' in the Embrace panel.">Frame</button>
       </div>
       <div id="show-buttons" class="btn-group" title="Show one dancer or both">
         <button data-show="both" class="active">Both</button>
@@ -310,6 +314,11 @@
           <label title="Freeze both dancers where they stand so you can build the embrace by hand. The automatic torso pull, body collision and hand-join stop moving anyone — so posing one dancer's arm no longer pushes the partner away. Joint limits still keep every arm reachable. Uncheck to let the embrace settle again.">
             <input type="checkbox" id="embrace-anchor" /> Anchor figures (place arms by hand)
           </label>
+        </div>
+        <div class="check-row" id="elbow-fix-row" title="Hold a dancer's two elbows exactly where they are in the room while you move anything else — rotate the chest, twist the hips (Move hips → Twist) or pivot the whole dancer on the support foot (Move figure → the ring). The shoulder blades and shoulders absorb the turn, which is the pivot part of a movement; the forearms and hands stay with the elbows. A white ball marks each fixed elbow; it turns amber, with a line, when the shoulder cannot reach. Untick to release.">
+          <span>Fix elbows:</span>
+          <label><input type="checkbox" id="elbow-fix-0" /> leader</label>
+          <label><input type="checkbox" id="elbow-fix-1" /> follower</label>
         </div>
         <div class="muted" id="embrace-anchor-hint" hidden>Both dancers are held in place — pose the arm or shoulder you want (try <b>Drag limb</b> to pull a hand into position) and the partner stays put. Joint limits stop an arm short of an impossible reach. Uncheck to let the embrace re-settle.</div>
       </section>
