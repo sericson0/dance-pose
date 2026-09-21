@@ -88,9 +88,11 @@ await page.screenshot({ path: `${outDir}/sequence-panel.png` });
 
 // ---- reorder / update / delete through the row controls ----
 // The rows carry no ↑/↓ buttons any more (the order is a drag, with Alt+↑/↓
-// as the keyboard route), so each row's buttons are [Show, ⟳, ◻, ✕] — the ◻
-// tags which floor drawings the keyframe shows (dev-verify-draw-persist.mjs
-// owns what it does; here it only has to be in the row, in that place).
+// as the keyboard route), so each row's buttons are [Show, ⟳, ⧉, ✎, ✕] — ⧉
+// duplicates the keyframe in place (dev-verify-seq-authoring.mjs owns what it
+// does) and ✎ takes the per-keyframe edit focus (dev-verify-seq-focus.mjs owns
+// that); here they only have to be in the row, in that place. The drawings tag
+// has moved down to the extras line beside the muscle one (`.seq-draw-btn`).
 const edit = await page.evaluate(() => {
   const app = window.__app;
   const rowBtns = (i) => document.querySelectorAll('#seq-list .pose-item')[i].querySelectorAll('button');
@@ -99,7 +101,7 @@ const edit = await page.evaluate(() => {
   const p0 = posOf(app.seqStates[0]);
   app.seqMoveTo(0, 1); // the lift-and-drop the drag and the keys both call
   const movedDown = posOf(app.seqStates[1]);
-  rowBtns(2)[3].click(); // ✕: delete the last keyframe
+  rowBtns(2)[4].click(); // ✕: delete the last keyframe
   const afterDelete = app.seqStates.length;
   app.applyPreset(3); // apilado
   rowBtns(0)[1].click(); // ⟳: overwrite keyframe 1 with the current pose
@@ -113,7 +115,7 @@ const edit = await page.evaluate(() => {
   };
 });
 console.log('--- sequence edit:', JSON.stringify(edit));
-if (edit.btnLabels.join('') !== 'Show⟳◻✕') problems.push(`row buttons are ${JSON.stringify(edit.btnLabels)}, want [Show, ⟳, ◻, ✕]`);
+if (edit.btnLabels.join('') !== 'Show⟳⧉✎✕') problems.push(`row buttons are ${JSON.stringify(edit.btnLabels)}, want [Show, ⟳, ⧉, ✎, ✕]`);
 if (!edit.swapOK) problems.push('seqMoveTo did not move a keyframe one place later');
 if (edit.afterDelete !== 2) problems.push(`✕ left ${edit.afterDelete} keyframes, want 2`);
 if (!edit.updateOK) problems.push('⟳ did not overwrite the keyframe with the current pose');
@@ -223,10 +225,20 @@ await page.evaluate(() => {
 await new Promise((r) => setTimeout(r, 400));
 await page.screenshot({ path: `${outDir}/dissociation-top.png` });
 
-// ---- per-keyframe DURATION: how long a keyframe takes to reach the next one.
-// The regression guard is the reduction: with every duration equal this has to
-// reproduce the old equal-time-per-segment split exactly, so t = 0.5 of a
-// three-keyframe chain still lands on the middle keyframe.
+// ---- per-keyframe TIMING: two numbers per keyframe — `move`, the seconds of
+// transition from the previous keyframe INTO this one (the first keyframe has
+// none), and `hold`, the seconds the couple then STAYS in this pose (every
+// keyframe has one, the last included).
+//
+// The regression guard is the REDUCTION: with every hold 0 and every move
+// equal, this has to reproduce the old equal-time-per-segment split exactly,
+// so t = 0.5 of a three-keyframe chain still lands on the middle keyframe.
+//
+// Measured with EASING OFF, and set explicitly rather than assumed: a timeline
+// begun from an empty list eases by default now (app.setSeqEase), and these
+// are checks of the linear time → pose ARITHMETIC, which is what the reduction
+// guard is about. dev-verify-seq-ease.mjs owns the eased case — including that
+// ease off is still this arithmetic to the last bit.
 const knee = (t) => page.evaluate((tt) => {
   const app = window.__app;
   app.applySeqT(tt);
@@ -235,49 +247,176 @@ const knee = (t) => page.evaluate((tt) => {
 const durSetup = await page.evaluate(() => {
   const app = window.__app;
   app.setSeqStates([]);
+  app.setSeqEase(false);
   app.applyPreset(1);
   app.seqAdd();
   app.leader.setJointDegrees({ knee_L: { x: 70 } });
   app.seqAdd();
   app.leader.setJointDegrees({ knee_L: { x: 10 } });
   app.seqAdd();
-  return { durs: app.seqStates.map((s) => s.dur), total: app.seqSeconds() };
+  return {
+    moves: app.seqStates.map((_, i) => app.seqTravel(i)),
+    holds: app.seqStates.map((_, i) => app.seqHold(i)),
+    total: app.seqSeconds(),
+  };
 });
-if (Math.abs(durSetup.total - 4.8) > 1e-9) problems.push(`default total ${durSetup.total}s, want 4.8 (two 2.4 s segments)`);
+console.log('--- timing defaults:', JSON.stringify(durSetup));
+if (Math.abs(durSetup.total - 4.8) > 1e-9) problems.push(`default total ${durSetup.total}s, want 4.8 (two 2.4 s moves, no holds)`);
+if (durSetup.holds.some((h) => h !== 0)) problems.push(`a new keyframe is born with a hold: ${JSON.stringify(durSetup.holds)} — the reduction to the old split is gone`);
 const midEqual = await knee(0.5);
-if (Math.abs(midEqual - 70) > 1.5) problems.push(`equal durations: t=0.5 gave knee ${midEqual.toFixed(1)}°, want the middle keyframe's 70°`);
+if (Math.abs(midEqual - 70) > 1.5) problems.push(`equal moves, no holds: t=0.5 gave knee ${midEqual.toFixed(1)}°, want the middle keyframe's 70°`);
 const weighted = await page.evaluate(() => {
   const app = window.__app;
-  app.seqSetDuration(0, 6); // first segment 6 s, second still 2.4
-  return { total: app.seqSeconds() };
+  app.seqSetTravel(1, 6); // 6 s into keyframe 2; keyframe 3 still takes 2.4
+  return { total: app.seqSeconds(), travel: app.seqStates.map((_, i) => app.seqTravel(i)) };
 });
 if (Math.abs(weighted.total - 8.4) > 1e-9) problems.push(`weighted total ${weighted.total}s, want 8.4`);
 // t = 0.5 of 8.4 s is 4.2 s, still 70% of the way through the FIRST segment.
 const midWeighted = await knee(0.5);
 const wantWeighted = 70 * (4.2 / 6);
 if (Math.abs(midWeighted - wantWeighted) > 1.5) {
-  problems.push(`weighted t=0.5 knee ${midWeighted.toFixed(1)}°, want ~${wantWeighted.toFixed(1)}° — the duration is not weighting the timeline`);
+  problems.push(`weighted t=0.5 knee ${midWeighted.toFixed(1)}°, want ~${wantWeighted.toFixed(1)}° — the move is not weighting the timeline`);
 }
+// A HOLD on the middle keyframe: the pose must be byte-stable right across the
+// hold's slice of t, and it must SHIFT where the later keyframe lands (which
+// is the difference between a hold and a longer move).
+const holdBand = await page.evaluate(async () => {
+  const app = window.__app;
+  app.seqSetTravel(1, 2.4); // back to equal moves: 2.4 + 2.4
+  app.seqSetHold(1, 4.8);   // …and stand on keyframe 2 for 4.8 s. Total 9.6.
+  const total = app.seqSeconds();
+  const at = (t) => { app.applySeqT(t); return app.leader.nodes.knee_L.rotation.x; };
+  // The hold runs from 2.4 s to 7.2 s of 9.6 → t ∈ [0.25, 0.75].
+  const samples = [0.25, 0.3, 0.5, 0.7, 0.749].map(at);
+  // …and exactly at the far edge the travel resumes, so t = 0.8 must have left.
+  const after = at(0.8);
+  return {
+    total,
+    spread: Math.max(...samples) - Math.min(...samples),
+    held: samples[0] * 180 / Math.PI,
+    after: after * 180 / Math.PI,
+  };
+});
+console.log('--- hold band:', JSON.stringify(holdBand));
+if (Math.abs(holdBand.total - 9.6) > 1e-9) problems.push(`hold total ${holdBand.total}s, want 9.6 (2.4 + 4.8 + 2.4)`);
+if (holdBand.spread > 1e-12) problems.push(`the pose moved ${holdBand.spread} rad across the hold — a hold must stand still`);
+if (Math.abs(holdBand.held - 70) > 1.5) problems.push(`the hold sits at knee ${holdBand.held.toFixed(1)}°, want keyframe 2's 70°`);
+if (Math.abs(holdBand.after - holdBand.held) < 2) problems.push(`t past the hold (knee ${holdBand.after.toFixed(1)}°) has not moved on`);
+// A hold on the FIRST and on the LAST keyframe both take effect: the first
+// delays the start, the last makes the end pose linger. The keyframes' own
+// knee angles are MEASURED rather than assumed — keyframe 1 is whatever the
+// preset poses, and only keyframes 2 and 3 were authored here.
+const endHolds = await page.evaluate(() => {
+  const app = window.__app;
+  const deg = (t) => { app.applySeqT(t); return app.leader.nodes.knee_L.rotation.x * 180 / Math.PI; };
+  app.seqSetHold(1, 0);
+  const k0 = deg(0); // the first keyframe's own knee, whatever the preset gave
+  app.seqSetHold(0, 2.4);  // 2.4 stand + 2.4 move + 2.4 move = 7.2
+  app.seqSetHold(2, 2.4);  // …+ 2.4 lingering on the end pose = 9.6
+  return {
+    total: app.seqSeconds(),
+    k0,
+    // First hold runs 0 → 2.4 s of 9.6 (t ≤ 0.25): still the START pose.
+    start: deg(0.2),
+    // Last hold runs 7.2 → 9.6 s (t ≥ 0.75): already the END pose.
+    end: deg(0.9),
+    endAt1: deg(1),
+  };
+});
+console.log('--- end holds:', JSON.stringify(endHolds));
+if (Math.abs(endHolds.total - 9.6) > 1e-9) problems.push(`first+last hold total ${endHolds.total}s, want 9.6`);
+if (Math.abs(endHolds.start - endHolds.k0) > 1e-9) {
+  problems.push(`the first keyframe's hold did not delay the start (knee ${endHolds.start.toFixed(2)}° at t=0.2 vs ${endHolds.k0.toFixed(2)}° at t=0)`);
+}
+if (Math.abs(endHolds.end - endHolds.endAt1) > 1e-9) {
+  problems.push(`the last keyframe's hold does not linger: t=0.9 (${endHolds.end.toFixed(3)}°) differs from t=1 (${endHolds.endAt1.toFixed(3)}°)`);
+}
+if (Math.abs(endHolds.endAt1 - 10) > 1.5) problems.push(`t=1 gave knee ${endHolds.endAt1.toFixed(1)}°, want the last keyframe's 10°`);
+
+// A LEGACY chain — one keyframe per `dur`, meaning "seconds to reach the next"
+// — must load and play exactly as it always did. The migration turns keyframe
+// i's `dur` into keyframe i+1's `move`, so the timeline is unchanged; the proof
+// is the pose at several t computed the OLD way (segment boundaries at the
+// running sums of the durs, lerping between the keyframes' measured angles).
+const legacy = await page.evaluate((k0) => {
+  const app = window.__app;
+  const fresh = JSON.parse(JSON.stringify(app.seqStates));
+  for (const s of fresh) { delete s.move; delete s.hold; }
+  fresh[0].dur = 6;   // 6 s from keyframe 1 to 2
+  fresh[1].dur = 2;   // 2 s from keyframe 2 to 3
+  fresh[2].dur = 3;   // the last keyframe's dur was carried and never played
+  app.setSeqStates(fresh);
+  const deg = (t) => { app.applySeqT(t); return app.leader.nodes.knee_L.rotation.x * 180 / Math.PI; };
+  // Old arithmetic: total 8, segment 1 spans [0, 6], segment 2 spans [6, 8].
+  const want = (t) => {
+    const time = t * 8;
+    return time <= 6 ? k0 + (70 - k0) * (time / 6) : 70 + (10 - 70) * ((time - 6) / 2);
+  };
+  const ts = [0, 0.25, 0.5, 0.75, 0.9, 1];
+  return {
+    total: app.seqSeconds(),
+    migrated: app.seqStates.map((s) => ({ move: s.move, hold: s.hold, dur: s.dur })),
+    got: ts.map(deg),
+    want: ts.map(want),
+  };
+}, endHolds.k0);
+const legacyErr = Math.max(...legacy.got.map((g, i) => Math.abs(g - legacy.want[i])));
+console.log('--- legacy dur chain:', JSON.stringify({ ...legacy, worst: +legacyErr.toFixed(3) }));
+if (Math.abs(legacy.total - 8) > 1e-9) problems.push(`a legacy dur chain totals ${legacy.total}s, want 8 (6 + 2, the trailing dur unplayed)`);
+if (legacyErr > 1.5) problems.push(`a legacy dur chain plays differently: worst ${legacyErr.toFixed(2)}° off the old arithmetic`);
+if (legacy.migrated.some((m) => m.dur !== undefined)) problems.push(`the legacy dur survived the migration: ${JSON.stringify(legacy.migrated)} — a reorder would hand that gap two owners`);
+if (legacy.migrated[1]?.move !== 6 || legacy.migrated[2]?.move !== 2) {
+  problems.push(`dur → move migration wrong: ${JSON.stringify(legacy.migrated)}`);
+}
+
+// The ROW's two boxes: both take, the FIRST row's move is disabled (nothing
+// precedes it to travel from), no hold box ever is (the last keyframe can be
+// stood in — that is what lingers on the end pose), and ⟳ — which re-records
+// the POSE — keeps both numbers.
 const durUi = await page.evaluate(() => {
   const app = window.__app;
-  const box = document.querySelectorAll('#seq-list .seq-dur')[1];
-  box.value = '0.5';
-  box.dispatchEvent(new Event('change'));
-  app.seqUpdate(1); // re-record that keyframe's POSE
-  const boxes = [...document.querySelectorAll('#seq-list .seq-dur')];
+  const set = (sel, i, v) => {
+    const box = document.querySelectorAll(`#seq-list ${sel}`)[i];
+    box.value = String(v);
+    box.dispatchEvent(new Event('change'));
+  };
+  set('.seq-move', 1, 0.5); // 0.5 s into keyframe 2
+  set('.seq-hold', 1, 3);   // …and stand there for 3
+  set('.seq-hold', 2, 1.5); // 1.5 s lingering on the last pose
+  app.seqUpdate(1);         // re-record keyframe 2's POSE — timing must survive
+  const moves = [...document.querySelectorAll('#seq-list .seq-move')];
+  const holds = [...document.querySelectorAll('#seq-list .seq-hold')];
   return {
-    durs: app.seqStates.map((s) => s.dur),
-    lastDisabled: boxes.at(-1).disabled,
+    moves: app.seqStates.map((_, i) => app.seqTravel(i)),
+    holds: app.seqStates.map((_, i) => app.seqHold(i)),
+    firstMoveDisabled: moves[0].disabled,
+    otherMovesEnabled: moves.slice(1).every((b) => !b.disabled),
+    anyHoldDisabled: holds.some((b) => b.disabled),
+    boxes: { moves: moves.length, holds: holds.length },
+    moveTitle: moves[1].title,
+    firstTitle: moves[0].title,
+    holdTitle: holds[0].title,
+    seconds: app.seqSeconds(),
     total: document.querySelector('#seq-list .seq-total')?.textContent ?? null,
   };
 });
-if (durUi.durs[1] !== 0.5) problems.push(`the row's duration box did not take: ${JSON.stringify(durUi.durs)}`);
-// ⟳ re-records the POSE; the duration is timing, and must survive it.
-if (durUi.durs[0] !== 6) problems.push(`"⟳ update" reset a duration: ${JSON.stringify(durUi.durs)}`);
-if (!durUi.lastDisabled) problems.push('the last keyframe has an editable duration — nothing follows it to travel to');
-console.log('--- durations:', JSON.stringify({ ...durUi, midEqual: +midEqual.toFixed(1), midWeighted: +midWeighted.toFixed(1) }));
+console.log('--- row boxes:', JSON.stringify(durUi));
+if (durUi.moves[1] !== 0.5) problems.push(`the row's "into" box did not take, or ⟳ reset it: ${JSON.stringify(durUi.moves)}`);
+if (durUi.holds[1] !== 3) problems.push(`the row's "hold" box did not take, or ⟳ reset it: ${JSON.stringify(durUi.holds)}`);
+if (durUi.holds[2] !== 1.5) problems.push(`the last row's hold box did not take: ${JSON.stringify(durUi.holds)}`);
+if (durUi.moves[2] !== 2) problems.push(`a neighbour's move changed: ${JSON.stringify(durUi.moves)}`);
+if (durUi.boxes.moves !== 3 || durUi.boxes.holds !== 3) problems.push(`want one move and one hold box per keyframe, got ${JSON.stringify(durUi.boxes)}`);
+if (!durUi.firstMoveDisabled) problems.push('the first keyframe has an editable move — nothing precedes it to travel from');
+if (!durUi.otherMovesEnabled) problems.push('a keyframe other than the first has a disabled move box');
+if (durUi.anyHoldDisabled) problems.push('a hold box is disabled — every keyframe can be stood in, the last included');
+if (!/econds to travel/.test(durUi.moveTitle)) problems.push(`the move box does not explain itself: "${durUi.moveTitle}"`);
+if (!/nothing before it/.test(durUi.firstTitle)) problems.push(`the first row's disabled move box does not say why: "${durUi.firstTitle}"`);
+if (!/stay in this pose/.test(durUi.holdTitle)) problems.push(`the hold box does not explain itself: "${durUi.holdTitle}"`);
+// 0.5 + 2 of travel, 3 + 1.5 of standing still.
+if (Math.abs(durUi.seconds - 7) > 1e-9) problems.push(`seqSeconds reads ${durUi.seconds}s, want 7 (0.5 + 2 travel, 3 + 1.5 hold)`);
+if (!/7\.0 s/.test(durUi.total ?? '')) problems.push(`the running total reads "${durUi.total}", want 7.0 s — the holds are not in it`);
 
-// …and the player really takes that long.
+// …and the player really takes that long, HOLDS INCLUDED.
 const played = await page.evaluate(async () => {
   const app = window.__app;
   app.setSeqStates([]);
@@ -285,15 +424,45 @@ const played = await page.evaluate(async () => {
   app.seqAdd();
   app.leader.setJointDegrees({ knee_L: { x: 70 } });
   app.seqAdd();
-  app.seqSetDuration(0, 1.0);
+  app.seqSetTravel(1, 1.0);
+  app.seqSetHold(1, 1.0); // a second of standing on the end pose
   const t0 = performance.now();
   await new Promise((res) => app.playSeq(null, res));
   return { secs: (performance.now() - t0) / 1000, asked: app.seqSeconds() };
 });
+if (Math.abs(played.asked - 2) > 1e-9) problems.push(`a 1 s move + 1 s hold totals ${played.asked}s, want 2`);
 if (Math.abs(played.secs - played.asked) > 0.35) {
   problems.push(`a ${played.asked}s sequence played in ${played.secs.toFixed(2)}s`);
 }
-console.log(`--- duration playback: asked ${played.asked}s, took ${played.secs.toFixed(2)}s`);
+console.log(`--- timing playback: asked ${played.asked}s, took ${played.secs.toFixed(2)}s`);
+
+// The COG trail is a PATH, so it is sampled by pose progress rather than by
+// time: a hold must cost it nothing. Same sample count, same geometry, with a
+// long hold added — which time-uniform sampling could not manage (it would
+// spend a third of its ink standing on one point).
+const trail = await page.evaluate(() => {
+  const app = window.__app;
+  const pts = () => {
+    const grp = app.scene.children.find((c) => c.children.some?.((l) => l.isLine && l.material.vertexColors));
+    const line = grp?.children.find((l) => l.isLine && l.material.vertexColors);
+    return line ? [...line.geometry.attributes.position.array] : null;
+  };
+  app.setSeqStates([]);
+  app.applyPreset(0); app.seqAdd();
+  app.applyPreset(2); app.seqAdd();
+  app.applyPreset(1); app.seqAdd();
+  const before = pts();
+  app.seqSetHold(1, 12); // twelve seconds standing on the middle keyframe
+  const after = pts();
+  return {
+    n: before?.length / 3,
+    same: before && after && before.length === after.length
+      && before.every((v, i) => Math.abs(v - after[i]) < 1e-9),
+  };
+});
+console.log('--- trail vs hold:', JSON.stringify(trail));
+if (trail.n !== 65) problems.push(`trail has ${trail.n} samples, want 65 (32·segs+1)`);
+if (!trail.same) problems.push('a hold changed the COG trail — it is still being sampled by TIME, not by pose progress');
 
 // ---- the row: its label, and the drag reorder ----------------------------
 // Both need the section actually ON SCREEN: the reorder is a real mouse
@@ -326,8 +495,16 @@ const rowShape = await page.evaluate(() => {
   return {
     labels: rows.map((r) => r.querySelector('.seq-name')?.value),
     indices: rows.map((r) => r.querySelector('.seq-index')?.textContent),
-    unitSpans: document.querySelectorAll('#seq-list .seq-dur-unit').length,
-    durTitle: rows[0].querySelector('.seq-dur').title,
+    // The timing lives on its own LINE now, not in the controls row: two
+    // number boxes in a 320 px row would have squeezed both below the width
+    // "2.4" needs. So the row must hold no number box at all, and the
+    // keyframe's block must hold exactly one of each.
+    rowNumbers: rows[0].querySelectorAll('input[type="number"]').length,
+    timeLines: document.querySelectorAll('#seq-list .seq-time').length,
+    // Down there each number gets its own word and a visible unit, which is
+    // what makes two of them on one line tellable apart at a glance.
+    words: [...document.querySelectorAll('#seq-list .seq-block')[0].querySelectorAll('.seq-time-lab')].map((s) => s.textContent),
+    units: document.querySelectorAll('#seq-list .seq-block .seq-time-unit').length,
     rowTitle: rows[0].title,
     fallback,
   };
@@ -335,8 +512,10 @@ const rowShape = await page.evaluate(() => {
 console.log('--- row shape:', JSON.stringify(rowShape));
 if (rowShape.labels.join('|') !== 'cross|pivot out|collection') problems.push(`row labels are ${JSON.stringify(rowShape.labels)}`);
 if (rowShape.indices.join('') !== '123') problems.push(`the leading index is gone: ${JSON.stringify(rowShape.indices)}`);
-if (rowShape.unitSpans) problems.push('the "s" unit span is still in the row');
-if (!/econds/.test(rowShape.durTitle)) problems.push(`the duration's unit is not in its tooltip: "${rowShape.durTitle}"`);
+if (rowShape.rowNumbers) problems.push(`the controls row still carries ${rowShape.rowNumbers} number box(es) — the timing belongs on its own line`);
+if (rowShape.timeLines !== 3) problems.push(`found ${rowShape.timeLines} timing lines, want one per keyframe`);
+if (rowShape.words.join('|') !== 'into|hold') problems.push(`the timing line's words are ${JSON.stringify(rowShape.words)}, want [into, hold]`);
+if (rowShape.units !== 6) problems.push(`want a visible "s" beside each of the six boxes, got ${rowShape.units}`);
 if (!/Alt/.test(rowShape.rowTitle)) problems.push(`the row does not advertise the keyboard reorder: "${rowShape.rowTitle}"`);
 if (rowShape.fallback.value !== '' || !/Keyframe 3/.test(rowShape.fallback.placeholder)) {
   problems.push(`an unnamed keyframe draws anonymously: ${JSON.stringify(rowShape.fallback)}`);
@@ -423,13 +602,21 @@ if (keyed.poseMoved > 1e-6) problems.push(`Alt+↓ also nudged the dancer (${key
 const kept = await page.evaluate(() => {
   const app = window.__app;
   app.seqStates[1].kf = { caption: 'from another feature' };
+  app.seqSetTravel(1, 1.7);
+  app.seqSetHold(1, 0.9);
   app.applyPreset(3);
   app.seqUpdate(1);
-  return { name: app.seqStates[1].name, dur: app.seqStates[1].dur, kf: app.seqStates[1].kf?.caption };
+  return {
+    name: app.seqStates[1].name,
+    move: app.seqStates[1].move,
+    hold: app.seqStates[1].hold,
+    kf: app.seqStates[1].kf?.caption,
+  };
 });
 console.log('--- ⟳ keeps:', JSON.stringify(kept));
 if (kept.name !== 'collection') problems.push('⟳ lost the keyframe label');
-if (kept.dur !== 2.4) problems.push(`⟳ lost the duration (${kept.dur})`);
+if (kept.move !== 1.7) problems.push(`⟳ lost the travel time (${kept.move})`);
+if (kept.hold !== 0.9) problems.push(`⟳ lost the hold (${kept.hold})`);
 if (kept.kf !== 'from another feature') problems.push('⟳ dropped an unknown field off the keyframe');
 await page.screenshot({ path: `${outDir}/sequence-rows.png` });
 
@@ -442,12 +629,24 @@ const reloaded = await page.evaluate(() => ({
   names: window.__app.seqStates.map((s) => s.name),
   rows: [...document.querySelectorAll('#seq-list .seq-name')].map((i) => i.value),
   kf: window.__app.seqStates[1]?.kf?.caption ?? null,
+  // Both timing numbers are authored work too: they are what a lesson video's
+  // pacing IS, and a refresh mid-lesson must not throw them away.
+  move: window.__app.seqTravel(1),
+  hold: window.__app.seqHold(1),
+  boxes: [
+    document.querySelectorAll('#seq-list .seq-move')[1]?.value,
+    document.querySelectorAll('#seq-list .seq-hold')[1]?.value,
+  ],
 }));
 console.log('--- after reload:', JSON.stringify(reloaded));
 if (reloaded.names.join('|') !== 'cross|collection|pivot out') {
   problems.push(`labels did not survive a reload: ${JSON.stringify(reloaded.names)}`);
 }
 if (reloaded.rows.join('|') !== reloaded.names.join('|')) problems.push('the restored rows do not show their labels');
+if (reloaded.move !== 1.7 || reloaded.hold !== 0.9) {
+  problems.push(`the timing did not survive a reload: move ${reloaded.move}, hold ${reloaded.hold} (want 1.7 / 0.9)`);
+}
+if (reloaded.boxes.join('|') !== '1.7|0.9') problems.push(`the restored boxes read ${JSON.stringify(reloaded.boxes)}, want [1.7, 0.9]`);
 
 await page.evaluate(() => window.__app.setSeqStates([]));
 

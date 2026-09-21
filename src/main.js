@@ -533,22 +533,204 @@ function groundInterpFeet(figure, fa, fb, t) {
   figure.group.updateMatrixWorld(true);
 }
 
-// How long each segment of a keyframe chain lasts, in seconds. A keyframe's
-// own `dur` is the time it takes to reach the NEXT one, so the last keyframe
-// has no say (nothing follows it) and a chain that carries no durations at all
-// — every A/B pair, every sequence saved before this existed — falls back to
-// the shared tempo and behaves exactly as it did.
-function segSeconds(states) {
-  const out = [];
-  for (let i = 0; i < states.length - 1; i++) {
-    const d = Number(states[i]?.dur);
-    out.push(Number.isFinite(d) && d > 0 ? d : SEQ_SEG_SECONDS);
+// A keyframe carries TWO numbers, because a movement is not only travel: how
+// long it takes to GET INTO this pose (`move`, the transition from the keyframe
+// before it) and how long the couple then STAYS in it (`hold`). The timeline is
+// therefore hold₀, move₁, hold₁, move₂, hold₂, … — the first keyframe has no
+// move (nothing precedes it to travel from) and the last one does have a hold
+// (a video that lingers on the end pose).
+//
+// Both are OPTIONAL at read time, which is what keeps every older chain
+// playing: an A/B pair carries neither and falls back to the shared tempo with
+// no hold, exactly as it did. The legacy field is `dur` — "seconds to reach the
+// NEXT keyframe", i.e. keyframe i's `dur` is keyframe i+1's `move` — and it is
+// migrated once at the entry points (see normalizeSeqTiming) so a reordered row
+// carries its own numbers with it rather than inheriting its neighbour's. The
+// fallback below is the second half of that: a chain that never went through an
+// entry point (any raw array handed straight to applyStatesT) still reads.
+function seqTiming(states) {
+  const holds = []; // holds[j] = seconds standing still ON keyframe j       (n)
+  const moves = []; // moves[j] = seconds travelling from j into j+1       (n-1)
+  // Read RAW — finite and positive, nothing else. The bounds are the setters'
+  // job, exactly as they were for `dur`: a reader that quietly re-clamps makes
+  // a hand-edited file play something other than what it says, and makes the
+  // row disagree with the playback about which number is in force.
+  for (let j = 0; j < states.length; j++) {
+    const h = Number(states[j]?.hold);
+    holds.push(Number.isFinite(h) && h > 0 ? h : 0);
+    if (j === 0) continue;
+    const m = Number(states[j]?.move);
+    const legacy = Number(states[j - 1]?.dur);
+    moves.push(Number.isFinite(m) && m > 0 ? m
+      : Number.isFinite(legacy) && legacy > 0 ? legacy
+        : SEQ_SEG_SECONDS);
   }
-  return out;
+  const total = holds.reduce((a, b) => a + b, 0) + moves.reduce((a, b) => a + b, 0);
+  return { holds, moves, total };
 }
 
 function statesSeconds(states) {
-  return segSeconds(states).reduce((a, b) => a + b, 0);
+  return seqTiming(states).total;
+}
+
+// Where t ∈ [0, 1] of the chain's RUNNING TIME lands: segment `i` at fraction
+// `u`, plus `at` — the keyframe whose extras are showing.
+//
+// The walk advances on a STRICT `>` at every phase boundary, which is what
+// makes the reduction exact: with every hold 0 this is the old equal-time
+// split down to the last bit, an exact boundary still resolving as u = 1 of
+// the segment just finished rather than u = 0 of the next (the two give the
+// same pose, but only one of them is the arithmetic that used to run).
+//
+// `at` follows the long-standing rule — extras come from the keyframe being
+// travelled FROM and hold until the next is REACHED — which now reads as: the
+// keyframe we are standing on, or the one we are leaving. A hold is therefore
+// covered by construction, and the hand-over still happens at the instant the
+// next keyframe is reached (u = 1), whether a hold follows it or not.
+//
+// "Reached" is read with a hair of slack, and that slack is load-bearing. `t`
+// is a FRACTION of the total, so anything that names a keyframe by its time
+// (seqKeyframeT, which Show uses; the players' final t = 1) hands us
+// arrival/total multiplied back by total — and in binary that round trip lands
+// an ulp short about a third of the time (measured over 1.2M random chains:
+// 250,764 of 800,672 arrivals came back as u = 0.999999999999999). `u` itself
+// is passed on RAW, so the pose is unaffected either way; but `at` is a
+// DISCRETE choice between two keyframes' captions, names, drawings and muscle
+// highlighting, and it must not turn on one ulp. With the slack, every one of
+// those 1.2M arrivals resolves to the keyframe actually arrived at.
+const U_ARRIVED = 1 - 1e-9;
+function seqTimeMap(states, t) {
+  const segs = states.length - 1;
+  if (segs < 1) return { i: 0, u: 0, at: 0 };
+  const { holds, moves, total } = seqTiming(states);
+  let time = THREE.MathUtils.clamp(t, 0, 1) * total;
+  for (let j = 0; j < segs; j++) {
+    if (time <= holds[j]) return { i: j, u: 0, at: j }; // standing on keyframe j
+    time -= holds[j];
+    // The last segment swallows whatever is left: past its end we are in the
+    // final keyframe's own hold, which is u = 1 of it.
+    if (time <= moves[j] || j === segs - 1) {
+      const u = THREE.MathUtils.clamp(time / moves[j], 0, 1);
+      return { i: j, u, at: u >= U_ARRIVED ? j + 1 : j };
+    }
+    time -= moves[j];
+  }
+  return { i: segs - 1, u: 1, at: segs }; // unreachable; the clamp above ends the walk
+}
+
+// ------------------------------------------------ eased transitions
+// A transition is a straight lerp in TIME by default, so the couple starts and
+// stops dead — robotic, and a linear move INTO a hold is a visible jolt (full
+// speed to standing still in one frame). With the sequence's `ease` toggle on
+// (app.setSeqEase) the within-segment fraction is remapped so a movement leaves
+// and arrives gently instead.
+//
+// It is remapped HERE, on the TIME → pose-parameter path, and deliberately NOT
+// inside applyStatesU: the COG trail samples applyStatesU by pose parameter,
+// and the PATH the couple walks must not depend on the tempo it is walked at.
+// Easing changes WHEN the couple is where, never WHERE it goes — so the trail
+// is byte-identical with the toggle on and off, which dev-verify-seq-ease.mjs
+// checks rather than assumes. `at` (the keyframe whose extras show) is decided
+// by seqTimeMap from the time PHASE and is untouched for the same reason.
+//
+// THE REST RULE. Easing every segment to a full stop at every keyframe turns a
+// flowing figure — a giro is four keyframes the couple never stands still in —
+// into a stutter: stop, go, stop, go. So each END of a segment is eased only
+// where the couple is really at rest: the chain's own first and last keyframes
+// (nothing precedes or follows them to be moving from), and any keyframe with a
+// hold > 0, which the timeline literally stands on. A pass-through keyframe —
+// hold 0, mid-chain — is crossed at speed.
+//
+// That leaves a velocity STEP at a pass-through keyframe whenever the two
+// segments differ in duration or in distance covered (a 0.5 s transition into a
+// 4 s one arrives eight times faster than it leaves). Accepted, and said out
+// loud: it is exactly what the linear timeline does today, and smoothing it
+// means a spline THROUGH the keyframes, which would move the path — the one
+// thing this must not touch.
+function restsOn(states, j) {
+  // The ends of the chain rest by construction; elsewhere it takes a hold.
+  // Read exactly as seqTiming reads it (raw, finite, positive) so the curve and
+  // the clock can never disagree about which keyframes are rests.
+  if (j === 0 || j === states.length - 1) return true;
+  const h = Number(states[j]?.hold);
+  return Number.isFinite(h) && h > 0;
+}
+
+// ONE curve, taken whole or by halves — there is no per-keyframe curve picker
+// and no second easing to tune. smoothstep u²(3−2u) is the S: zero velocity at
+// both ends, peak 1.5× the average through the middle. A segment eased at one
+// end only takes the HALF of that same S it needs, stretched back over [0, 1]:
+// the first half leaves at rest and arrives at 1.5×, the second half enters at
+// 1.5× and stops. Using the halves is also what keeps the two sides of a
+// pass-through keyframe agreeing — both free ends run at 1.5× — where two
+// independent curves would meet at whatever slopes they happened to have.
+//
+// Every branch is exactly 0 at u = 0 and exactly 1 at u = 1 in floating point
+// (smoothstep(0.5) is 0.5 exactly), so a keyframe arrival still renders that
+// keyframe's own pose bit for bit — applyStatesU short-circuits u = 0/1 — and a
+// hold stays byte-stable across its whole band.
+//
+// smootherstep (6u⁵−15u⁴+10u³) was the other candidate and is NOT used, and
+// the choice was made by LOOKING at the motion rather than by taste. Filmed at
+// nine equal time steps over a 131.8° sweep taking 2.4 s, its peak per-frame
+// travel is 1.875× the mean against smoothstep's 1.500×, and the pose takes
+// 0.23 s to move even one degree off the keyframe it is leaving, against
+// 0.13 s — a fifth of the transition spent parked at each end, paid for with a
+// lurch through the middle. On a tango transition, which is unhurried to begin
+// with, that reads as hesitation rather than as grace. Its one real advantage,
+// continuous acceleration, is unrealizable here anyway: the free end of a
+// one-sided segment has a corner in the velocity whatever curve feeds it.
+function easeU(states, i, u) {
+  const leaves = restsOn(states, i); // travelling OUT of a keyframe it rested in
+  const arrives = restsOn(states, i + 1); // …and INTO one it will rest in
+  if (leaves && arrives) return smoothstep(u);
+  if (leaves) return 2 * smoothstep(u / 2); // rest → speed (the S's first half)
+  if (arrives) return 2 * smoothstep(0.5 + u / 2) - 1; // speed → rest (its second)
+  return u; // passed through at speed, both ends
+}
+
+// Where keyframe i sits ON THE SCRUBBER: the moment the chain ARRIVES at it,
+// i.e. the START of its hold. Keyframe 0 is t = 0; the last keyframe is t = 1
+// exactly when it has no hold of its own, and earlier by that hold when it
+// does (the tail of the timeline is time spent standing ON it, not travelling
+// to it).
+//
+// This is the inverse of seqTimeMap's walk and is written as the same sum, so
+// the two cannot drift apart: hold₀ + move₁ + hold₁ + move₂ … up to but not
+// including keyframe i's own hold.
+function keyframeT(states, i) {
+  const { holds, moves, total } = seqTiming(states);
+  const k = Math.min(Math.max(i | 0, 0), states.length - 1);
+  if (k <= 0 || !(total > 0)) return 0;
+  let time = 0;
+  for (let j = 0; j < k; j++) time += holds[j] + moves[j];
+  return THREE.MathUtils.clamp(time / total, 0, 1);
+}
+
+// ------------------------------------------------ stopping a player
+// The ONE place either player's running flag is cleared. Five paths end a
+// playback — a stop, a natural finish, a chain that shrank below two
+// keyframes, new snapshots replacing the chain, and a video capture taking the
+// player over — and each of them has to tell the UI, or a Play button is left
+// reading "■ Stop" with nothing running. That stuck button is the whole bug
+// this funnel exists to make impossible, so never clear the flags by hand.
+// Returns whether anything actually was playing.
+function clearPlaying({ seq = true, interp = true } = {}) {
+  const was = (seq && app.seqPlaying) || (interp && app.interpPlaying);
+  if (seq) app.seqPlaying = false;
+  if (interp) app.interpPlaying = false;
+  if (was && app.ui) app.ui.onPlaybackChanged();
+  return was;
+}
+
+// Where a Play press starts from — the media-player rule. The scrubber's own
+// position when it sits strictly INSIDE the movement (playback was stopped
+// there, or the user dragged it there), because stop is a pause and Play after
+// a pause means "carry on". At either end it means "from the top": at 1 there
+// is nothing left to play, and at 0 the start is where it already is.
+const RESUME_EPS = 1e-4;
+function resumeT(t) {
+  return Number.isFinite(t) && t > RESUME_EPS && t < 1 - RESUME_EPS ? t : 0;
 }
 
 // The EXTRAS a keyframe may carry beside its pose, in its own `kf` block:
@@ -569,20 +751,87 @@ function statesSeconds(states) {
 // honest answer to that question.
 let shownExtras = null;
 
+// A keyframe's name, as the PICTURE should carry it — the empty string for a
+// keyframe the user never named. `seqAdd` stores no name at all now, but every
+// sequence saved before it did carries a literal "Keyframe 3", and those are
+// not names: they are the row's own placeholder, frozen into the file, and they
+// go STALE the moment the row is reordered. Stamping one across a recorded
+// video would label the third step "Keyframe 1". So only a name the user
+// actually typed is drawn — the row goes on showing (and editing) whatever the
+// keyframe really holds.
+const AUTO_NAME = /^Keyframe \d+$/;
+function screenName(state) {
+  const n = typeof state?.name === 'string' ? state.name.trim() : '';
+  return n && !AUTO_NAME.test(n) ? n : '';
+}
+
+// ---- which drawings a keyframe shows -------------------------------------
+// Two keys, and the second one is what makes "draw this for keyframe 3 alone"
+// one gesture instead of a tour of every other row:
+//   kf.draw — the SUBSET this keyframe was tagged with (captured from screen).
+//   kf.own  — drawings AUTHORED FOR this keyframe while it was focused (✎).
+//
+// The rule is  shown(X) = base(X) ∪ X.kf.own, with
+//   base(X) = X.kf.draw     when X is tagged,
+//           = every drawing NO keyframe owns, otherwise.
+// So an owned drawing is private to its owner(s) — an untagged keyframe's
+// "all of them" stops meaning "including the ones that belong to somebody
+// else" — while an ordinary drawing still shows on every untagged keyframe.
+// Ownership is a UNION, not a move: a duplicated keyframe shares its
+// original's ids and both go on showing the drawing.
+//
+// REDUCTION GUARD: with nothing owned anywhere and X untagged this returns
+// exactly `null` — the filter every sequence authored before this carries, and
+// the one `Drawings.setVisibleIds` treats as "no filter at all". Nothing about
+// an existing timeline changes until somebody uses ✎.
+let ownedCache = null; // ids owned by SOME keyframe; invalidated in onSeqChanged
+function ownedDrawIds() {
+  if (ownedCache) return ownedCache;
+  const s = new Set();
+  for (const st of app.seqStates) for (const id of st?.kf?.own ?? []) s.add(id);
+  return (ownedCache = s);
+}
+
+function keyframeDrawFilter(state) {
+  const kf = state?.kf;
+  const tagged = Array.isArray(kf?.draw) ? kf.draw : null;
+  const own = Array.isArray(kf?.own) ? kf.own : null;
+  const owned = ownedDrawIds();
+  if (!tagged && !owned.size) return null; // the reduction: no filter at all
+  // A tagged keyframe's base is exactly what it captured; an untagged one's is
+  // the PUBLIC diagram — everything nobody has claimed.
+  const base = tagged ?? drawings.ids().filter((id) => !owned.has(id));
+  if (!own?.length) return [...base];
+  return [...new Set([...base, ...own])];
+}
+
 function applyKeyframeExtras(state) {
+  // Which keyframe is CURRENT is otherwise invisible — it decides where
+  // "+ Add keyframe" inserts, so the row wears a marker. The panel is told
+  // only when the answer actually CHANGES, by object identity: this runs every
+  // frame of a playback, and renderSequence rebuilds every row (it would tear
+  // the caret out of a label being typed sixty times a second). The identity
+  // test is also what keeps a re-apply of the SAME keyframe — seqSetCaption
+  // and friends do one on every keystroke — free.
+  const moved = (state ?? null) !== shownExtras;
   shownExtras = state ?? null;
   const kf = state?.kf;
-  const ids = kf?.draw;
-  drawings.setVisibleIds(Array.isArray(ids) ? ids : null);
-  // The caption is the ONE extra with no running counterpart: the panel holds
-  // no live caption to inherit, so the neutral state is simply no caption and
-  // an untagged keyframe clears the band.
-  studio.setCaption(typeof kf?.caption === 'string' ? kf.caption : '');
+  drawings.setVisibleIds(keyframeDrawFilter(state));
+  // The caption and the name are the extras with no running counterpart: the
+  // panel holds no live caption to inherit, so the neutral state is simply no
+  // text and an untagged keyframe clears the band. `*Hidden` is applied by
+  // handing the studio an empty string, which is also what makes the block
+  // un-grabbable and keeps it out of every export — one rule, not three.
+  studio.setCaption(
+    kf?.captionHidden || typeof kf?.caption !== 'string' ? '' : kf.caption,
+    kf?.captionColor ?? null);
+  studio.setSeqName(kf?.nameHidden ? '' : screenName(state), kf?.nameColor ?? null);
   // The muscle look DOES have a running counterpart — the Muscles panel's own
   // lit set and colours — so an untagged keyframe hands it back rather than
   // going dark. It is applied as a VIEW OVERRIDE that never reaches storage;
   // see ui.setMuscleOverride for why this must not go through applyViewState.
   app.ui?.setMuscleOverride(kf?.muscles ?? null);
+  if (moved) app.ui?.onShownKeyframeChanged?.();
   requestRender(); // all three are view changes; main.js renders on demand
 }
 
@@ -601,6 +850,44 @@ function setKfField(state, key, value) {
   else delete state.kf;
 }
 
+// ---- the per-keyframe EDIT FOCUS (✎) -------------------------------------
+// "Add this drawing / this highlight to keyframe 3 and nowhere else" used to be
+// four gestures in three places (draw it, then visit every OTHER keyframe, hide
+// it there, re-capture its ◻). Focus turns it into one: while keyframe K is
+// focused the couple stands at K, every drawing authored belongs to K
+// (kf.own), and every Muscles-panel edit writes K's kf.muscles instead of the
+// user's running look.
+//
+// Tracked by IDENTITY, not by index — a reorder must not silently move the
+// focus to whichever keyframe slid into that row. Session state, deliberately:
+// it is never serialized into a keyframe and never persisted, because it is a
+// mode the user is in, not something the lesson carries.
+let seqFocusState = null;
+
+// Leave the focus. `handBack` says whether the TIMELINE has finished speaking
+// too: true drops the keyframe's extras (the floor shows the whole diagram, the
+// Muscles panel takes its own look back), false leaves them because the caller
+// is about to apply another keyframe's — Show, a scrub, a player, focusing a
+// different row. Returns whether anything was focused.
+function endSeqFocus(handBack = true) {
+  if (!seqFocusState) return false;
+  seqFocusState = null;
+  if (handBack) applyKeyframeExtras(null);
+  app.ui?.onSeqFocusChanged?.();
+  requestRender();
+  return true;
+}
+
+// The focused keyframe's index, or -1. Resolved live: if the state has left the
+// chain (deleted, replaced by an import) the focus is stale and is dropped
+// here, so nothing downstream has to carry a second copy of that rule.
+function seqFocusIndex() {
+  if (!seqFocusState) return -1;
+  const i = app.seqStates.indexOf(seqFocusState);
+  if (i < 0) { seqFocusState = null; app.ui?.onSeqFocusChanged?.(); }
+  return i;
+}
+
 // Pose the couple at t ∈ [0, 1] along a chain of couple states — the A→B
 // lerp generalized to any number of keyframes. `t` is a fraction of the whole
 // chain's RUNNING TIME, so a keyframe held longer occupies more of the
@@ -610,20 +897,37 @@ function setKfField(state, key, value) {
 // `extras` is the one caller that must opt OUT: updateCogTrail runs this ~289
 // times per edit to sample the COG path, and a trail rebuild is not a scrub —
 // it must not leave the floor diagram set to whatever the last sample said.
-function applyStatesT(states, t, { extras = true } = {}) {
-  const segs = states.length - 1;
-  const durs = segSeconds(states);
-  const total = durs.reduce((a, b) => a + b, 0);
-  let time = THREE.MathUtils.clamp(t, 0, 1) * total;
-  let i = 0;
-  while (i < segs - 1 && time > durs[i]) { time -= durs[i]; i++; }
-  const u = i + THREE.MathUtils.clamp(time / durs[i], 0, 1);
+//
+// `ease` is RESOLVED BY THE CALLER, never sniffed from the array: the sequence
+// players pass app.seqEase(), and the A→B compare — a bare [A, B] pair with no
+// settings of its own — passes nothing and stays linear. Defaulting it off is
+// also what keeps every chain handed straight to this function by a script
+// playing exactly as it did.
+function applyStatesT(states, t, { extras = true, ease = false } = {}) {
+  if (!states || states.length < 2) return; // nothing to travel between
+  const { i, u, at } = seqTimeMap(states, t);
   // Extras come from the keyframe being travelled FROM and hold until the next
   // one is REACHED — a diagram that re-picked itself every frame would flicker
-  // its way through a recorded video. The while loop above already hands over
-  // at each segment boundary, so the only place `u` can sit ON a keyframe is
-  // the end of the chain, where the last keyframe's own extras take over.
-  if (extras) applyKeyframeExtras(states[u >= i + 1 ? i + 1 : i]);
+  // its way through a recorded video. seqTimeMap has already worked out which
+  // keyframe that is, holds included; easing never moves a phase boundary, so
+  // this answer is the same either way.
+  if (extras) applyKeyframeExtras(states[at]);
+  applyStatesU(states, i, ease ? easeU(states, i, u) : u);
+}
+
+// Pose the couple at POSE PARAMETER (i, u): fraction u of segment i, with no
+// reference to the clock at all. Split out of applyStatesT because the two
+// questions are genuinely different — the players ask "where are we at this
+// moment", the COG trail asks "draw the PATH" — and a path sampled by time
+// wastes its samples wherever the couple is standing still and thins out the
+// very parts that move (a 6 s hold beside a 0.5 s move would spend twelve
+// times the ink on a single point). Sampling by pose parameter makes a hold
+// cost nothing, which is the honest drawing of a trail.
+//
+// u = 0 and u = 1 are EXACT: lerpPose short-circuits both (three's slerp does
+// too), so a hold really does render its keyframe's own pose rather than a
+// rounded copy of it.
+function applyStatesU(states, i, u) {
   const sA = states[i];
   const sB = states[i + 1];
   // Foot anchors first: measuring applies the endpoint poses, which the
@@ -631,16 +935,70 @@ function applyStatesT(states, t, { extras = true } = {}) {
   const feetA = app.interpGroundFeet ? stateFeet(sA) : null;
   const feetB = app.interpGroundFeet ? stateFeet(sB) : null;
   app.figures.forEach((f, j) => {
-    f.setPose(lerpPose(sA.figures[j], sB.figures[j], u - i));
-    if (feetA && feetB) groundInterpFeet(f, feetA[j], feetB[j], u - i);
+    f.setPose(lerpPose(sA.figures[j], sB.figures[j], u));
+    if (feetA && feetB) groundInterpFeet(f, feetA[j], feetB[j], u);
   });
 }
 
-// Default tempo of the A→B player and of a new keyframe (seconds per segment);
-// a keyframe can override it with its own `dur`, within these bounds.
+// Migrate a chain's timing to the two-number form, in place, ONCE — at every
+// entry point a chain can arrive through (setSeqStates, which the localStorage
+// restore and the JSON import both go through).
+//
+// The legacy `dur` on keyframe i means "seconds to reach the next one", so it
+// is keyframe i+1's `move`, and the old chains all had no holds. Doing it here
+// rather than only at read time is what makes a REORDER behave: `dur` belongs
+// to the gap AFTER a row, so dragging row 3 to the top would otherwise hand it
+// whatever the row now above it happens to say. `move` belongs to the keyframe
+// itself and travels with it. The read-time fallback in seqTiming stays as
+// well, for a raw array that never passed through here (an A/B pair, a chain a
+// script builds by hand).
+function normalizeSeqTiming(states) {
+  if (!Array.isArray(states)) return states;
+  states.forEach((s, i) => {
+    if (!s || typeof s !== 'object') return;
+    const m = Number(s.move);
+    if (!(Number.isFinite(m) && m > 0) && i > 0) {
+      const legacy = Number(states[i - 1]?.dur);
+      // Carried across UNCLAMPED: this is a rename, and a migration that
+      // quietly changes a number is a migration that cannot be trusted. The
+      // chain must play exactly as it did before it was loaded.
+      if (Number.isFinite(legacy) && legacy > 0) s.move = legacy;
+    }
+  });
+  // Dropped only after every keyframe has read its predecessor's: leaving it
+  // would give the same gap two owners, which is the bug this migration exists
+  // to prevent.
+  for (const s of states) { if (s && typeof s === 'object') delete s.dur; }
+  return states;
+}
+
+// Default tempo of the A→B player and of a new keyframe (seconds to travel
+// into it); a keyframe can override it with its own `move`, within these
+// bounds.
 const SEQ_SEG_SECONDS = 2.4;
 const SEQ_MIN_SECONDS = 0.2;
 const SEQ_MAX_SECONDS = 30;
+// How long a NEW keyframe stands in its pose. Zero, deliberately: a chain with
+// no holds is exactly the old equal-time split, so the second number costs a
+// user who never touches it nothing at all — neither a changed playback nor a
+// changed recording. A hold may be 0, which is why it has its own floor rather
+// than sharing SEQ_MIN_SECONDS (a move may not: a zero-length transition is a
+// cut, and it would divide the timeline by zero).
+const SEQ_HOLD_SECONDS = 0;
+// Whether a sequence STARTED FROM SCRATCH in this session eases its
+// transitions. On, because new work should look right without having to be
+// told to — but only for a timeline the user begins empty (see seqAdd). A
+// chain arriving from anywhere else defaults OFF and so plays exactly as it
+// always has: a session restored from localStorage without the flag, and an
+// imported file without the `ease` key, are both older work whose timing the
+// author already judged (ui.js resolves both).
+const SEQ_EASE_FRESH = true;
+// Has anyone SAID what this timeline should do — the checkbox, a restored
+// session, an imported file, a script? The fresh default applies only while
+// nobody has, so unticking the box and THEN adding the first keyframe keeps the
+// answer the user just gave instead of overruling it. Cleared when the timeline
+// is emptied, because that ends the sequence the choice was about.
+let seqEaseChosen = false;
 // A keyframe's own label ("cross", "pivot out"). Capped because the row is one
 // line in a 320 px sidebar — a label that cannot be read in the list is not
 // identifying anything, and the cap is where the input stops taking, so the
@@ -686,10 +1044,17 @@ function updateCogTrail() {
   if (!states) return;
   const saved = app.getCoupleState('__trail');
   const series = { a: [], b: [], couple: [] };
-  const N = 32 * (states.length - 1) + 1;
-  for (let i = 0; i < N; i++) {
-    // extras: false — sampling the path is not showing a keyframe (see applyStatesT).
-    applyStatesT(states, i / (N - 1), { extras: false });
+  const segs = states.length - 1;
+  const N = 32 * segs + 1;
+  for (let k = 0; k < N; k++) {
+    // Sampled by POSE PARAMETER, not by time: 32 samples per segment whatever
+    // the segment's tempo, so a held keyframe costs one point instead of a
+    // third of the trail's ink (see applyStatesU). Going through the pose
+    // applier directly is also what keeps the extras out of it — sampling the
+    // path is not showing a keyframe, and this runs ~289 times per edit.
+    const p = (k / (N - 1)) * segs;
+    const seg = Math.min(Math.floor(p), segs - 1);
+    applyStatesU(states, seg, p - seg);
     leader.clampToFloor();
     follower.clampToFloor();
     const rep = coupleReport(leader, follower);
@@ -1578,12 +1943,24 @@ const app = {
   interpPlaying: false,
   interpT: 0,
   interpTick: null, // UI callback fed the current t while playing
+  interpDone: null, // fired once when the A→B player reaches t = 1 (never on a stop)
   seqStates: [], // movement-sequence keyframes (couple states, ≥2 to play)
   seqPlaying: false,
   seqT: 0,
   seqTick: null, // UI callback fed the current t while the sequence plays
-  seqDone: null, // fired once when the sequence player reaches t = 1
-  recording: null, // { states, t, secs, rec } while a video capture plays
+  seqDone: null, // fired once when the sequence player reaches t = 1 (never on a stop)
+  // Ease transitions in and out of the keyframes the couple rests in — ONE
+  // setting for the whole sequence (see easeU). Read through seqEase()/written
+  // through setSeqEase(on), which is the whole API a sequence LIBRARY needs to
+  // bundle it with the rest of a saved sequence's settings.
+  seqEaseOn: SEQ_EASE_FRESH,
+  recording: null, // { states, t, secs, ease, rec } while a video capture plays
+  // Present mode held FOR a capture: { wasPresenting } from the moment the
+  // first ⏺ enters it until the take really ends. It outlives the MP4→WebM
+  // retry (which re-enters recordPlayback), or the retry would bounce out of
+  // Present and back in — resizing the render target mid-capture — and lose
+  // the memory of whether the user was presenting to begin with.
+  recPresent: null,
   ghosts: { A: null, B: null }, // translucent snapshot figures
   history: [], // undo stack of serialized couple states
   redoStack: [], // states walked back from, awaiting redo (cleared by any fresh edit)
@@ -1707,13 +2084,22 @@ const app = {
   },
 
   // Escape, and the one place that decides what Escape means. Precedence runs
-  // from the most transient thing on screen to the least: a half-drawn floor
-  // shape, then a half-authored pin, then the selection (with its gizmo). Each
-  // step says what it just abandoned — an Escape that silently does nothing
-  // reads as an Escape that is not wired up. Move-hips is exempt from the
-  // deselect step because its handle is seated automatically with no click, so
-  // dismissing it would leave the mode with nothing to drag.
+  // from the most transient thing on screen to the least: a running playback,
+  // then a half-drawn floor shape, then a half-authored pin, then the
+  // selection (with its gizmo). Each step says what it just abandoned — an
+  // Escape that silently does nothing reads as an Escape that is not wired up.
+  // Move-hips is exempt from the deselect step because its handle is seated
+  // automatically with no click, so dismissing it would leave the mode with
+  // nothing to drag.
+  //
+  // Playback goes FIRST because a moving dancer is the most pending thing on
+  // screen: it is the only item here that is still changing, and Escape during
+  // an animation can only mean "stop that".
   cancelPending() {
+    if (this.stopPlayback()) {
+      this.status('Playback stopped.', 'info');
+      return 'playback';
+    }
     if (this.drawPending) {
       this.cancelDraw();
       this.status('Drawing cancelled.', 'info');
@@ -1722,6 +2108,14 @@ const app = {
     if (this.cancelPinPending()) {
       this.status('Pin cancelled — the first spot was released.', 'info');
       return 'pin';
+    }
+    // The edit focus is a MODE, so it sits below the half-finished things and
+    // above the selection: one Escape leaves it, and that same press must not
+    // also deselect (the user would lose the joint or drawing they were on for
+    // a keypress they meant for the mode).
+    if (seqFocusIndex() >= 0) {
+      this.seqFocus(null);
+      return 'seqfocus';
     }
     if (this.drawSelected) {
       this.selectDrawing(null);
@@ -1753,6 +2147,7 @@ const app = {
     // slide composed in "fill window" would reframe itself the moment it is
     // recorded.
     this.presentSaved = { frame: studio.frame, mode: this.mode };
+    endSeqFocus(true); // presenting is showing, not authoring
     this.presenting = true;
     container.parentElement.classList.add('presenting');
     this.setMode('rotate'); // no gizmos, no half-authored shapes on screen
@@ -1879,27 +2274,29 @@ const app = {
     return o;
   },
 
+  // The ONE place a newly committed drawing lands, whichever tool or script
+  // made it — which is what lets the edit focus claim it without four copies
+  // of the rule (and what a fifth shape would inherit for free).
+  afterDrawAdded(o) {
+    this.claimForFocus(o);
+    this.ui?.onDrawingsChanged?.();
+    requestRender();
+    return o;
+  },
+
   // `a`/`b` are floor points ({x, z}) or JOINT ANCHORS ({ fig, joint }) — the
   // latter pins that end to a dancer, so the line leaves the floor and rides
   // the pose. `fig` takes an index or 'leader'/'follower'.
   addDrawLine(a, b) {
-    const o = drawings.addLine(drawEnd(a), drawEnd(b));
-    this.ui?.onDrawingsChanged?.();
-    requestRender();
-    return o;
+    return this.afterDrawAdded(drawings.addLine(drawEnd(a), drawEnd(b)));
   },
 
   addDrawArrow(a, b) {
-    const o = drawings.addArrow(drawEnd(a), drawEnd(b));
-    this.ui?.onDrawingsChanged?.();
-    requestRender();
-    return o;
+    return this.afterDrawAdded(drawings.addArrow(drawEnd(a), drawEnd(b)));
   },
 
   addDrawCircle(center, radius) {
-    const o = drawings.addCircle(toFloorV3(center), radius);
-    this.ui?.onDrawingsChanged?.();
-    return o;
+    return this.afterDrawAdded(drawings.addCircle(toFloorV3(center), radius));
   },
 
   // `pos` is a floor point ({x, z}) or a JOINT ANCHOR ({ fig, joint }), exactly
@@ -1914,14 +2311,13 @@ const app = {
     // from the anchor's own position: drag the text off the dancer later and it
     // lands on the floor readable rather than at whatever angle 0 happens to be.
     const at = end.joint ? anchorFigure(end)?.surfacePos?.(end.joint) : end;
-    const o = drawings.addText(end, String(text), yaw ?? (at ? textYawFromCamera(at) : 0), opts);
-    this.ui?.onDrawingsChanged?.();
-    requestRender();
-    return o;
+    return this.afterDrawAdded(
+      drawings.addText(end, String(text), yaw ?? (at ? textYawFromCamera(at) : 0), opts));
   },
 
   removeLastDrawing() {
     drawings.removeLast();
+    this.pruneOwnedDrawIds();
     this.ui?.onDrawSelectionChanged?.(drawings.selected);
     this.ui?.onDrawingsChanged?.();
     requestRender();
@@ -1934,6 +2330,7 @@ const app = {
     const sel = drawings.selected;
     if (!sel) return false;
     drawings.remove(sel);
+    this.pruneOwnedDrawIds();
     this.ui?.onDrawSelectionChanged?.(null);
     this.ui?.onDrawingsChanged?.();
     requestRender();
@@ -1943,6 +2340,7 @@ const app = {
   clearDrawings() {
     this.cancelDraw();
     drawings.clear();
+    this.pruneOwnedDrawIds();
     this.ui?.onDrawSelectionChanged?.(null);
     this.ui?.onDrawingsChanged?.();
     requestRender();
@@ -1959,6 +2357,12 @@ const app = {
   setDrawings(list) {
     this.cancelDraw();
     const n = drawings.fromJSON(list);
+    // An imported file may carry `own` ids naming drawings this diagram does
+    // not have (a sequence exported without them, a hand-edited file). A stale
+    // id is HARMLESS — it matches no child, so it filters nothing — but it
+    // would keep `owned` non-empty and so keep the reduction guard from
+    // firing, turning "no filter at all" into an explicit list of everything.
+    this.pruneOwnedDrawIds();
     this.ui?.onDrawSelectionChanged?.(null);
     this.ui?.onDrawingsChanged?.();
     requestRender();
@@ -2449,6 +2853,12 @@ const app = {
   },
 
   markEdit(figure) {
+    // Starting to pose a dancer stops a running playback: the player rewrites
+    // every joint each frame, so an edit made under it lasts exactly one
+    // frame. Every pose-mutating path already comes through here, which makes
+    // this the one place that covers them all — and the guard keeps it free on
+    // the hot path (markEdit fires on every pointermove of a drag).
+    if (this.seqPlaying || this.interpPlaying) this.stopPlayback();
     if (figure) this.lastEditedFigure = figure;
     this.editStamp = performance.now();
     requestSim(); // a pose just changed — wake the solve/redraw loop
@@ -2733,6 +3143,10 @@ const app = {
     const preset = PRESETS[index];
     if (!preset) return;
     if (studio.clipActive) studio.exitClip(); // a preset is for the couple, not the clip stage
+    // A preset places both dancers; a running player would overwrite it next
+    // frame. (applyPreset does not go through applyCoupleState, so it needs
+    // its own stop.)
+    this.stopPlayback();
     this.pushHistory();
     this.deselect();
     // A preset places both dancers outright, so no one is mid-edit any more:
@@ -2771,6 +3185,14 @@ const app = {
   },
 
   applyCoupleState(state) {
+    // A pose applied outright and a player writing a pose every frame fight,
+    // and the player wins: the keyframe's Show, the slide, the library pose or
+    // the undo would flash up and be overwritten on the very next frame. The
+    // gesture wins instead, and playback stops where it had got to. This is
+    // the one seam Show / slides / the pose library / recall A|B / undo all
+    // pass through, which is why the stop belongs here rather than in five
+    // callers.
+    this.stopPlayback();
     this.deselect();
     if (state.meta?.heights) {
       state.meta.heights.forEach((h, i) => {
@@ -2791,7 +3213,10 @@ const app = {
   // -------------------------------------------------- A→B interpolation
   setInterpStates(A, B) {
     this.interpStates = A && B ? { A, B } : null;
-    this.interpPlaying = false;
+    this.stopInterp();
+    // A position on the chain that has just been replaced means nothing, and
+    // Play resumes from the scrubber — so a fresh pair starts at its start.
+    this.interpT = 0;
     updateCogTrail();
   },
 
@@ -2799,15 +3224,52 @@ const app = {
   applyInterp(t) {
     if (!this.interpStates) return;
     if (this.selected || this.ikState) this.deselect();
+    // The scrubber's position IS interpT — what Play resumes from, exactly as
+    // applySeqT stores the sequence's. The player feeds its own t back in
+    // here, so this is a no-op on that path.
+    this.interpT = t;
     applyStatesT([this.interpStates.A, this.interpStates.B], t);
   },
 
-  playInterp(onTick) {
+  // Play A→B. `from` overrides the resume rule for scripts: 0 replays from the
+  // start whatever the scrubber says, and any t starts there.
+  playInterp(onTick, onDone = null, { from = null } = {}) {
     if (!this.interpStates) return;
-    this.seqPlaying = false; // one player at a time
-    this.interpT = 0;
+    this.stopSeq(); // one player at a time
+    this.interpT = from === null ? resumeT(this.interpT) : THREE.MathUtils.clamp(from, 0, 1);
     this.interpPlaying = true;
-    this.interpTick = onTick || null;
+    this.interpTick = onTick || this.ui?.interpScrubTo || null; // see playSeq
+    this.interpDone = onDone;
+    if (this.ui) this.ui.onPlaybackChanged();
+  },
+
+  // ---- stopping a player -------------------------------------------------
+  // Stop is a PAUSE, not a rewind: the dancers stay in the pose the player
+  // last set and `seqT`/`interpT` keep the position it stopped at, which is
+  // both what the scrubber shows and what Play carries on from. `onDone` is
+  // DROPPED rather than fired — it means "the movement finished", and a
+  // stopped run did not; a caller chaining something onto the end of a
+  // playback must not have it run because the user pressed Stop.
+  stopSeq() {
+    this.seqDone = null;
+    return clearPlaying({ interp: false });
+  },
+
+  stopInterp() {
+    this.interpDone = null;
+    return clearPlaying({ seq: false });
+  },
+
+  // Whatever is playing, stop it; returns whether anything was. Everything
+  // that would FIGHT a running player frame by frame comes through here — a
+  // scrub, a preset, a keyframe's Show, a slide, Escape, the first edit of a
+  // dancer. Merely LOOKING (an orbit, a zoom, a layer switch) deliberately
+  // does not: the player is what the viewer is watching, and moving the camera
+  // to watch it better must not stop it.
+  stopPlayback() {
+    const a = this.stopSeq();
+    const b = this.stopInterp();
+    return a || b;
   },
 
   setPathVisible(visible) {
@@ -2827,44 +3289,182 @@ const app = {
   },
 
   onSeqChanged() {
-    if (this.seqStates.length < 2) this.seqPlaying = false;
+    // Ownership is derived from the chain, so every mutation of it invalidates
+    // the cache. It has to BE a cache: keyframeDrawFilter runs from
+    // applyKeyframeExtras, i.e. several times a second while a sequence plays.
+    ownedCache = null;
+    // Deleting down to one keyframe leaves nothing to travel: stop, rather
+    // than leave the player running on a chain it can no longer play (and its
+    // button stuck offering to stop it).
+    if (this.seqStates.length < 2) this.stopSeq();
     updateCogTrail();
     if (this.ui) this.ui.onSequenceChanged();
   },
 
-  // Insert the current couple pose as a keyframe (appended by default).
-  seqAdd(index = this.seqStates.length) {
-    const state = this.getCoupleState(`Keyframe ${this.seqStates.length + 1}`);
-    state.dur = SEQ_SEG_SECONDS; // seconds to reach the NEXT keyframe
-    this.seqStates.splice(index, 0, state);
+  // Where a keyframe goes when nobody says: AFTER the one being stood on, else
+  // at the end. Building a movement is a walk along it — you show a keyframe,
+  // pose the next step, and add it — and an Add that always appended sent that
+  // step to the far end of the chain, to be dragged back by hand every time.
+  // "The one being stood on" is exactly the keyframe whose extras are showing
+  // (seqShownIndex), which is the same answer the scrubber, the players and
+  // the row's own marker give, so there is one notion of "current" and not two.
+  // Resolved HERE rather than in the caller, so the button, the script and any
+  // later caller cannot disagree about it.
+  seqInsertIndex() {
+    const at = this.seqShownIndex();
+    return at >= 0 ? at + 1 : this.seqStates.length;
+  },
+
+  // Insert the current couple pose as a keyframe — after the current one by
+  // default (seqInsertIndex), or wherever an explicit index says. It is given
+  // the default TRAVEL and no hold — the pair that reduces the timeline to the
+  // old equal-time split, so adding keyframes behaves as it always did until
+  // someone actually sets a hold.
+  // It is born with NO name. The row already falls back to "Keyframe N" as a
+  // placeholder and seqName(i) to the same words, so nothing reads as anonymous
+  // — but a stored "Keyframe 3" is a value that goes stale on the first reorder
+  // AND gets stamped over the picture as if the user had written it (see
+  // screenName). Only a name someone typed is a name.
+  // Returns the index it landed at.
+  seqAdd(index = this.seqInsertIndex()) {
+    // A timeline the user begins EMPTY is new work, and new work eases (see
+    // SEQ_EASE_FRESH). Only here, only on the first keyframe, and only if
+    // nobody has said otherwise: anything else would overrule a choice already
+    // made, and a chain from a file or a previous session brings its own.
+    if (!this.seqStates.length && !seqEaseChosen) this.seqEaseOn = SEQ_EASE_FRESH;
+    const state = this.getCoupleState('');
+    // Every keyframe gets one, the first included: it is INERT there (seqTiming
+    // reads no travel into keyframe 0) but it travels with the row, so a
+    // keyframe dragged out of first place brings its own number rather than
+    // silently inheriting the default.
+    // A keyframe inserted mid-chain gets the plain default like any other — it
+    // deliberately does NOT split the travel time of the gap it landed in. That
+    // would silently re-time a movement the user had already tuned, to make an
+    // arithmetic invariant nobody asked for hold.
+    state.move = SEQ_SEG_SECONDS; // seconds to travel INTO this keyframe
+    const at = Math.min(Math.max(index | 0, 0), this.seqStates.length);
+    this.seqStates.splice(at, 0, state);
     this.onSeqChanged();
+    // The keyframe you just made is the one you are working on, so the next
+    // Add goes after IT — otherwise a run of adds would all pile into the same
+    // slot. It is untagged, so this also hands the caption band and the Muscles
+    // panel back to the user, which is what standing on an untagged keyframe
+    // means everywhere else.
+    // An edit focus (✎) belongs to the keyframe that WAS being stood on; with
+    // the playhead moving to the new one, drawings made from here on must not
+    // go on being filed under a keyframe the user is no longer looking at.
+    endSeqFocus(false);
+    applyKeyframeExtras(state);
+    // Appending is self-evident — the row appears where you are looking. An
+    // insert in the middle of a long list may not be, so it says where it went.
+    if (at < this.seqStates.length - 1) {
+      this.status(at > 0
+        ? `Keyframe added after keyframe ${at}.`
+        : 'Keyframe added at the start of the movement.', 'info');
+    }
+    return at;
+  },
+
+  // Copy keyframe i and drop the copy in right after it — the "same again,
+  // slightly different" gesture a sequence is mostly built from (a walk is four
+  // near-identical steps). A DEEP copy through JSON, which is exactly the
+  // fidelity a keyframe has (it is serialized to localStorage and to an export
+  // file already): nothing — `figures`, `meta`, the `kf` block, the arrays
+  // inside it — may be shared, or editing the copy's caption or its drawing
+  // tag would silently rewrite the original's.
+  //
+  // The NAME is kept as it stands: a copy of "cross" is still the cross, and a
+  // keyframe named "cross (copy)" is a label the user has to clean up rather
+  // than one they wrote.
+  seqDuplicate(i) {
+    const src = this.seqStates[i];
+    if (!src) return -1;
+    const copy = JSON.parse(JSON.stringify(src));
+    this.seqStates.splice(i + 1, 0, copy);
+    // Duplicating the keyframe you are STANDING ON leaves you standing on the
+    // copy, so ⧉ then ⟳ then ⧉ builds a chain forward. Duplicating any other
+    // row deliberately does not move the playhead: the copy's extras are the
+    // source's, and jumping the caption band to a row the user is not looking
+    // at would be a view change nobody asked for.
+    if (shownExtras === src) {
+      endSeqFocus(false); // the focus was on the SOURCE; the playhead is leaving it
+      applyKeyframeExtras(copy);
+    }
+    this.onSeqChanged();
+    this.status(`Keyframe ${i + 1} duplicated — the copy is keyframe ${i + 2}.`, 'info');
+    return i + 1;
   },
 
   // Overwrite keyframe i with the current couple pose. ⟲ re-records the POSE,
-  // and everything else a keyframe carries is NOT pose: its duration is timing,
-  // its name is the user's label, and a later feature may hang its own block
-  // here. So the fresh couple state is spread OVER the old one rather than
+  // and everything else a keyframe carries is NOT pose: its `move`/`hold` are
+  // timing, its name is the user's label, and a later feature may hang its own
+  // block here. So the fresh couple state is spread OVER the old one rather than
   // replacing it — an unknown field rides through untouched by construction,
   // instead of having to be listed here and silently lost when it isn't.
+  // A keyframe's pose is not couple pose state either — the undo stack holds
+  // the POSE OF THE DANCERS, so Ctrl+Z after this would put the couple back and
+  // leave the keyframe holding the new pose. ⟳ destroys authored work in one
+  // click exactly as ✕ does, so it gets the same recovery: an Undo on the
+  // status line, offered where the loss happened.
   seqUpdate(i) {
     const old = this.seqStates[i];
     if (!old) return;
-    this.seqStates[i] = { ...old, ...this.getCoupleState(old.name) };
+    const fresh = { ...old, ...this.getCoupleState(old.name) };
+    this.seqStates[i] = fresh;
+    // The keyframe on screen is an OBJECT, not an index, and ⟳ replaces the
+    // object — so a re-record of the keyframe being stood on would otherwise
+    // orphan `shownExtras` on a state no longer in the chain, and the row's
+    // marker (and pickSeqTextColor, and every `shownExtras === s` fast path)
+    // would report that no keyframe is current at all.
+    // The edit focus (✎) is tracked by identity for the same reason and needs
+    // the same re-pointing — ⟳ on the focused keyframe is the NATURAL gesture
+    // (focus it, adjust the pose, re-record), and it must not quietly end the
+    // session by making the focused object vanish from the chain.
+    if (seqFocusState === old) seqFocusState = fresh;
+    if (shownExtras === old) applyKeyframeExtras(fresh);
     this.onSeqChanged();
+    this.status(`Keyframe ${i + 1} re-recorded.`, 'info', {
+      label: 'Undo',
+      run: () => {
+        // BY IDENTITY, never by the index the message was written with: the
+        // offer lives six seconds, which is long enough to drag a row, delete
+        // one, or ⟳ a second keyframe — and an index-based restore would then
+        // overwrite whichever keyframe had moved into that slot. If the
+        // re-recorded keyframe has since been deleted there is nothing to put
+        // back, and doing nothing is the only honest answer.
+        const at = this.seqStates.indexOf(fresh);
+        if (at < 0) return;
+        this.seqStates[at] = old;
+        if (seqFocusState === fresh) seqFocusState = old;
+        if (shownExtras === fresh) applyKeyframeExtras(old);
+        this.onSeqChanged();
+      },
+    });
   },
 
   // The cap the row's input enforces, read from here so the field and the
   // setter can never disagree about where a label stops.
   seqNameMax: SEQ_NAME_MAX,
   seqCaptionMax: SEQ_CAPTION_MAX,
+  // …and the bounds the two timing boxes enforce, for the same reason: a
+  // number box whose min/max disagree with the setter's clamp silently takes a
+  // value and then shows something else. A move has a floor (a zero-length
+  // transition is a cut, and divides the timeline by zero); a hold does not.
+  seqTravelMin: SEQ_MIN_SECONDS,
+  seqHoldMin: SEQ_HOLD_SECONDS,
+  seqSecondsMax: SEQ_MAX_SECONDS,
 
   // The keyframe's own label ("cross", "pivot out"), so a row says what it is
   // rather than only where it sits. Empty is allowed and meaningful — the row
   // then falls back to its index, which is never anonymous.
   seqSetName(i, text) {
-    if (!this.seqStates[i]) return;
-    this.seqStates[i].name = String(text ?? '').trim().slice(0, SEQ_NAME_MAX);
+    const s = this.seqStates[i];
+    if (!s) return;
+    s.name = String(text ?? '').trim().slice(0, SEQ_NAME_MAX);
     this.onSeqChanged();
+    // The name is drawn over the picture too, so renaming the keyframe that is
+    // showing must land at once rather than on the next scrub.
+    if (shownExtras === s) applyKeyframeExtras(s);
   },
 
   // The label shown for keyframe i: its name, else the positional fallback.
@@ -2873,22 +3473,108 @@ const app = {
     return (s && typeof s.name === 'string' && s.name.trim()) || `Keyframe ${i + 1}`;
   },
 
-  // How long keyframe i takes to reach the next one, in seconds. The LAST
-  // keyframe has no next, so its value is carried but never played.
-  seqSetDuration(i, secs) {
-    if (!this.seqStates[i]) return;
+  // The name the PICTURE would draw for keyframe i — '' for one that was never
+  // named, and for a legacy auto-name (see screenName). The sidebar asks so its
+  // show/hide and colour controls can be inert where there is nothing to style.
+  seqNameForScreen(i) {
+    return screenName(this.seqStates[i]);
+  },
+
+  // ---- the two numbers a keyframe's timing is made of -----------------------
+  // Both are named for what the user sets: how long it takes to GET INTO this
+  // pose, and how long to STAY in it. The stored fields are `move` and `hold`;
+  // the API says `travel` for the first of them only because `seqMove(i, di)`
+  // is already the REORDER, and a timing setter that reads like a reorder is a
+  // trap for the next caller.
+  //
+  // Seconds of transition from the previous keyframe INTO keyframe i. Keyframe
+  // 0 has none — nothing precedes it to travel from — so it is refused there
+  // rather than stored and ignored.
+  seqSetTravel(i, secs) {
+    if (!this.seqStates[i] || i === 0) return;
     const d = Number(secs);
     if (!Number.isFinite(d) || d <= 0) return;
-    this.seqStates[i].dur = Math.min(Math.max(d, SEQ_MIN_SECONDS), SEQ_MAX_SECONDS);
+    this.seqStates[i].move = Math.min(Math.max(d, SEQ_MIN_SECONDS), SEQ_MAX_SECONDS);
     this.onSeqChanged();
   },
 
-  seqDuration(i) {
-    const d = Number(this.seqStates[i]?.dur);
-    return Number.isFinite(d) && d > 0 ? d : SEQ_SEG_SECONDS;
+  seqTravel(i) {
+    if (i === 0) return 0; // the chain starts here; there is no travel into it
+    const d = Number(this.seqStates[i]?.move);
+    if (Number.isFinite(d) && d > 0) return d;
+    // A chain that has not been through setSeqStates may still carry the
+    // legacy field on the keyframe BEFORE this one; seqTiming reads it the
+    // same way, so the row and the playback cannot disagree.
+    const legacy = Number(this.seqStates[i - 1]?.dur);
+    return Number.isFinite(legacy) && legacy > 0 ? legacy : SEQ_SEG_SECONDS;
   },
 
-  // Running time of the whole timeline, in seconds (what Play and ⏺ take).
+  // Seconds the couple STAYS in keyframe i's pose once it is reached. Every
+  // keyframe has one, the last included — that final hold is how a recording
+  // lingers on the end pose instead of cutting the instant it arrives. Zero is
+  // a legitimate value (and the default), so unlike a move it is not refused.
+  seqSetHold(i, secs) {
+    if (!this.seqStates[i]) return;
+    const d = Number(secs);
+    if (!Number.isFinite(d) || d < 0) return;
+    const clamped = Math.min(d, SEQ_MAX_SECONDS);
+    // An absent `hold` and a zero one must serialize identically, or every
+    // sequence saved before this grows a field that changes nothing.
+    if (clamped > 0) this.seqStates[i].hold = clamped;
+    else delete this.seqStates[i].hold;
+    this.onSeqChanged();
+  },
+
+  seqHold(i) {
+    const d = Number(this.seqStates[i]?.hold);
+    // Raw, like seqTiming: the row must show the number that will actually
+    // play, bounds or no bounds.
+    return Number.isFinite(d) && d > 0 ? d : SEQ_HOLD_SECONDS;
+  },
+
+  // Compatibility shims for the one-number era, kept because scripts drive
+  // them: a "duration" was the time to reach the NEXT keyframe, which is that
+  // keyframe's own travel. The last keyframe had no next, and still has none.
+  seqSetDuration(i, secs) { this.seqSetTravel(i + 1, secs); },
+  seqDuration(i) {
+    return i + 1 < this.seqStates.length ? this.seqTravel(i + 1) : SEQ_SEG_SECONDS;
+  },
+
+  // ---- eased transitions ---------------------------------------------------
+  // ONE setting for the WHOLE sequence, like the two text placements and for
+  // the same reason: a figure whose transitions changed character from keyframe
+  // to keyframe would be unwatchable, and which keyframes are eased is already
+  // answered by the holds the author set (see easeU's rest rule). So there is
+  // no per-keyframe curve to pick.
+  seqEase() { return this.seqEaseOn === true; },
+
+  setSeqEase(on) {
+    const next = !!on;
+    // Marked BEFORE the early-out: asking for the value it already holds is
+    // still an answer, and the fresh default must not undo it on the next add.
+    seqEaseChosen = true;
+    if (next === this.seqEaseOn) return next;
+    this.seqEaseOn = next;
+    // Not onSeqChanged: no keyframe changed, and that hook rebuilds the COG
+    // trail — ~289 replays of the whole chain for a checkbox that provably
+    // cannot move the trail by a single vertex (easing is a remap of time, and
+    // the trail is sampled by pose parameter).
+    this.ui?.onSeqEaseChanged?.();
+    // Re-pose at once where the answer has actually changed: strictly inside
+    // the movement, stopped, with a chain to play. At either end (and while a
+    // player or a capture owns the timeline) this would only re-assert a pose
+    // the toggle cannot alter — and at t = 0 that means stamping keyframe 1
+    // over whatever the user has since posed by hand.
+    if (this.seqStates.length >= 2 && !this.seqPlaying && !this.recording
+      && this.seqT > RESUME_EPS && this.seqT < 1 - RESUME_EPS) {
+      applyStatesT(this.seqStates, this.seqT, { ease: next });
+    }
+    requestRender();
+    return next;
+  },
+
+  // Running time of the whole timeline, in seconds (what Play and ⏺ take):
+  // every move PLUS every hold, the last keyframe's included.
   seqSeconds() {
     return this.seqStates.length >= 2 ? statesSeconds(this.seqStates) : 0;
   },
@@ -2899,13 +3585,43 @@ const app = {
   // as a clickable Undo on the status line.
   seqDelete(i) {
     const [removed] = this.seqStates.splice(i, 1);
-    this.onSeqChanged();
+    if (removed === seqFocusState) endSeqFocus(true);
+    // Drawings this keyframe OWNED go with it: owned means "belongs to that
+    // keyframe", so left behind they would be visible on no keyframe at all —
+    // present in the file, present on the floor off the timeline, and invisible
+    // everywhere the lesson actually plays. Only ORPHANS go: an id another
+    // keyframe still lists (a duplicate shares them) has a home, and a drawing
+    // is dropped only when its LAST owner does.
+    this.onSeqChanged(); // invalidates the cache, so the union below is the survivors'
+    const orphans = (removed?.kf?.own ?? []).filter((id) => !ownedDrawIds().has(id));
+    const records = drawings.list()
+      .filter((a) => orphans.includes(a.id))
+      .map((a) => JSON.parse(JSON.stringify(a)));
+    if (records.length) {
+      for (const o of [...drawings.group.children]) {
+        if (orphans.includes(o.userData.annotation?.id)) drawings.remove(o);
+      }
+      this.ui?.onDrawSelectionChanged?.(drawings.selected);
+      this.ui?.onDrawingsChanged?.();
+      requestRender();
+    }
     if (!removed) return;
-    this.status(`Keyframe ${i + 1} deleted.`, 'info', {
+    const what = records.length
+      ? `Keyframe ${i + 1} and its ${records.length} drawing${records.length === 1 ? '' : 's'} deleted.`
+      : `Keyframe ${i + 1} deleted.`;
+    this.status(what, 'info', {
       label: 'Undo',
       run: () => {
+        // BOTH halves, in one press — the records are held in this closure
+        // because nothing else can bring them back (annotations sit outside the
+        // pose undo stack, and the keyframe is not pose state either).
+        if (records.length) {
+          drawings.restore(records);
+          this.ui?.onDrawingsChanged?.();
+        }
         this.seqStates.splice(Math.min(i, this.seqStates.length), 0, removed);
         this.onSeqChanged();
+        requestRender();
       },
     });
   },
@@ -2948,7 +3664,121 @@ const app = {
     if (!s) return null;
     setKfField(s, 'draw', Array.isArray(ids) ? [...ids] : null);
     this.onSeqChanged();
+    if (shownExtras === s) applyKeyframeExtras(s);
     return this.seqDrawIds(i);
+  },
+
+  // What a row's ◻ Drawings tag stores: the ids ON SCREEN minus the ones this
+  // keyframe already OWNS. An owned drawing is carried by `kf.own` and shows
+  // here by the union rule, so capturing it into `kf.draw` as well would leave
+  // a ghost entry behind the day it is released — the keyframe would go on
+  // showing a drawing it no longer owns and nobody could see why.
+  seqCaptureDrawIds(i) {
+    const own = new Set(this.seqOwnIds(i) ?? []);
+    return this.seqSetDrawIds(i, this.drawShownIds.filter((id) => !own.has(id)));
+  },
+
+  // ---- drawings a keyframe OWNS (kf.own) -----------------------------------
+  // Authored while that keyframe was focused, or claimed for it by hand. Union
+  // semantics: an id may sit in several keyframes' `own` (a duplicated keyframe
+  // shares its original's), and the drawing then shows on every one of them.
+  seqOwnIds(i) {
+    const ids = this.seqStates[i]?.kf?.own;
+    return Array.isArray(ids) ? [...ids] : null;
+  },
+
+  seqSetOwnIds(i, ids) {
+    const s = this.seqStates[i];
+    if (!s) return null;
+    const list = Array.isArray(ids) ? [...new Set(ids)] : null;
+    // An empty list is the same thing as none — and must serialize the same
+    // way, or releasing the last claim leaves a `kf` block behind on a keyframe
+    // that carries nothing.
+    setKfField(s, 'own', list && list.length ? list : null);
+    this.onSeqChanged();
+    if (shownExtras === s) applyKeyframeExtras(s);
+    return this.seqOwnIds(i);
+  },
+
+  // Claim or release ONE drawing for keyframe i. `d` is an Object3D from the
+  // draw group or a bare id, so the toolbar (which holds the selection) and a
+  // script (which holds an id) reach the same rule.
+  seqOwnDrawing(i, d, on = true) {
+    const id = typeof d === 'string' ? d : d?.userData?.annotation?.id;
+    if (!id || !this.seqStates[i]) return null;
+    const next = new Set(this.seqOwnIds(i) ?? []);
+    if (on) next.add(id); else next.delete(id);
+    return this.seqSetOwnIds(i, [...next]);
+  },
+
+  // Does keyframe i own this drawing? (The toolbar's toggle reads it.)
+  seqOwnsDrawing(i, d) {
+    const id = typeof d === 'string' ? d : d?.userData?.annotation?.id;
+    return !!id && (this.seqOwnIds(i) ?? []).includes(id);
+  },
+
+  // Drop ids naming drawings that no longer exist from every keyframe's `own`.
+  // Cheap, and it is what keeps the reduction guard honest — see setDrawings.
+  pruneOwnedDrawIds() {
+    const live = new Set(drawings.ids());
+    let changed = false;
+    for (const s of this.seqStates) {
+      const own = s?.kf?.own;
+      if (!Array.isArray(own)) continue;
+      const kept = own.filter((id) => live.has(id));
+      if (kept.length === own.length) continue;
+      setKfField(s, 'own', kept.length ? kept : null);
+      changed = true;
+    }
+    if (changed) this.onSeqChanged();
+    return changed;
+  },
+
+  // ---- the edit focus (✎ on a keyframe row) --------------------------------
+  // Show keyframe i and scope the two authoring surfaces to it: a drawing made
+  // from now on belongs to i alone, and a Muscles-panel edit writes i's own
+  // highlighting instead of the running look. `null` (or ✎ again) finishes.
+  //
+  // Showing a keyframe is not a pose EDIT — nothing here calls markEdit, so it
+  // cannot flip who yields to the embrace — but it DOES move the couple, so it
+  // takes a history snapshot exactly as Show does.
+  seqFocus(i) {
+    if (i === null || i === undefined) {
+      if (!endSeqFocus(true)) return -1;
+      this.status('Finished editing that keyframe on its own.', 'info');
+      return -1;
+    }
+    const s = this.seqStates[i];
+    if (!s) return seqFocusIndex();
+    if (s === seqFocusState) return i; // ✎ on the focused row is the way out
+    // Moving the focus, not ending the session: the keyframe about to be shown
+    // applies its own extras, so there is nothing to hand back in between.
+    endSeqFocus(false);
+    seqFocusState = s;
+    this.pushHistory();
+    this.applyCoupleState(s);
+    applyKeyframeExtras(s);
+    this.ui?.onSeqFocusChanged?.();
+    this.status(
+      `Editing keyframe ${i + 1} only — drawings and muscle highlights you add now belong to it. ✎ or Esc to finish.`,
+      'info');
+    return i;
+  },
+
+  // The keyframe an authoring gesture should be filed under, or -1. The
+  // Muscles panel asks before every edit; claimForFocus asks per drawing.
+  seqFocusIndex() { return seqFocusIndex(); },
+
+  // A drawing has just been committed: if a keyframe is focused it owns it.
+  // Re-applying the extras afterwards is what puts the new id through the
+  // filter — #commit stamps the CURRENT filter on a new child, so a drawing
+  // authored into a tagged keyframe would otherwise be born hidden.
+  claimForFocus(o) {
+    const i = seqFocusIndex();
+    if (i < 0 || !o?.userData?.annotation?.id) return o;
+    this.seqOwnDrawing(i, o, true);
+    applyKeyframeExtras(this.seqStates[i]);
+    return o;
   },
 
   // ---- per-keyframe caption ------------------------------------------------
@@ -2980,6 +3810,95 @@ const app = {
     return studio.caption;
   },
   caption() { return studio.caption; },
+  // What the name block is showing, for the same reasons.
+  seqNameShown() { return studio.seqName; },
+
+  // ---- the two on-screen texts: where they sit, and how each keyframe inks
+  // them --------------------------------------------------------------------
+  // PLACEMENT is one setting for the WHOLE sequence and COLOUR/HIDING is per
+  // keyframe, and the split is not an accident: a caption that jumped to a
+  // different corner at every keyframe would make a recorded lesson unwatchable,
+  // while the ink is part of what a particular keyframe is saying. So the two
+  // placements live beside the sequence (persisted by ui.js, and carried in the
+  // export file) and the rest lives in each keyframe's own `kf` block.
+  SEQ_TEXTS: ['name', 'caption'],
+
+  seqTextPos(which) {
+    const p = studio.blockPos(which === 'caption' ? 'caption' : 'name');
+    return p ? { x: p.x, y: p.y } : null;
+  },
+
+  // `null` hands that text back to its default spot (top-left / the foot of the
+  // frame). Not an edit: overlay chrome is outside the pose undo stack, exactly
+  // as drawings and labels are.
+  setSeqTextPos(which, pos) {
+    const key = which === 'caption' ? 'caption' : 'name';
+    studio.setBlockPos(key, pos ?? null);
+    this.onSeqTextMoved();
+    return this.seqTextPos(key);
+  },
+
+  // Both placements at once — what the session store and the export file carry.
+  seqTextPositions() {
+    return { name: this.seqTextPos('name'), caption: this.seqTextPos('caption') };
+  },
+  setSeqTextPositions(pos) {
+    for (const which of this.SEQ_TEXTS) studio.setBlockPos(which, pos?.[which] ?? null);
+    this.onSeqTextMoved();
+  },
+
+  // One hook for every path that moves a text, so ui.js has a single place to
+  // persist from — the arrangement drawings and the Muscles panel already use.
+  onSeqTextMoved() {
+    requestRender();
+    this.ui?.onSeqTextChanged?.();
+  },
+
+  // How keyframe i inks its name / caption: `{ color, hidden }`, with a null
+  // colour meaning the backdrop's own ink. Absent keys throughout, so a
+  // keyframe nobody has styled serializes exactly as it did before this existed.
+  seqTextStyle(i, which) {
+    const kf = this.seqStates[i]?.kf;
+    const key = which === 'caption' ? 'caption' : 'name';
+    return {
+      color: typeof kf?.[`${key}Color`] === 'string' ? kf[`${key}Color`] : null,
+      hidden: kf?.[`${key}Hidden`] === true,
+    };
+  },
+
+  // Each field goes through setKfField on its own, so they merge and delete
+  // independently: clearing a colour must not take the hide with it, and
+  // clearing both must leave no `kf` block behind at all.
+  seqSetTextStyle(i, which, { color, hidden } = {}) {
+    const s = this.seqStates[i];
+    if (!s) return null;
+    const key = which === 'caption' ? 'caption' : 'name';
+    if (color !== undefined) setKfField(s, `${key}Color`, color || null);
+    if (hidden !== undefined) setKfField(s, `${key}Hidden`, hidden ? true : null);
+    this.onSeqChanged();
+    if (shownExtras === s) applyKeyframeExtras(s);
+    return this.seqTextStyle(i, key);
+  },
+
+  // Which keyframe the on-screen text belongs to right now — the one the
+  // timeline is travelling FROM, which is the one applyKeyframeExtras last
+  // applied. -1 when the texts were set by hand rather than by a keyframe, in
+  // which case there is nothing for a colour to be stored on.
+  seqShownIndex() {
+    return shownExtras ? this.seqStates.indexOf(shownExtras) : -1;
+  },
+
+  // The second tap on a block in the 3D view. It colours THAT keyframe's text,
+  // so it needs a keyframe to be showing; saying so is better than a picker
+  // whose colour lands nowhere.
+  pickSeqTextColor(which, x = null, y = null) {
+    const i = this.seqShownIndex();
+    if (i < 0) {
+      this.status('That text belongs to no keyframe yet — add one to give it a colour.', 'info');
+      return;
+    }
+    this.ui?.pickSeqTextColor?.(i, which, x, y);
+  },
 
   // ---- per-keyframe muscle highlighting ------------------------------------
   // `{ lit: [label], colors: [[label, hex]] }`, in the same label keys the
@@ -3017,57 +3936,135 @@ const app = {
   // otherwise, so this is the way OFF it — Clear calls it, and so does the
   // panel when the user takes the look back by hand.
   clearKeyframeExtras() {
+    endSeqFocus(false); // there is no keyframe left to be editing
     applyKeyframeExtras(null);
+  },
+
+  // Where keyframe i sits on the scrubber (0..1) — the instant the movement
+  // ARRIVES at it. Exposed for scripts, and for the panel, which has no other
+  // way to ask.
+  seqKeyframeT(i) {
+    return this.seqStates.length >= 2 ? keyframeT(this.seqStates, i) : 0;
   },
 
   // Jump the couple to keyframe i.
   seqApply(i) {
     if (!this.seqStates[i]) return;
+    // Show on ANOTHER row ends the focus — the user has moved on to a different
+    // keyframe, and edits must not go on being filed under the old one. Show on
+    // the focused row is just Show, and keeps it.
+    if (seqFocusState && this.seqStates[i] !== seqFocusState) endSeqFocus(false);
     this.pushHistory();
     this.applyCoupleState(this.seqStates[i]);
+    // …and MOVE THE SCRUBBER THERE. Show used to jump the pose and leave the
+    // slider wherever it happened to be, so the two disagreed about where in
+    // the movement the couple was — and because Play resumes from the
+    // scrubber's own position (stop is a pause), pressing Play after a Show
+    // jumped straight back to the stale spot. The position is the start of
+    // keyframe i's hold: first keyframe → 0, and a last keyframe with no hold
+    // → 1, which resumeT reads as "from the top", which is right (there is
+    // nothing left of the movement to play from there).
+    if (this.seqStates.length >= 2) {
+      this.seqT = keyframeT(this.seqStates, i);
+      this.ui?.seqScrubTo?.(this.seqT);
+    }
     // Show is the timeline's other seam onto a keyframe — the scrubber and the
-    // players go through applyStatesT, this one does not.
+    // players go through applyStatesT, this one does not. LAST, so the extras
+    // on screen are keyframe i's outright rather than whatever seqTimeMap
+    // would have made of the t just stored (which is the same keyframe — see
+    // U_ARRIVED — but this does not have to depend on that).
     applyKeyframeExtras(this.seqStates[i]);
   },
 
-  // Bulk replace (import / session restore).
+  // Bulk replace (import / session restore). The ONE entry point a chain from
+  // outside this session arrives through, which is why the legacy `dur` → `move`
+  // migration lives here (see normalizeSeqTiming).
   setSeqStates(states) {
-    this.seqStates = Array.isArray(states) ? states : [];
+    // The chain the focus pointed into is gone, whatever arrived in its place.
+    endSeqFocus(true);
+    this.seqStates = normalizeSeqTiming(Array.isArray(states) ? states : []);
+    this.seqT = 0; // a position on the chain being replaced means nothing here
+    // Clearing the timeline puts the ease setting back to the fresh default:
+    // there is no sequence left for it to be a setting OF, and the next
+    // keyframe added starts a new one. A non-empty replacement (an import, the
+    // session restore, a library recall) brings its own answer, so it is left
+    // to the caller — sniffing one out of the keyframes would guess.
+    if (!this.seqStates.length) {
+      this.seqEaseOn = SEQ_EASE_FRESH;
+      seqEaseChosen = false; // the choice belonged to the sequence just wiped
+    }
     this.onSeqChanged();
   },
 
   // Pose the couple at t ∈ [0, 1] across the whole sequence (the scrubber).
   applySeqT(t) {
     if (this.seqStates.length < 2) return;
+    // Grabbing the scrubber is leaving the keyframe: the playhead is about to
+    // cross every other one, and applyStatesT will apply their extras.
+    endSeqFocus(false);
     if (this.selected || this.ikState) this.deselect();
     this.seqT = t;
-    applyStatesT(this.seqStates, t);
+    applyStatesT(this.seqStates, t, { ease: this.seqEase() });
   },
 
-  playSeq(onTick, onDone = null) {
+  // Play the sequence, carrying on from wherever the scrubber sits (see
+  // resumeT). `from` overrides that for scripts: 0 replays the whole chain
+  // whatever the scrubber says, and any t starts there.
+  playSeq(onTick, onDone = null, { from = null } = {}) {
     if (this.seqStates.length < 2) return;
-    this.interpPlaying = false; // one player at a time
-    this.seqT = 0;
+    endSeqFocus(false); // the whole chain is about to speak, not one keyframe
+    this.stopInterp(); // one player at a time
+    this.seqT = from === null ? resumeT(this.seqT) : THREE.MathUtils.clamp(from, 0, 1);
     this.seqPlaying = true;
-    this.seqTick = onTick || null;
+    // No tick given (Space, a script) still moves the scrubber: the panel's
+    // own label setter is the fallback, so the slider can never sit lying
+    // about where the movement has got to.
+    this.seqTick = onTick || this.ui?.seqScrubTo || null;
     this.seqDone = onDone;
+    if (this.ui) this.ui.onPlaybackChanged();
   },
 
   // -------------------------------------------------- animation export
   // Play a keyframe chain while recording the 3D canvas, then download the
   // capture as a .webm — class material from the same view the teacher posed.
-  // `states` is any couple-state chain ([A, B] or the sequence). Returns false
-  // if a capture is already running or the chain can't play.
-  recordPlayback(states, name = 'tangle-movement') {
+  // `states` is any couple-state chain ([A, B] or the sequence). `ease` is
+  // resolved by the CALLER, exactly as it is for applyStatesT: the Sequence
+  // panel's ⏺ passes app.seqEase() so a recording plays the way the scrubber
+  // does, and the A→B ⏺ passes nothing. Returns false if a capture is already
+  // running or the chain can't play.
+  recordPlayback(states, name = 'tangle-movement', { ease = false } = {}) {
     if (this.recording || studio.recorder || !states || states.length < 2) return false;
+    endSeqFocus(false); // a capture plays the whole chain; editing one keyframe is over
     this.deselect(); // also hides every gizmo/handle
-    this.interpPlaying = false;
-    this.seqPlaying = false;
+    this.stopPlayback(); // the capture owns the player for its whole length
     if (!this.canRecord) {
       this.status('This browser has no video recorder (MediaRecorder) — use 📷 Save photo instead.', 'error');
       return false;
     }
-    applyStatesT(states, 0); // first frames show the start pose, not the editor state
+    // A VIDEO IS A SLIDE THAT MOVES, so it is recorded in Present mode. The
+    // joint pick spheres — translucent blobs ringing every joint in the
+    // skeleton and muscle views — are the visible symptom, but they are only
+    // one item on the list Present already takes off a slide: the gizmos, a
+    // half-drawn annotation, a drawing's endpoint handles, a pending pin
+    // marker and the Label-mode cursor preview all go with them, and the frame
+    // is forced to the 16:9 1920×1080 shape an export is composed in.
+    //
+    // TWO ORDERING CONSTRAINTS, both of which put this HERE rather than inside
+    // the whenEncoderReady() continuation below:
+    //  * enterPresent asks for fullscreen, which a browser grants only from a
+    //    user gesture — after the await we are no longer in the click's task.
+    //  * entering resizes the render target (layoutCanvas runs synchronously
+    //    inside enterPresent, via the resize event it dispatches), and
+    //    studio.startRecorder sizes its composite canvas from gl.width ONCE,
+    //    when it starts. Enter first and every captured frame is 1920×1080;
+    //    enter afterwards and the file opens at the old size.
+    // `recPresent` is set only on the FIRST pass, so the WebM retry — which
+    // re-enters this function — stays inside the Present mode it is already in.
+    if (!this.recPresent) {
+      this.recPresent = { wasPresenting: this.presenting };
+      if (!this.presenting) this.enterPresent();
+    }
+    applyStatesT(states, 0, { ease }); // first frames show the start pose, not the editor state
     // The shared recorder captures GL + the label overlay, as MP4 by default
     // (studio.videoFormat) — PowerPoint will not play a .webm. The job is held
     // on its first frame (rec: null) until the H.264 encoder is awake; see
@@ -3076,24 +4073,70 @@ const app = {
     // wake on the first recording of a page, and the button used to read
     // "⏺ Recording…" throughout while capturing nothing. The clip recorder
     // already showed "⏺ Preparing…" here; this mirrors it.
-    const job = { states, t: 0, secs: statesSeconds(states), rec: null, arming: true };
+    const job = { states, t: 0, secs: statesSeconds(states), ease, rec: null, arming: true };
     this.recording = job;
     if (this.ui) this.ui.onRecordingChanged();
     studio.whenEncoderReady().then(() => {
+      // Superseded (only stopRecording clears a job that is still arming), and
+      // it has already handed Present mode back.
       if (this.recording !== job) return;
       job.arming = false;
       if (this.ui) this.ui.onRecordingChanged();
       job.rec = studio.startRecorder(name, ({ retry }) => {
         this.recording = null;
         if (this.ui) this.ui.onRecordingChanged();
-        if (retry) this.recordPlayback(states, name); // MP4 unavailable here → WebM
+        // MP4 unavailable here → WebM. The retry keeps the Present mode this
+        // capture is already holding; only a retry that refuses to start (a
+        // guard tripped, no recorder) has to give it back itself.
+        if (retry) {
+          // The WebM retry re-enters with the SAME options — a fallback that
+          // quietly played linear would hand the user a different movement.
+          if (!this.recordPlayback(states, name, { ease })) this.finishRecPresent();
+        } else this.finishRecPresent();
       });
       if (!job.rec) {
         this.recording = null;
         if (this.ui) this.ui.onRecordingChanged();
+        this.finishRecPresent();
       }
     });
     return true;
+  },
+
+  // End a capture early and KEEP the take. Present mode hides the ⏺ button, so
+  // Esc (the capture-phase handler at the foot of this file) is the only stop
+  // within reach while a slide is on screen — and a stop that silently threw
+  // away a two-minute take would be the worst possible answer to that gesture.
+  // Returns whether there was anything to stop.
+  stopRecording() {
+    const job = this.recording;
+    if (!job) return false;
+    if (job.rec) {
+      // MediaRecorder.stop() flushes what it already holds: startRecorder's
+      // onstop builds the blob and downloads it exactly as a run to t = 1
+      // does, and its onDone then hands Present mode back (finishRecPresent).
+      job.stopping = true; // the player's own stop at t ≥ 1 must not fire too
+      job.rec.stop();
+      this.status('Recording stopped — saving what was captured.', 'info');
+      return true;
+    }
+    // Still ARMING: the H.264 encoder has not woken (~5.5 s on a page's first
+    // recording), so not one frame exists yet. Cancel cleanly — downloading a
+    // zero-byte file is the failure warmUpMp4 exists to prevent.
+    this.recording = null;
+    if (this.ui) this.ui.onRecordingChanged();
+    this.finishRecPresent();
+    this.status('Recording cancelled — the video encoder had not started yet.', 'info');
+    return true;
+  },
+
+  // Give back exactly the Present state the capture found: entered for the
+  // recording → leave; already presenting → stay put, because the user is
+  // mid-lesson and the video was something they did inside it.
+  finishRecPresent() {
+    const held = this.recPresent;
+    this.recPresent = null;
+    if (held && !held.wasPresenting) this.exitPresent(); // no-ops if already out
   },
 
   // Show/replace/remove the translucent ghost couple for snapshot A or B.
@@ -3430,14 +4473,15 @@ tcontrols.addEventListener('objectChange', () => {
   }
 });
 
-// A clip's title block is 2D overlay chrome, so it has no place in the scene's
-// picking: studio.js says where it drew, and these three handlers drag it. The
-// grab is armed by HOVER (canvasPoint below turns orbiting off while the cursor
-// is over the title) rather than at pointerdown — OrbitControls listens on this
-// same canvas and would already have started a camera rotate by the time a
+// An overlay TEXT BLOCK — the clip's title, a keyframe's name, its caption —
+// is 2D chrome, so it has no place in the scene's picking: studio.js says where
+// each one drew, and these handlers drag whichever is under the cursor. The
+// grab is armed by HOVER (the pointermove below turns orbiting off while the
+// cursor is over a block) rather than at pointerdown — OrbitControls listens on
+// this same canvas and would already have started a camera rotate by the time a
 // pointerdown handler of ours ran.
-let titleDrag = false;
-let titleHover = false;
+let blockDrag = false;
+let blockHover = null; // 'title' | 'name' | 'caption' | null
 // The same arrangement for a callout pill: hovering one hands it the cursor, a
 // drag moves it to the column the cursor ends in, and a double-click opens its
 // colour picker.
@@ -3450,6 +4494,9 @@ let drawHandleHover = null;
 let drawHandleDrag = null;
 const DOUBLE_TAP_MS = 400;
 let labelTap = { id: null, t: 0 };
+// The same counted second tap for an overlay text block, whose gesture the
+// block's own drag already owns (see the note in the pointerup handler).
+let blockTap = { key: null, t: 0 };
 const canvasPoint = (e) => {
   const r = renderer.domElement.getBoundingClientRect();
   return [e.clientX - r.left, e.clientY - r.top];
@@ -3460,7 +4507,7 @@ let downPos = null;
 renderer.domElement.addEventListener('pointerdown', (e) => {
   downPos = [e.clientX, e.clientY];
   if (drawHandleHover) drawHandleDrag = { ...drawHandleHover };
-  else if (titleHover && studio.beginTitleDrag(...canvasPoint(e))) titleDrag = true;
+  else if (blockHover && studio.beginBlockDrag(...canvasPoint(e))) blockDrag = true;
   else if (labelHover && studio.beginLabelDrag(...canvasPoint(e))) labelDrag = true;
 });
 renderer.domElement.addEventListener('pointerup', (e) => {
@@ -3469,11 +4516,27 @@ renderer.domElement.addEventListener('pointerup', (e) => {
     downPos = null;
     return; // the handle took this gesture; it must not also author a shape
   }
-  if (titleDrag) {
-    titleDrag = false;
-    studio.endTitleDrag();
+  if (blockDrag) {
+    blockDrag = false;
     downPos = null;
-    return; // the title took this gesture; nothing in the scene should see it
+    const movedKey = studio.endBlockDrag();
+    if (movedKey) {
+      if (movedKey !== 'title') app.onSeqTextMoved();
+      blockTap = { key: null, t: 0 };
+      return; // the block took this gesture; nothing in the scene should see it
+    }
+    // A press that never travelled is a TAP on the block. A SECOND one in quick
+    // succession opens the colour picker for the keyframe's text — counted here
+    // rather than off the native `dblclick`, for the reason the callout pill's
+    // tap records: the block's own drag already owns pointerdown/up over it, and
+    // an automated browser never fires dblclick on this canvas at all.
+    const key = studio.blockHit(...canvasPoint(e));
+    const now = performance.now();
+    if (key && key !== 'title' && blockTap.key === key && now - blockTap.t < DOUBLE_TAP_MS) {
+      blockTap = { key: null, t: 0 };
+      app.pickSeqTextColor(key, e.clientX, e.clientY);
+    } else blockTap = { key: key ?? null, t: now };
+    return; // a click ON a block must not fall through to a joint behind it
   }
   if (labelDrag) {
     labelDrag = false;
@@ -3680,7 +4743,7 @@ function jointActionable(jointName) {
 renderer.domElement.addEventListener('pointerleave', () => {
   clearHover();
   studio.hover = null;
-  if (titleHover && !titleDrag) { titleHover = false; orbit.enabled = true; }
+  if (blockHover && !blockDrag) { blockHover = null; orbit.enabled = true; }
   if (labelHover && !labelDrag) { labelHover = false; orbit.enabled = true; }
 });
 renderer.domElement.addEventListener('pointermove', (e) => {
@@ -3701,8 +4764,8 @@ renderer.domElement.addEventListener('pointermove', (e) => {
     }
     return;
   }
-  if (titleDrag) {
-    studio.dragTitleTo(...canvasPoint(e));
+  if (blockDrag) {
+    studio.dragBlockTo(...canvasPoint(e));
     requestRender(); // overlay-only change; the solve loop may be idling
     return;
   }
@@ -3711,16 +4774,18 @@ renderer.domElement.addEventListener('pointermove', (e) => {
     return;
   }
   if (downPos || gizmoDragging()) return; // don't fight a click, gizmo drag, or orbit
-  // Over the clip title, the cursor belongs to the title: nothing in the scene
-  // is pickable through it, and orbiting is held off so a drag moves the block
-  // instead of the camera.
-  const overTitle = studio.clipActive && studio.titleHit(...canvasPoint(e));
-  titleHover = overTitle;
+  // Over an overlay text block (the clip title, a keyframe's name or caption)
+  // the cursor belongs to that block: nothing in the scene is pickable through
+  // it, and orbiting is held off so a drag moves the block instead of the
+  // camera. A block that drew nothing recorded no box, so a hidden caption or
+  // an unnamed keyframe is inert here without a flag of its own.
+  const overBlock = studio.blockHit(...canvasPoint(e));
+  blockHover = overBlock;
   // Assigned every move, not toggled on the edge: a gizmo drag that ends under
-  // the title re-enables orbiting behind our back, and a stale edge would then
-  // leave the title dragging the camera with it.
-  orbit.enabled = !overTitle;
-  if (overTitle) {
+  // the block re-enables orbiting behind our back, and a stale edge would then
+  // leave the block dragging the camera with it.
+  orbit.enabled = !overBlock;
+  if (overBlock) {
     clearHover();
     studio.hover = null;
     renderer.domElement.style.cursor = 'move';
@@ -4194,26 +5259,46 @@ function animate() {
     app.interpT = Math.min(1, app.interpT + dt / SEQ_SEG_SECONDS);
     app.applyInterp(app.interpT);
     if (app.interpTick) app.interpTick(app.interpT);
-    if (app.interpT >= 1) app.interpPlaying = false;
+    if (app.interpT >= 1) {
+      // A NATURAL finish — the one place interpDone fires (a stop drops it).
+      const done = app.interpDone;
+      app.interpDone = null;
+      clearPlaying({ seq: false }); // …which also flips the button back to Play
+      if (done) done();
+    }
   }
 
   // Advance the movement-sequence player (Play button in the Sequence panel).
   if (app.seqPlaying) {
     const segs = app.seqStates.length - 1;
-    if (segs < 1) app.seqPlaying = false;
+    if (segs < 1) clearPlaying({ interp: false });
     else {
       // Per-keyframe durations: the player advances through the chain's own
       // running time, so a keyframe given 6 s really takes 6 s.
       app.seqT = Math.min(1, app.seqT + dt / statesSeconds(app.seqStates));
-      applyStatesT(app.seqStates, app.seqT);
+      applyStatesT(app.seqStates, app.seqT, { ease: app.seqEase() });
       if (app.seqTick) app.seqTick(app.seqT);
       if (app.seqT >= 1) {
-        app.seqPlaying = false;
+        // A NATURAL finish — the one place seqDone fires (a stop drops it).
         const done = app.seqDone;
         app.seqDone = null;
+        clearPlaying({ interp: false }); // …which also flips the button back to Play
         if (done) done();
       }
     }
+  }
+
+  // A capture runs in Present mode, where the ⏺ button is hidden with the rest
+  // of the chrome — so the status line is the only place the stop can be
+  // announced. Re-asserted per frame rather than raced against the 3 s fade:
+  // an identical (text, kind) is free in setStatus (it pushes the expiry out
+  // and touches no DOM), which is the same property that lets the joint-limit
+  // amber be reported from inside a drag. The status line is page chrome and
+  // is structurally incapable of reaching the file (see setStatus).
+  if (app.recording && app.presenting && !app.recording.stopping) {
+    app.status(app.recording.arming
+      ? 'Preparing to record… Esc cancels.'
+      : 'Recording… Esc stops and saves.', 'info');
   }
 
   // Advance a video capture's playback; stop the recorder shortly after the
@@ -4221,7 +5306,7 @@ function animate() {
   if (app.recording?.rec) {
     const r = app.recording;
     r.t = Math.min(1, r.t + dt / r.secs);
-    applyStatesT(r.states, r.t);
+    applyStatesT(r.states, r.t, { ease: r.ease });
     if (r.t >= 1 && !r.stopping) {
       r.stopping = true;
       setTimeout(() => r.rec.stop(), 150);
@@ -4361,7 +5446,17 @@ window.addEventListener('keydown', (e) => {
   if (!app.presenting) return;
   const k = e.key;
   let handled = true;
-  if (k === 'Escape') app.exitPresent();
+  // A video capture is recorded from inside Present mode (see recordPlayback),
+  // which hides the ⏺ button along with the rest of the chrome: Esc is the
+  // only stop the user can reach, so while a capture runs it stops and SAVES
+  // the take rather than abandoning the slide. Present mode is then handed
+  // back by the capture's own completion (finishRecPresent) — one Esc for the
+  // recording, a second for the presentation.
+  if (k === 'Escape') { if (app.recording) app.stopRecording(); else app.exitPresent(); }
+  // Every other presenter key changes the shot — a slide step, or a movement
+  // played over the one being captured. A remote's click must not swap the
+  // slide into the middle of a video, so they are swallowed for the duration.
+  else if (app.recording) handled = true;
   else if (k === 'ArrowRight' || k === 'ArrowDown' || k === 'PageDown') app.gotoSlide(1);
   else if (k === 'ArrowLeft' || k === 'ArrowUp' || k === 'PageUp') app.gotoSlide(-1);
   else if (k === 'Home') { app.slideAt = -1; app.gotoSlide(1); }
@@ -4369,11 +5464,17 @@ window.addEventListener('keydown', (e) => {
     if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
     else document.documentElement.requestFullscreen?.().catch(() => {});
   } else if (k === ' ' || e.code === 'Space') {
-    // Play whatever movement this slide is about: a keyframe sequence first,
-    // then an A→B comparison, and failing both just advance the deck.
-    if (app.seqStates.length >= 2) app.playSeq();
-    else if (app.interpStates) app.playInterp();
-    else app.gotoSlide(1);
+    // Play/stop TOGGLE, the media-player convention — and the only key a
+    // presenter has for it, so it cannot be play-only: a movement that runs
+    // for eight seconds has to be stoppable mid-sentence. Play picks whatever
+    // movement this slide is about (a keyframe sequence first, then an A→B
+    // comparison) and resumes from the scrubber; failing both, Space just
+    // advances the deck as it always did.
+    if (!app.stopPlayback()) {
+      if (app.seqStates.length >= 2) app.playSeq();
+      else if (app.interpStates) app.playInterp();
+      else app.gotoSlide(1);
+    }
   } else handled = false;
   if (handled) {
     e.preventDefault();
@@ -4387,13 +5488,46 @@ window.addEventListener('keydown', (e) => {
 // visible way back. Nothing fires if the fullscreen request was refused (no
 // user gesture, or policy), so an in-window presentation is unaffected.
 document.addEventListener('fullscreenchange', () => {
-  if (app.presenting && !document.fullscreenElement) app.exitPresent();
+  if (!app.presenting || document.fullscreenElement) return;
+  // A capture composites into a canvas sized from the 16:9 frame when it
+  // started, so leaving Present resizes the render target out from under it.
+  // End the take and SAVE it first — never leave a recorder running against a
+  // canvas that has changed shape. exitPresent still runs, because the user
+  // asked to LEAVE and not merely to stop; finishRecPresent then no-ops.
+  if (app.recording) app.stopRecording();
+  app.exitPresent();
 });
 
 // Esc abandons whatever is half-finished — see app.cancelPending for the order.
 // Never reached while presenting: the capture handler above consumes Escape.
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') app.cancelPending();
+});
+
+// Space is the play/stop toggle in the editor too — the same gesture Present
+// mode binds, and the same one every video player has trained the user to
+// expect. Space was otherwise unbound here, so nothing is taken away.
+//
+// The guard is what makes it safe: a caption or a keyframe label is full of
+// spaces, and a FOCUSED BUTTON already treats Space as its own activation —
+// pressing Space just after clicking Play would otherwise toggle twice and
+// look like nothing happened. Anything focused inside the app chrome owns its
+// own Space key (the same rule the nudge handler applies to the arrows); this
+// only means anything with focus on the canvas or the page body.
+window.addEventListener('keydown', (e) => {
+  if (e.key !== ' ' && e.code !== 'Space') return;
+  if (app.presenting) return; // the capture handler above already consumed it
+  const t = e.target;
+  if (t && (t.closest?.('#sidebar, #topbar') || t.isContentEditable
+            || /^(?:INPUT|TEXTAREA|SELECT|BUTTON)$/.test(t.tagName))) return;
+  if (app.recording) return; // a capture owns the player for its whole length
+  e.preventDefault(); // Space scrolls the page by default
+  if (app.stopPlayback()) {
+    app.status('Playback stopped.', 'info');
+    return;
+  }
+  if (app.seqStates.length >= 2) app.playSeq();
+  else if (app.interpStates) app.playInterp();
 });
 
 // Delete removes the selected floor drawing. Scoped to Draw mode with a

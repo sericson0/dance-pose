@@ -51,6 +51,11 @@
         <button data-tool="text" title="One click on the floor, then type the label">Text</button>
         <label class="tool-field" title="Chalk colour. With a drawing selected this recolours it; otherwise it sets the colour of the next one."><input type="color" id="draw-color" value="#ffd27f" /></label>
         <label class="tool-field" title="Stroke width (text size follows it). With a drawing selected this resizes it; otherwise it sets the width of the next one."><span>Size</span><input type="range" id="draw-width" min="0.006" max="0.06" step="0.002" value="0.02" /></label>
+        <!-- Shown only while a keyframe is focused (✎ on its row): the tag says
+             where a new shape is being filed, and the toggle claims or releases
+             the SELECTED one for that keyframe. -->
+        <span id="draw-focus-tag" class="tool-tag" hidden>✎ <span id="draw-focus-which">keyframe</span></span>
+        <button id="draw-own" hidden title="Make the selected drawing belong to the focused keyframe alone — press again to release it back to every keyframe">◻ Only this keyframe</button>
         <button id="draw-hide" title="Hide the selected drawing — hiding is how you build the set a sequence keyframe is then tagged with. With nothing selected this brings the hidden ones back.">◐ Hide</button>
         <button id="draw-delete" title="Remove the selected drawing (Del)">✕ Selected</button>
         <button id="draw-undo" title="Remove the most recent drawing">⌫ Last</button>
@@ -335,6 +340,13 @@
         <div class="muted" id="muscle-layer-note" hidden>
           The clothed body hides these. Turn on the <button id="muscle-enable-layer" class="linkish">Muscles layer</button> for all of them — or the Skeleton view, where the highlighted ones ride over the bones.
         </div>
+        <!-- The edit focus, said here as well as in the Sequence section: the
+             two panels are on the same tab and the user comes straight over
+             here to light a belly, so "these edits belong to keyframe 3" has to
+             be legible where the editing happens. -->
+        <div class="muted kf-focus-note" id="muscle-focus-note" hidden>
+          ✎ Editing <b id="muscle-focus-which">a keyframe</b> only — highlights you change here belong to it, not to your running set.
+        </div>
         <div class="muted" id="muscle-kf-note" hidden>
           A sequence keyframe is showing <b>its own</b> highlighting — these chips say what is lit on screen. Your own set is kept; change anything here to take it back.
         </div>
@@ -413,15 +425,66 @@
       <section class="collapsed" id="sequence-section" data-tab="teach">
         <h2><button type="button" class="collapse-toggle" aria-expanded="false" aria-controls="sequence-section">Sequence</button></h2>
         <div class="muted">Chain keyframes into a whole figure (a giro is 4+ poses): pose the couple, add a keyframe, repeat — then scrub or play the movement.</div>
+        <!-- The sequence LIBRARY. There is one timeline, so starting a second
+             figure used to mean exporting a file first or losing the first one.
+             A saved entry is everything needed to replay the figure — the
+             keyframes with their timing, names, captions and tags, where the two
+             on-screen texts sit, and the floor diagram their kf.draw ids point
+             at. It sits ABOVE the keyframe list because it is what you reach for
+             before authoring, and folds away because the Sequence section is
+             already the longest one in the sidebar. The current-entry line lives
+             in the HEADING, outside the fold, so "which figure am I editing, and
+             have I saved it?" is answerable with the block shut. -->
+        <div class="sub-block" id="seq-lib">
+          <h3>
+            <button type="button" class="sub-toggle" aria-expanded="true" aria-controls="seq-lib-body">Saved sequences</button>
+            <span id="seq-lib-current" class="muted"></span>
+          </h3>
+          <div id="seq-lib-body">
+            <div class="row">
+              <input type="text" id="seq-lib-name" placeholder="Sequence name…" />
+              <button id="seq-lib-save" title="Save the timeline — its keyframes, their timing and text, and the floor drawings they use — under this name">Save as</button>
+            </div>
+            <div id="seq-lib-list"></div>
+            <div class="btn-row">
+              <button id="seq-lib-update" disabled title="Overwrite the saved sequence the timeline came from">Save</button>
+              <button id="seq-lib-new" title="Empty the timeline to start a new figure. The saved sequences and the floor drawings are left alone.">New</button>
+            </div>
+          </div>
+        </div>
         <div class="btn-row">
+          <!-- The title is rewritten per render (markSeqCurrent in ui.js): the
+               button inserts AFTER the keyframe being stood on when there is
+               one, and only appends when there is not. -->
           <button id="seq-add" title="Append the current couple pose as a keyframe">+ Add keyframe</button>
           <button id="seq-clear" disabled title="Remove every keyframe">Clear</button>
+        </div>
+        <!-- The edit focus, said DURABLY. app.status auto-clears after ~3 s and
+             this session lasts as long as the user is drawing, so the banner
+             (with the row's own ✎ mark) is the indicator that stays put. -->
+        <div class="kf-focus-note" id="seq-focus-note" hidden>
+          ✎ Editing <b id="seq-focus-which">keyframe</b> only — drawings and muscle highlights you add now belong to it.
+          <button id="seq-focus-end" class="linkish" type="button">Finish</button>
         </div>
         <div id="seq-list"></div>
         <div class="slider-row" id="seq-row" hidden>
           <div class="lbl"><span>Movement</span><span class="val" id="seq-val">0%</span></div>
           <input type="range" id="seq-slider" min="0" max="1000" step="1" value="0" />
           <div class="range-hint"><span>start</span><span>end</span></div>
+        </div>
+        <!-- Where the two on-screen texts sit. ONE placement each for the whole
+             sequence (they are dragged in the 3D view), so this belongs beside
+             the timeline rather than on a keyframe row — a per-row reset would
+             offer the same button n times for one setting. -->
+        <div class="btn-row" id="seq-text-row" hidden>
+          <button id="seq-name-reset" title="Put the keyframe name back in the frame's top-left corner">⟲ Name here</button>
+          <button id="seq-caption-reset" title="Put the caption back along the foot of the frame">⟲ Caption here</button>
+        </div>
+        <!-- ONE setting for the whole sequence: which keyframes are eased is
+             already answered by the holds the author set, so there is no
+             per-keyframe curve to pick here. -->
+        <div class="check-row">
+          <label title="Transitions start and stop gently at keyframes the couple rests in (the first, the last, and any with a hold); keyframes with no hold are passed through at speed."><input type="checkbox" id="seq-ease" /> Ease in/out</label>
         </div>
         <div class="btn-row">
           <button id="seq-play" disabled title="Animate the couple through every keyframe">▶ Play</button>

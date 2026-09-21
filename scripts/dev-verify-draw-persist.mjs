@@ -289,17 +289,19 @@ const rowTag = await page.evaluate(() => {
   app.setDrawingVisible(app.draw.group.children[0], false);
   app.setDrawingVisible(app.draw.group.children[3], false);
   const onScreen = app.drawShownIds;
-  const rows = document.querySelectorAll('#seq-list .pose-item');
-  const tagBtn = rows[1].querySelectorAll('button')[2];
+  // The drawings tag lives on the extras line now, beside the muscle one, and
+  // wears its own class — `.seq-kf-btn` still indexes the MUSCLE tag alone.
+  const tagOf = (i) => document.querySelectorAll('#seq-list .seq-draw-btn')[i];
+  const tagBtn = tagOf(1);
   const labelBefore = tagBtn.textContent;
   tagBtn.click();
   const stored = app.seqDrawIds(1);
-  const labelAfter = document.querySelectorAll('#seq-list .pose-item')[1].querySelectorAll('button')[2].textContent;
-  document.querySelectorAll('#seq-list .pose-item')[1].querySelectorAll('button')[2].click();
+  const labelAfter = tagOf(1).textContent;
+  tagOf(1).click();
   return { onScreen, stored, labelBefore, labelAfter, cleared: app.seqDrawIds(1), status: document.getElementById('status-line').textContent };
 });
-if (rowTag.labelBefore !== '◻' || rowTag.labelAfter !== '◼') {
-  problems.push(`the row tag button reads ${rowTag.labelBefore} → ${rowTag.labelAfter}, want ◻ → ◼`);
+if (!/^◻/.test(rowTag.labelBefore) || !/^◼/.test(rowTag.labelAfter)) {
+  problems.push(`the row tag button reads ${rowTag.labelBefore} → ${rowTag.labelAfter}, want ◻ … → ◼ …`);
 }
 if (JSON.stringify(rowTag.stored) !== JSON.stringify(rowTag.onScreen)) {
   problems.push(`◻ captured ${JSON.stringify(rowTag.stored)}, on screen was ${JSON.stringify(rowTag.onScreen)}`);

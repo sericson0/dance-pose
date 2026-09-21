@@ -250,6 +250,24 @@ export function initUI(app) {
   const drawHide = $('draw-hide');
   const drawColor = $('draw-color');
   const drawWidth = $('draw-width');
+  const drawOwn = $('draw-own');
+  const drawFocusTag = $('draw-focus-tag');
+  // Claim / release the SELECTED drawing for the focused keyframe. This is the
+  // way an EXISTING shape joins one — drawing a new one while focused claims it
+  // automatically (app.claimForFocus), and this is the same rule reachable by
+  // hand, in both directions. Shown only while a keyframe is focused: with none
+  // there is no keyframe for a drawing to belong to.
+  drawOwn.addEventListener('click', () => {
+    const i = app.seqFocusIndex();
+    const sel = app.drawSelected;
+    if (i < 0 || !sel) return;
+    const on = !app.seqOwnsDrawing(i, sel);
+    app.seqOwnDrawing(i, sel, on);
+    app.status(on
+      ? `That drawing now belongs to keyframe ${i + 1} alone.`
+      : `That drawing is back on every keyframe.`, 'info');
+    syncDrawButtons();
+  });
   drawUndo.addEventListener('click', () => app.removeLastDrawing());
   // A diagram now survives a reload, so Clear destroys authored work AND the
   // saved copy of it, and annotations sit outside the pose undo stack — Ctrl+Z
@@ -297,6 +315,23 @@ export function initUI(app) {
     const filtered = app.drawVisibleIds !== null;
     drawHide.textContent = app.drawSelected ? '◐ Hide' : '◉ Show all';
     drawHide.disabled = !app.drawSelected && !filtered;
+    // The focus, said in the Draw toolbar too: the user is in another mode, in
+    // another corner of the screen, and needs to know their chalk is being
+    // filed under one keyframe.
+    const fi = app.seqFocusIndex?.() ?? -1;
+    drawFocusTag.hidden = fi < 0;
+    drawOwn.hidden = fi < 0;
+    if (fi >= 0) {
+      $('draw-focus-which').textContent = app.seqName(fi);
+      const owns = app.drawSelected && app.seqOwnsDrawing(fi, app.drawSelected);
+      drawOwn.textContent = owns ? '◼ Only this keyframe' : '◻ Only this keyframe';
+      drawOwn.disabled = !app.drawSelected;
+      drawOwn.title = app.drawSelected
+        ? (owns
+          ? `Release this drawing back to every keyframe`
+          : `Make this drawing belong to ${app.seqName(fi)} alone`)
+        : 'Select a drawing first, then this makes it belong to the focused keyframe alone';
+    }
   };
   // A selected drawing hands its own colour and width to the toolbar, so the
   // controls always read the thing they would change.
@@ -970,19 +1005,62 @@ export function initUI(app) {
     return true;
   };
 
+  // ---- WHERE a panel edit lands: the ONE seam ------------------------------
+  // Ordinarily an edit is the user taking the look back (above) and lands in
+  // the RUNNING sets, which persist. While a keyframe is FOCUSED (✎ on its row)
+  // the same gesture belongs to that keyframe instead: it edits the override in
+  // place and commits it to `kf.muscles`, and the running look — and
+  // `tangoPoseStudio.muscleLook.v1` with it — must come through the whole
+  // session BYTE-IDENTICAL.
+  //
+  // One seam rather than an `if (focused)` in each of the five handlers: a
+  // sixth control added later inherits the rule instead of quietly not having
+  // it. Every caller does the same three things — mutate `lit`/`colors`, push,
+  // commit — and only this function knows which sets those are.
+  //
+  // The override is SEEDED from the running look when the focused keyframe has
+  // none of its own, which is what makes entering focus change nothing on
+  // screen: the first edit starts from exactly what the user was looking at.
+  // `hidden` is deliberately out of scope — `kf.muscles` stores `lit` +
+  // `colors` only, so the hide checkboxes go on editing the running set even
+  // while focused (and go on saving it).
+  function lookTarget() {
+    const i = app.seqFocusIndex?.() ?? -1;
+    if (i < 0) {
+      return {
+        focused: false, lit: litMuscles, colors: muscleColors,
+        commit: saveMuscleLook,
+      };
+    }
+    if (!muscleOverride) {
+      muscleOverride = { lit: new Set(litMuscles), colors: new Map(muscleColors) };
+    }
+    return {
+      focused: true, lit: muscleOverride.lit, colors: muscleOverride.colors,
+      // Straight to the keyframe, never to storage. seqSetMuscles re-applies
+      // the extras if that keyframe is the one showing, and setMuscleOverride's
+      // sameLook early-out makes that a no-op — the sets it would rebuild are
+      // the ones just edited.
+      commit: () => app.seqSetMuscles(i, muscleLookNow()),
+    };
+  }
+
   // One place a muscle's colour changes, whichever control asked: the panel's
   // swatch or a click on the belly itself in a clip (app.ui.pickMuscleColor).
   // Takes one label or several, because a clip's callout names a group of
   // bellies and the colour belongs to the callout.
   const applyMuscleColor = (labels, hex) => {
-    const wasOverride = takeBackMuscleLook();
+    const t = lookTarget();
+    // Focused, the override IS the thing being edited, so it must not be
+    // dropped; unfocused, any edit here is the user taking the look back.
+    const wasOverride = t.focused ? false : takeBackMuscleLook();
     for (const label of [labels].flat()) {
-      muscleColors.set(label, hex);
+      t.colors.set(label, hex);
       const sw = muscleSwatches.get(label);
       if (sw) sw.value = hex;
     }
     pushMuscleLook();
-    saveMuscleLook();
+    t.commit();
     if (wasOverride) renderMuscleList(); // every other row's chip may have changed
     renderLabels(); // the callout list's kind tag wears the colour too
   };
@@ -1030,6 +1108,17 @@ export function initUI(app) {
       app.setLabelColor(id, hex);
       renderLabels(); // the list's kind tag wears it too
     }, x, y);
+  };
+
+  // A sequence keyframe's on-screen NAME or CAPTION, tapped twice in the 3D
+  // view. The colour belongs to that keyframe (main.js works out which one is
+  // showing), so this is the same gesture as a callout's, pointed at the `kf`
+  // block instead of at a label.
+  const pickSeqTextColor = (i, which, x = null, y = null) => {
+    const word = which === 'caption' ? 'caption' : 'name';
+    const shown = word === 'caption' ? app.seqCaption(i) : app.seqNameForScreen(i);
+    openPicker(app.seqTextStyle(i, word).color || '#f4f6fb',
+      `“${shown}”`, (hex) => app.seqSetTextStyle(i, word, { color: hex }), x, y);
   };
 
   const MUSCLE_REGION = {
@@ -1093,16 +1182,19 @@ export function initUI(app) {
         sw.addEventListener('input', () => applyMuscleColor(label, sw.value));
         muscleSwatches.set(label, sw);
         hl.addEventListener('click', () => {
-          const wasOverride = takeBackMuscleLook();
-          if (litMuscles.has(label)) litMuscles.delete(label); else litMuscles.add(label);
+          // One seam (lookTarget): the running sets, or the focused keyframe's
+          // own working copy. Everything below is written against whichever.
+          const t = lookTarget();
+          const wasOverride = t.focused ? false : takeBackMuscleLook();
+          if (t.lit.has(label)) t.lit.delete(label); else t.lit.add(label);
           pushMuscleLook();
-          saveMuscleLook();
+          t.commit();
           // Dropping an override changes every other row too, so the whole list
           // is rebuilt — otherwise just the two controls that moved.
           if (wasOverride) renderMuscleList();
           else {
-            hl.classList.toggle('active', litMuscles.has(label));
-            sw.hidden = !litMuscles.has(label);
+            hl.classList.toggle('active', t.lit.has(label));
+            sw.hidden = !t.lit.has(label);
           }
         });
         row.append(lbl, hl, sw);
@@ -1135,10 +1227,14 @@ export function initUI(app) {
   };
   muscleTint.addEventListener('input', syncMuscleTint);
   muscleClearHl.addEventListener('click', () => {
-    takeBackMuscleLook();
-    litMuscles.clear();
+    const t = lookTarget();
+    // Focused, "Clear highlights" is a real choice for THAT keyframe — "show no
+    // highlighting here" — and is stored as an empty lit set rather than
+    // wiping the user's running one.
+    if (!t.focused) takeBackMuscleLook();
+    t.lit.clear();
     pushMuscleLook();
-    saveMuscleLook();
+    t.commit();
     renderMuscleList();
   });
 
@@ -1900,7 +1996,8 @@ export function initUI(app) {
     const ready = !!(snaps.A && snaps.B);
     app.setInterpStates(snaps.A, snaps.B);
     interpRow.hidden = !ready;
-    interpPlay.disabled = !ready;
+    setInterpLabel(app.interpT); // the scrubber shows the player's position
+    syncPlayButtons();
     syncRecordButtons();
     syncPath();
   }
@@ -1910,12 +2007,23 @@ export function initUI(app) {
     interpVal.textContent = `${Math.round(t * 100)}%`;
   };
   pushHistoryOnEdit(interpSlider);
+  // Grabbing the scrubber stops the player. Otherwise the two fight for the
+  // same t: the tick drags the thumb out from under the cursor every frame,
+  // and whatever the user lets go on is overwritten on the next. The user's
+  // scrub wins, and playback stays stopped where they put it. `pointerdown` is
+  // the grab itself (a press-and-hold fires no `input` at all); the stop
+  // inside the input handler covers a keyboard or scripted change.
+  interpSlider.addEventListener('pointerdown', () => app.stopInterp());
   interpSlider.addEventListener('input', () => {
+    app.stopInterp();
     const t = Number(interpSlider.value) / 1000;
     app.applyInterp(t);
     interpVal.textContent = `${Math.round(t * 100)}%`;
   });
+  // Play ⇄ Stop: while it runs, the only thing you want from this button is to
+  // stop it. Play carries on from the scrubber (app.playInterp).
   interpPlay.addEventListener('click', () => {
+    if (app.stopInterp()) return;
     app.pushHistory();
     app.playInterp(setInterpLabel);
   });
@@ -1991,6 +2099,36 @@ export function initUI(app) {
   // played / recorded as one figure (see app.seqStates). Persisted per
   // session so a half-authored giro survives a reload.
   const SEQ_KEY = 'tangoPoseStudio.sequence.v1';
+  // WHERE the two on-screen texts sit — one placement each for the whole
+  // sequence, so a recorded lesson does not make them hop about between
+  // keyframes. Its own key rather than a field inside SEQ_KEY's array: it is
+  // not a keyframe, and a per-keyframe store would have to answer "which one
+  // wins" on every scrub. Restored before the first render, behind the same
+  // `ready` guard the drawings and the Muscles panel use — the studio starts at
+  // its defaults and the restore writes through the very hook that saves, so
+  // without the guard the first sync overwrites the stored placement with null.
+  const SEQ_TEXT_KEY = 'tangoPoseStudio.seqText.v1';
+  let seqTextReady = false;
+  // The running chain, serialized — written by renderSequence (which builds it
+  // for SEQ_KEY anyway) and read by the library's dirty marker. Declared up
+  // here so nothing can reach it in its temporal dead zone.
+  let seqStatesJson = '[]';
+  const saveSeqText = () => {
+    if (!seqTextReady) return;
+    try { localStorage.setItem(SEQ_TEXT_KEY, JSON.stringify(app.seqTextPositions())); } catch { /* storage full */ }
+  };
+  // Whether transitions ease in and out (app.seqEase). Its own key beside the
+  // keyframes for the same reason `textPos` has one — it is a setting of the
+  // SEQUENCE, not of any keyframe — and behind the same `ready` guard, since
+  // app starts at the fresh default and the restore writes through the very
+  // hook that saves. The guard is opened only after the restore below, or that
+  // first write would store the default over the user's choice.
+  const SEQ_EASE_KEY = 'tangoPoseStudio.seqEase.v1';
+  let seqEaseReady = false;
+  const saveSeqEase = () => {
+    if (!seqEaseReady) return;
+    try { localStorage.setItem(SEQ_EASE_KEY, JSON.stringify(app.seqEase())); } catch { /* storage full */ }
+  };
   const seqList = $('seq-list');
   const seqRow = $('seq-row');
   const seqSlider = $('seq-slider');
@@ -1999,6 +2137,7 @@ export function initUI(app) {
   const seqRecord = $('seq-record');
   const seqClear = $('seq-clear');
   const seqExport = $('seq-export');
+  const seqAddBtn = $('seq-add');
   const interpRecord = $('interp-record');
 
   // Both ⏺ buttons: armed when their chain can play, locked while a capture
@@ -2020,6 +2159,28 @@ export function initUI(app) {
       interpRecord.title = NO_RECORDER_TITLE;
       seqRecord.title = NO_RECORDER_TITLE;
     }
+    syncPlayButtons(); // a capture locks Play too — it owns the player
+  }
+
+  // Both Play buttons are PLAY ⇄ STOP toggles. A playback that can only run to
+  // the end is the bug this fixes, and a button that goes on reading "▶ Play"
+  // while the dancers move says the tool has no idea what it is doing — so the
+  // label is derived from the flag, in one place, and every path that clears
+  // that flag reports here through app.ui.onPlaybackChanged (see clearPlaying
+  // in main.js). Disabled while a video capture runs: the recorder owns the
+  // player for its whole length, and a Play press would only fight the capture.
+  function syncPlayButtons() {
+    const busy = !!app.recording;
+    seqPlay.textContent = app.seqPlaying ? '■ Stop' : '▶ Play';
+    seqPlay.title = app.seqPlaying
+      ? 'Stop here — the dancers hold this pose and Play carries on from it'
+      : 'Animate the couple through every keyframe';
+    seqPlay.disabled = busy || app.seqStates.length < 2;
+    interpPlay.textContent = app.interpPlaying ? '■ Stop' : '▶ Play A→B';
+    interpPlay.title = app.interpPlaying
+      ? 'Stop here — the dancers hold this pose and Play carries on from it'
+      : 'Animate the couple from pose A to pose B';
+    interpPlay.disabled = busy || !(snaps.A && snaps.B);
   }
 
   const setSeqLabel = (t) => {
@@ -2027,20 +2188,94 @@ export function initUI(app) {
     seqVal.textContent = `${Math.round(t * 100)}%`;
   };
   pushHistoryOnEdit(seqSlider);
+  // The grab stops the player — see the A→B scrubber above for why.
+  seqSlider.addEventListener('pointerdown', () => app.stopSeq());
   seqSlider.addEventListener('input', () => {
+    app.stopSeq();
     const t = Number(seqSlider.value) / 1000;
     app.applySeqT(t);
     seqVal.textContent = `${Math.round(t * 100)}%`;
   });
   seqPlay.addEventListener('click', () => {
+    if (app.stopSeq()) return; // it was playing: this press is the Stop
     app.pushHistory();
     app.playSeq(setSeqLabel);
   });
   seqRecord.addEventListener('click', () => {
     app.pushHistory();
-    app.recordPlayback(app.seqStates, 'tangle-sequence');
+    // The recording plays what the scrubber plays: the flag is resolved HERE,
+    // by the caller that knows this chain is the sequence (see recordPlayback).
+    app.recordPlayback(app.seqStates, 'tangle-sequence', { ease: app.seqEase() });
   });
-  $('seq-add').addEventListener('click', () => app.seqAdd());
+  seqAddBtn.addEventListener('click', () => app.seqAdd());
+
+  // ---- which keyframe is CURRENT ---------------------------------------
+  // The one the timeline is standing on (app.seqShownIndex): what "+ Add
+  // keyframe" inserts after, and — because it is otherwise invisible — a
+  // subtle marker on its own row. An accent edge and an accent index, not a
+  // fill: this row is where you ARE, not a selection, and a loud one in a list
+  // of three-line blocks reads as an error state.
+  //
+  // The class is TOGGLED and the list is deliberately NOT re-rendered.
+  // renderSequence rebuilds every row from scratch, and this follows a playing
+  // sequence — sixty rebuilds a second would tear the caret out of a caption
+  // being typed and make the panel unusable while anything plays. `marked` is
+  // the cheap guard on top of that: main.js only calls in when the keyframe
+  // actually changes, and this only touches the DOM when the INDEX does (a
+  // reorder can move the same keyframe to a new row, which is a re-render and
+  // arrives through the `force` path below).
+  let seqMarked = -1;
+  function markSeqCurrent(force = false) {
+    const i = app.seqShownIndex();
+    if (!force && i === seqMarked) return;
+    seqMarked = i;
+    seqList.querySelectorAll('.seq-block').forEach((b, j) => {
+      b.classList.toggle('seq-current', j === i);
+    });
+    // The button says where it will put one, because "after the current
+    // keyframe" is a rule the user cannot see the input to otherwise.
+    seqAddBtn.title = i >= 0
+      ? `Insert the current couple pose as a keyframe after keyframe ${i + 1}`
+      : 'Append the current couple pose as a keyframe';
+  }
+
+  // Ease in/out. The checkbox is the only writer of the setting in the UI, and
+  // syncSeqEase the only reader, so a restore / an import / a script setting it
+  // shows up in the box rather than leaving it lying about the playback.
+  const seqEase = $('seq-ease');
+  function syncSeqEase() {
+    seqEase.checked = app.seqEase();
+  }
+  seqEase.addEventListener('change', () => {
+    // No pushHistory: the undo stack holds couple POSES, and this changes none
+    // — it changes when the timeline shows them. setSeqEase re-poses at the
+    // scrubber's own t, so a toggle mid-scrub is visible at once.
+    app.setSeqEase(seqEase.checked);
+  });
+
+  // The two ⟲s. Each is shown only once its text has actually been dragged
+  // somewhere — a reset for a placement nobody has changed is a control that
+  // can do nothing, and the row would then be permanent furniture. The gesture
+  // that MOVES a text is the drag in the 3D view; this is only the way back.
+  const seqTextRow = $('seq-text-row');
+  const seqNameReset = $('seq-name-reset');
+  const seqCaptionReset = $('seq-caption-reset');
+  function syncSeqTextRow() {
+    const name = !!app.seqTextPos('name');
+    const caption = !!app.seqTextPos('caption');
+    seqNameReset.hidden = !name;
+    seqCaptionReset.hidden = !caption;
+    seqTextRow.hidden = !(name || caption);
+  }
+  seqNameReset.addEventListener('click', () => {
+    app.setSeqTextPos('name', null);
+    app.status('The keyframe name is back in the top-left corner.', 'info');
+  });
+  seqCaptionReset.addEventListener('click', () => {
+    app.setSeqTextPos('caption', null);
+    app.status('The caption is back along the foot of the frame.', 'info');
+  });
+
   // Clearing destroys every keyframe AND the localStorage copy in one click,
   // and the undo stack holds couple poses only, so nothing can bring them back.
   // Ask — but only when there is something to lose.
@@ -2053,6 +2288,30 @@ export function initUI(app) {
     app.clearKeyframeExtras();
     if (n) app.status(`Deleted ${n} keyframe${n === 1 ? '' : 's'}.`, 'info');
   });
+
+  // ---- the edit focus banner -------------------------------------------
+  // The DURABLE indicator. app.status says it once and clears after ~3 s, and a
+  // focus session lasts as long as the user spends drawing, so the mode needs
+  // something that stays on screen: this banner, the row's pressed ✎, and the
+  // one-liners in the Muscles panel and the Draw toolbar. Three places because
+  // the user is in three places while it is on.
+  const seqFocusNote = $('seq-focus-note');
+  const muscleFocusNote = $('muscle-focus-note');
+  $('seq-focus-end').addEventListener('click', () => app.seqFocus(null));
+  function syncSeqFocus() {
+    const i = app.seqFocusIndex?.() ?? -1;
+    seqFocusNote.hidden = i < 0;
+    muscleFocusNote.hidden = i < 0;
+    if (i >= 0) {
+      $('seq-focus-which').textContent = app.seqName(i);
+      $('muscle-focus-which').textContent = app.seqName(i);
+    }
+    // While focused the panel's chips belong to the keyframe, so its own
+    // "a keyframe is showing its highlighting" note would be a second, weaker
+    // way of saying the same thing.
+    if (i >= 0) muscleKfNote.hidden = true;
+    syncDrawButtons();
+  }
 
   // ---- keyframe reordering --------------------------------------------
   // A row is dragged with POINTER events, not HTML5 drag-and-drop. The row
@@ -2161,6 +2420,7 @@ export function initUI(app) {
         b.disabled = disabled;
         b.addEventListener('click', fn);
         row.appendChild(b);
+        return b;
       };
       // The user's own word for this keyframe ("cross", "pivot out"). Left
       // blank the placeholder still names it by number, so no row is anonymous.
@@ -2193,53 +2453,37 @@ export function initUI(app) {
       label.addEventListener('change', commitName);
       label.addEventListener('blur', commitName);
       row.appendChild(label);
-      btn('Show', 'Jump the couple to this keyframe', () => app.seqApply(i));
+      btn('Show', 'Jump the couple to this keyframe (and the scrubber with it)', () => app.seqApply(i));
       btn('⟳', 'Overwrite this keyframe with the current pose', () => app.seqUpdate(i));
-      // Which floor drawings this keyframe shows. UNTAGGED (◻) means all of
-      // them, which is what every keyframe authored before this carries and
-      // why the control is inert until someone presses it. Tagging CAPTURES
-      // what is on screen rather than offering a list of every drawing: the
-      // teacher has just arranged the diagram they want (Draw mode's ◐ Hide),
-      // and a checklist of fifteen chalk marks named "Line 7" identifies
-      // nothing. Pressing it again on a tagged row clears back to all.
-      const tagged = app.seqDrawIds(i);
-      const nDraw = app.drawings.length;
-      btn(tagged ? '◼' : '◻',
-        tagged
-          ? `Showing ${tagged.length} of ${nDraw} drawings on this keyframe — click to show all again`
-          : 'Show only the drawings currently on screen when this keyframe plays',
-        () => {
-          if (tagged) {
-            app.seqSetDrawIds(i, null);
-            app.status(`Keyframe ${i + 1} shows all drawings.`, 'info');
-            return;
-          }
-          const ids = app.drawShownIds;
-          app.seqSetDrawIds(i, ids);
-          app.status(`Keyframe ${i + 1} shows ${ids.length} of ${nDraw} drawing${nDraw === 1 ? '' : 's'}.`, 'info');
-        },
-        nDraw === 0);
-      // How long this keyframe takes to reach the next one. The last keyframe
-      // has nothing to travel to, so its box is disabled rather than hidden —
-      // the column stays aligned and the reason is in the tooltip. The unit
-      // lives in that tooltip rather than in an "s" beside the field: the row
-      // now carries a label too, and a one-character span was the cheapest
-      // thing in it to give up.
-      const dur = document.createElement('input');
-      dur.type = 'number';
-      dur.className = 'seq-dur';
-      dur.dataset.field = 'dur';
-      dur.min = '0.2';
-      dur.max = '30';
-      dur.step = '0.1';
-      dur.value = String(app.seqDuration(i));
-      dur.disabled = i === n - 1;
-      dur.title = i === n - 1
-        ? 'The last keyframe ends the movement — nothing follows it to travel to.'
-        : `Seconds from keyframe ${i + 1} to ${i + 2}`;
-      dur.addEventListener('change', () => app.seqSetDuration(i, parseFloat(dur.value)));
-      row.appendChild(dur);
+      // A sequence is mostly the same pose slightly changed — a walk is four
+      // near-identical steps — so the fastest way to author the next keyframe
+      // is to copy this one and adjust it, not to re-pose the couple from
+      // whatever they happen to be doing. The copy lands directly after its
+      // source and carries everything: pose, timing, name, caption, tags.
+      btn('⧉', `Duplicate this keyframe — the copy becomes keyframe ${i + 2}`,
+        () => app.seqDuplicate(i));
+      // ✎ EDIT ONLY THIS KEYFRAME. The row is the only place this mode can
+      // live — it is per keyframe, and the timeline is where a keyframe is
+      // identified. It is a TOGGLE, and the pressed state is on the row (plus
+      // the banner above the list), because the session lasts as long as the
+      // user is drawing and app.status clears after three seconds.
+      const focused = app.seqFocusIndex() === i;
+      const ed = document.createElement('button');
+      // Its own class, not the extras line's `.seq-kf-btn`: that selector is
+      // how the sequence gates find the ONE tag button per row, and a second
+      // button wearing it would shift every index they read.
+      ed.className = 'seq-focus-btn';
+      ed.textContent = '✎';
+      ed.dataset.index = String(i);
+      ed.setAttribute('aria-pressed', focused ? 'true' : 'false');
+      ed.classList.toggle('active', focused);
+      ed.title = focused
+        ? 'Stop editing this keyframe on its own (Esc)'
+        : 'Edit ONLY this keyframe — drawings you make and muscles you light belong to it alone';
+      ed.addEventListener('click', () => app.seqFocus(focused ? null : i));
+      row.appendChild(ed);
       btn('✕', 'Delete this keyframe', () => app.seqDelete(i));
+      if (focused) row.classList.add('seq-focus');
       // A press on the row body arms the drag; a press on a control never
       // does, or the label could not be typed in nor a button pressed.
       row.addEventListener('pointerdown', (e) => {
@@ -2259,10 +2503,65 @@ export function initUI(app) {
       });
       block.appendChild(row);
 
+      // ---- the keyframe's TIMING: two numbers, on a line of their own ----
+      // A movement is not only travel — a teacher wants the couple to ARRIVE
+      // and then be looked at — so a keyframe says how long it takes to get
+      // into its pose and how long it stays there. Both live on their own line
+      // rather than in the row: the row is already index + label + four buttons
+      // inside a 320 px sidebar, and a second number box there would have left
+      // each of them too narrow to read "2.4" in (which is the bug the single
+      // box's width was widened to fix). Down here each one has room for its
+      // own word and its unit, which is what makes two numbers on one line
+      // tellable apart at a glance.
+      const timing = document.createElement('div');
+      timing.className = 'seq-time';
+      const timeBox = (field, word, value, disabled, title) => {
+        const lab = document.createElement('span');
+        lab.className = 'seq-time-lab';
+        lab.textContent = word;
+        lab.title = title;
+        const box = document.createElement('input');
+        box.type = 'number';
+        box.className = `seq-num seq-${field}`;
+        box.dataset.field = field;
+        box.min = String(field === 'move' ? app.seqTravelMin : app.seqHoldMin);
+        box.max = String(app.seqSecondsMax);
+        box.step = '0.1';
+        box.value = String(value);
+        box.disabled = disabled;
+        box.title = title;
+        const unit = document.createElement('span');
+        unit.className = 'seq-time-unit';
+        unit.textContent = 's';
+        unit.title = title;
+        timing.append(lab, box, unit);
+        return box;
+      };
+      // The FIRST keyframe has nothing before it to travel from, so its move
+      // box is disabled rather than hidden — the two columns stay aligned down
+      // the list, and the reason is in the tooltip (the same choice the last
+      // row's duration box used to make, at the other end of the chain).
+      const first = i === 0;
+      const mv = timeBox('move', 'into', first ? '' : app.seqTravel(i), first,
+        first
+          ? 'Keyframe 1 starts the movement — there is nothing before it to travel from.'
+          : `Seconds to travel from keyframe ${i} into this one`);
+      mv.addEventListener('change', () => {
+        if (gen !== seqGen) return;
+        app.seqSetTravel(i, parseFloat(mv.value));
+      });
+      const hd = timeBox('hold', 'hold', app.seqHold(i), false,
+        'Seconds to stay in this pose once it is reached — 0 travels straight on');
+      hd.addEventListener('change', () => {
+        if (gen !== seqGen) return;
+        app.seqSetHold(i, parseFloat(hd.value));
+      });
+      block.appendChild(timing);
+
       // ---- the keyframe's own EXTRAS: a caption and a muscle highlight ----
-      // A SECOND LINE rather than two more controls on the row. The row is
-      // already index + label + four buttons + a number box inside a 320 px
-      // sidebar, and a caption is a sentence, not a chip. It is always shown
+      // A LINE OF ITS OWN rather than two more controls on the row. The row is
+      // already index + label + four buttons inside a 320 px sidebar, and a
+      // caption is a sentence, not a chip. It is always shown
       // rather than hidden behind a disclosure because this list has no
       // "selected keyframe" to hang a panel off — and a caption you cannot see
       // while you order the sequence is one you will forget you wrote.
@@ -2286,6 +2585,49 @@ export function initUI(app) {
       cap.addEventListener('change', commitCaption);
       cap.addEventListener('blur', commitCaption);
       extras.appendChild(cap);
+
+      // Which floor drawings this keyframe shows. UNTAGGED (◻) means all of
+      // the PUBLIC ones — every drawing no keyframe owns — which is what every
+      // keyframe authored before this carries and why the control is inert
+      // until someone presses it. Tagging CAPTURES what is on screen rather
+      // than offering a list of every drawing: the teacher has just arranged
+      // the diagram they want (Draw mode's ◐ Hide), and a checklist of fifteen
+      // chalk marks named "Line 7" identifies nothing. Pressing it again on a
+      // tagged row clears back to all.
+      //
+      // It lives HERE, on the extras line beside the muscle tag, rather than on
+      // the controls row: the two are the same kind of thing (what this
+      // keyframe shows, as against what it IS), and the row has to keep room
+      // for ✎ inside a 320 px sidebar. It also gets its word back — "◻" alone
+      // next to Show and ⟳ said nothing about drawings.
+      const tagged = app.seqDrawIds(i);
+      const nDraw = app.drawings.length;
+      const nOwn = app.seqOwnIds(i)?.length ?? 0;
+      const dBtn = document.createElement('button');
+      // Its OWN class, deliberately NOT `.seq-kf-btn`: that selector is how the
+      // keyframe-extras gate finds the one MUSCLE tag per row, and a second
+      // button wearing it shifts every index it reads.
+      dBtn.className = 'seq-draw-btn';
+      dBtn.textContent = tagged ? `◼ ${tagged.length + nOwn}` : '◻ Drawings';
+      dBtn.disabled = nDraw === 0;
+      dBtn.title = tagged
+        ? `Showing ${tagged.length + nOwn} of ${nDraw} drawings on this keyframe — click to show all again`
+        : nOwn
+          ? `${nOwn} drawing${nOwn === 1 ? '' : 's'} belong${nOwn === 1 ? 's' : ''} to this keyframe; the rest of the diagram shows too. Click to show only what is on screen now.`
+          : 'Show only the drawings currently on screen when this keyframe plays';
+      dBtn.addEventListener('click', () => {
+        if (tagged) {
+          app.seqSetDrawIds(i, null);
+          app.status(`Keyframe ${i + 1} shows all drawings.`, 'info');
+          return;
+        }
+        // Capture EXCLUDES what this keyframe owns — those are carried by
+        // kf.own and would be a ghost entry here the day they are released.
+        const ids = app.seqCaptureDrawIds(i);
+        const shown = (ids?.length ?? 0) + nOwn;
+        app.status(`Keyframe ${i + 1} shows ${shown} of ${nDraw} drawing${nDraw === 1 ? '' : 's'}.`, 'info');
+      });
+      extras.appendChild(dBtn);
 
       // The muscle tag — the drawings tag's twin, and CAPTURE for the same
       // reason: the teacher has just lit the bellies they mean in the Muscles
@@ -2315,6 +2657,56 @@ export function initUI(app) {
           : `Keyframe ${i + 1} now shows no muscle highlighting.`, 'info');
       });
       extras.appendChild(mBtn);
+
+      // ---- how THIS keyframe inks its two on-screen texts ----------------
+      // Show/hide and colour are per keyframe (a step you want to call out can
+      // wear its own ink), while WHERE they sit is one setting for the whole
+      // sequence — dragged in the 3D view, reset by the ⟲ row under the list.
+      // A pair appears only once that keyframe HAS the text it styles. A
+      // keyframe with neither — which is every one the moment it is added, and
+      // every one in a sequence that uses none of this — draws the same extras
+      // line it always did, rather than two dead controls per text per row in a
+      // 320 px sidebar.
+      const ink = document.createElement('span');
+      ink.className = 'seq-ink';
+      for (const [which, word] of [
+        ['name', 'Name'],
+        ['caption', 'Caption'],
+      ]) {
+        const has = !!(which === 'name' ? app.seqNameForScreen(i) : app.seqCaption(i));
+        if (!has) continue;
+        const st = app.seqTextStyle(i, which);
+        const eye = document.createElement('button');
+        // Its OWN class, deliberately not the muscle tag's `.seq-kf-btn`: that
+        // selector is how the sequence gates find the one tag button per row,
+        // and a second button wearing it shifts every index they read.
+        eye.className = 'seq-eye';
+        eye.dataset.text = which;
+        // ◉ / ◎ rather than an eye emoji: the app's chrome is plain glyphs
+        // (◻ / ◼ next door), and they stay legible at 11px in any font.
+        eye.textContent = `${st.hidden ? '◎' : '◉'} ${word}`;
+        eye.title = st.hidden
+          ? `${word} hidden on this keyframe — click to show it again`
+          : `Hide the ${word.toLowerCase()} while this keyframe is showing`;
+        eye.addEventListener('click', () => {
+          const now = app.seqSetTextStyle(i, which, { hidden: !st.hidden });
+          app.status(`Keyframe ${i + 1}: ${word.toLowerCase()} ${now.hidden ? 'hidden' : 'shown'}.`, 'info');
+        });
+        ink.appendChild(eye);
+        const sw = document.createElement('input');
+        sw.type = 'color';
+        sw.className = 'seq-ink-sw';
+        sw.dataset.text = which;
+        // No colour of its own = the backdrop's ink, which the swatch cannot
+        // express (a colour input has no "unset"), so it opens on white — the
+        // dark backdrops' own text colour — and picking anything commits.
+        sw.value = st.color || '#f4f6fb';
+        sw.disabled = st.hidden; // nothing on screen to colour
+        sw.title = `Colour of the ${word.toLowerCase()} on this keyframe`;
+        sw.addEventListener('input', () => app.seqSetTextStyle(i, which, { color: sw.value }));
+        ink.appendChild(sw);
+      }
+      if (ink.childElementCount) extras.appendChild(ink);
       block.appendChild(extras);
       seqList.appendChild(block);
     });
@@ -2324,8 +2716,15 @@ export function initUI(app) {
       total.textContent = `Whole movement: ${app.seqSeconds().toFixed(1)} s`;
       seqList.appendChild(total);
     }
+    syncSeqTextRow();
+    // Forced: every row here is a brand-new node with no class on it, and a
+    // reorder can move the current keyframe to a different row without
+    // changing WHICH keyframe it is.
+    markSeqCurrent(true);
+    syncSeqFocus();
     seqRow.hidden = n < 2;
-    seqPlay.disabled = n < 2;
+    setSeqLabel(app.seqT); // the scrubber shows the player's position
+    syncPlayButtons();
     seqClear.disabled = n === 0;
     seqExport.disabled = n < 2;
     if (held && Number.isFinite(held.i)) {
@@ -2336,20 +2735,91 @@ export function initUI(app) {
     }
     syncRecordButtons();
     syncPath();
-    try { localStorage.setItem(SEQ_KEY, JSON.stringify(app.seqStates)); } catch { /* storage full */ }
+    // Two paths change the ease setting without going through setSeqEase — the
+    // fresh default on the first keyframe of an empty timeline, and Clear
+    // putting it back — and both land here. So the box and the stored copy are
+    // brought up to date from the same place the rows are.
+    syncSeqEase();
+    saveSeqEase();
+    // Kept rather than thrown away: the dirty marker compares the timeline
+    // against the library entry it came from part by part, and this is the
+    // expensive part. Every path that changes a keyframe lands here, so the
+    // cached string is always the current chain — which is what stops a drawing
+    // drag (onDrawingsChanged fires per pointermove) re-serializing a 60 kB
+    // chain it did not touch.
+    seqStatesJson = JSON.stringify(app.seqStates);
+    // NOTE (unchanged, deliberately): a full quota swallows this write in
+    // silence. For the RUNNING timeline that is still the lesser evil — it
+    // fires on every keystroke and reorder, so reporting here would turn one
+    // full disk into a message per edit, and the work is still on screen. The
+    // LIBRARY write is the opposite case and does report; see saveSeqLibrary.
+    try { localStorage.setItem(SEQ_KEY, seqStatesJson); } catch { /* storage full */ }
+    syncSeqLibCurrent(); // the timeline moved: the dirty marker may have too
+  }
+
+  // ---- the sequence BUNDLE: one capture, one apply -------------------------
+  // Everything a sequence needs to be replayed, in ONE shape. A file and a
+  // library entry are the same object — the file only wraps it in its `app` /
+  // `type` / `version` envelope — so the two can never drift apart, and a new
+  // per-sequence field is one line here and one line in applySeqBundle.
+  //
+  // The floor diagram travels WITH the sequence because a keyframe may name a
+  // SUBSET of it (kf.draw): keyframes without the drawings their ids point at
+  // cannot be replayed. `textPos` travels for the same reason — the keyframes
+  // carry the words and this carries where they go. Both keys are additive and
+  // the file version stays 1: a file without them is still a valid sequence,
+  // and an older build ignores what it does not know.
+  const deepCopy = (v) => (v === null || v === undefined ? v : JSON.parse(JSON.stringify(v)));
+
+  function captureSeqBundle() {
+    return {
+      // Deep-copied at the boundary, BOTH ways: a bundle handed to the library
+      // must not be the live array (editing the timeline would rewrite the
+      // saved entry under it), and a bundle handed back must not be the stored
+      // one (setSeqStates keeps the array it is given, and normalizeSeqTiming
+      // mutates it in place).
+      states: deepCopy(app.seqStates),
+      drawings: app.drawingsJSON(),
+      textPos: app.seqTextPositions(),
+      // A SETTING of the sequence, not of a keyframe: a figure saved eased and
+      // loaded linear would replay the lesson with a different character.
+      ease: app.seqEase(),
+      // ---- ONE LINE PER new per-sequence setting, mirrored in applySeqBundle.
+    };
+  }
+
+  /**
+   * Put a bundle on the timeline. The ONE way a sequence arrives from outside
+   * the running session — a file, a library entry — so the ordering rules live
+   * here once: the drawings land BEFORE the keyframes (their kf.draw ids name
+   * drawings, which must be on the floor to be pointed at) and the keyframe
+   * extras are handed back AFTER (the caption, the muscle override and the
+   * draw filter on screen belong to the sequence being replaced, and nothing
+   * in the new chain would clear them until it was next scrubbed).
+   * A `drawings` of null means "this bundle carries none" — a legacy file —
+   * and leaves whatever is on the floor alone, rather than wiping it.
+   * @param {{states:Array, drawings?:Array|null, textPos?:object|null}} bundle
+   */
+  function applySeqBundle(bundle) {
+    if (!bundle || !Array.isArray(bundle.states)) return false;
+    // Loading is not a pose edit, but it MOVES the couple, so it takes a
+    // history snapshot exactly as the file import always has.
+    app.pushHistory();
+    if (Array.isArray(bundle.drawings)) app.setDrawings(deepCopy(bundle.drawings));
+    app.setSeqTextPositions(deepCopy(bundle.textPos) ?? null);
+    app.setSeqStates(deepCopy(bundle.states));
+    // ---- ONE LINE PER new per-sequence setting, mirrored in captureSeqBundle.
+    // AFTER the chain, so the setting is never applied to the timeline being
+    // replaced (setSeqEase re-poses at the scrubber's t) — and explicitly even
+    // when false, because setSeqStates leaves the previous sequence's choice
+    // standing for a non-empty chain. Absent means OFF: the bundle predates it.
+    app.setSeqEase(bundle.ease === true);
+    app.clearKeyframeExtras();
+    return true;
   }
 
   seqExport.addEventListener('click', () => {
-    // The floor diagram travels WITH the sequence: a keyframe may name a subset
-    // of it (kf.draw), so a file carrying the keyframes and not the drawings
-    // they point at is a file that cannot be replayed. The key is additive and
-    // the version stays 1 — a file without it is still a valid sequence, and
-    // an older build simply ignores it.
-    const payload = {
-      app: 'tangle', type: 'sequence', version: 1,
-      states: app.seqStates,
-      drawings: app.drawingsJSON(),
-    };
+    const payload = { app: 'tangle', type: 'sequence', version: 1, ...captureSeqBundle() };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -2391,17 +2861,342 @@ export function initUI(app) {
         e.target.value = '';
         return;
       }
-      app.pushHistory();
-      // Drawings first: the keyframes' kf.draw ids name drawings, so the
-      // diagram they point at should be on the floor before they land.
-      if (incoming) app.setDrawings(incoming);
-      app.setSeqStates(states);
+      // A file saved before the texts could be placed carries no `textPos`, and
+      // must import exactly as it always did — which for a placement means the
+      // default, not whatever the last sequence left on screen, since the words
+      // arriving are this file's. `?? null` in the bundle is that rule.
+      // `ease` absent means OFF: a file saved before easing existed was authored
+      // against a linear timeline, and reading its silence as "ease it" would
+      // change a movement whose timing its author had already judged.
+      applySeqBundle({ states, drawings: incoming, textPos: data.textPos ?? null, ease: data.ease === true });
+      // The timeline now holds a figure that is in no library entry — a file
+      // and a saved sequence are different stores, and claiming otherwise
+      // would offer to overwrite an entry this was never taken from.
+      setSeqLibCurrent(null);
       app.status(`Loaded ${bringing.join(' and ')}.`, 'info');
     } catch {
       app.status('Could not read that file as a sequence.', 'error');
     }
     e.target.value = '';
   });
+
+  // ------------------------------------------------- the sequence LIBRARY
+  // Several NAMED figures, so starting a second one no longer means exporting
+  // a file first or losing the first. Modelled on the slide library below:
+  // name → bundle in one key, the running order in its own (a sequence may be
+  // called "order"), a single delete that does not interrupt but offers Undo,
+  // a bulk action that asks only when there is something to lose.
+  const SEQ_LIB_KEY = 'tangoPoseStudio.seqLibrary.v1';
+  const SEQ_LIB_ORDER_KEY = 'tangoPoseStudio.seqLibOrder.v1';
+  // WHICH entry the timeline came from, so a reload still knows what the quick
+  // Save would overwrite and whether there is unsaved work. Only the NAME is
+  // stored: the bundle it is compared against is the library entry itself, and
+  // keeping a second copy of a 60 kB chain here to answer "is it dirty?" would
+  // double the storage a sequence costs for a single boolean.
+  const SEQ_CUR_KEY = 'tangoPoseStudio.seqCurrent.v1';
+
+  const seqLibList = $('seq-lib-list');
+  const seqLibName = $('seq-lib-name');
+  const seqLibCurrentEl = $('seq-lib-current');
+  const seqLibUpdate = $('seq-lib-update');
+  let seqLibCurrent = null; // the entry name the timeline corresponds to, or null
+  // …and that entry's three parts, serialized. Held in memory rather than
+  // re-read per check: the dirty marker is refreshed on every drawing mutation
+  // (which fires per pointermove of a handle drag), and parsing the whole
+  // library there to answer one boolean would make dragging a chalk line pay
+  // for every figure the user has ever saved.
+  let seqLibBase = null;
+
+  function loadSeqLib() {
+    try { return JSON.parse(localStorage.getItem(SEQ_LIB_KEY)) || {}; } catch { return {}; }
+  }
+  // Unlike the running timeline's own write (see renderSequence), a failure
+  // here MUST be reported: this is the one copy of a figure the user asked to
+  // keep, and a Save that silently did nothing is a figure lost at the next
+  // "New". Bundles are big — a dozen keyframes of a couple is tens of kB — so
+  // the quota is a real outcome, not a theoretical one. Non-modal, and it names
+  // the way out (Export file), because that path has no quota at all.
+  function saveSeqLib(lib) {
+    try {
+      localStorage.setItem(SEQ_LIB_KEY, JSON.stringify(lib));
+      return true;
+    } catch {
+      app.status('NOT saved — browser storage is full. Delete a saved sequence, or use Export file instead.', 'error');
+      return false;
+    }
+  }
+  // The running order, kept beside the name→bundle map for the reason the
+  // slide deck's is: an "order" key inside the map would collide with a
+  // sequence actually called "order". Names missing from the list fall in
+  // alphabetically at the end, so nothing a user saved can become unreachable.
+  function loadSeqOrder(lib) {
+    let saved = [];
+    try { saved = JSON.parse(localStorage.getItem(SEQ_LIB_ORDER_KEY)) || []; } catch { saved = []; }
+    const known = new Set(Object.keys(lib));
+    const ordered = saved.filter((n) => known.has(n));
+    const rest = [...known].filter((n) => !ordered.includes(n)).sort();
+    return [...ordered, ...rest];
+  }
+  function saveSeqOrder(names) {
+    try { localStorage.setItem(SEQ_LIB_ORDER_KEY, JSON.stringify(names)); } catch { /* full / private mode */ }
+  }
+
+  // ---- dirty tracking -------------------------------------------------------
+  // "Does the timeline still say what the entry it came from says?" — compared
+  // by CONTENT, not by an edited-since flag, so undoing an edit back to the
+  // saved figure stops claiming there is work to lose. Part by part rather than
+  // one JSON of the whole bundle: the states string is already built by
+  // renderSequence for SEQ_KEY, and this runs on every drawing mutation.
+  const seqPartsOf = (bundle) => [
+    JSON.stringify(bundle?.states ?? []),
+    JSON.stringify(bundle?.drawings ?? []),
+    JSON.stringify(bundle?.textPos ?? null),
+    // An entry saved before easing existed has no key and played linear.
+    String(bundle?.ease === true),
+  ];
+  const seqLiveParts = () => [
+    seqStatesJson,
+    JSON.stringify(app.drawingsJSON()),
+    JSON.stringify(app.seqTextPositions()),
+    String(app.seqEase()),
+  ];
+
+  function seqLibDirty() {
+    // No entry to compare against: unsaved work is simply "there are
+    // keyframes". Drawings alone do not count — the floor is its own saved
+    // thing, and the Draw toolbar owns it.
+    if (!seqLibBase) return app.seqStates.length > 0;
+    return seqLiveParts().some((s, i) => s !== seqLibBase[i]);
+  }
+
+  // Point the timeline at an entry (or at none) and remember it across reloads.
+  function setSeqLibCurrent(name) {
+    seqLibCurrent = name || null;
+    seqLibBase = seqLibCurrent ? seqPartsOf(loadSeqLib()[seqLibCurrent]) : null;
+    try {
+      if (seqLibCurrent) localStorage.setItem(SEQ_CUR_KEY, JSON.stringify(seqLibCurrent));
+      else localStorage.removeItem(SEQ_CUR_KEY);
+    } catch { /* full / private mode: the link is a convenience, not the work */ }
+    renderSeqLibrary();
+  }
+
+  // The heading line and the quick-Save button: which entry the timeline is,
+  // and whether it still matches. Split from the list below because it is what
+  // changes on every keyframe edit, drawing tweak and text drag, while the LIST
+  // only changes when the library itself does — and rebuilding it there would
+  // parse the whole store on each pointermove of a drawing handle.
+  function syncSeqLibCurrent() {
+    if (!seqLibCurrentEl) return;
+    const dirty = seqLibDirty();
+    seqLibCurrentEl.textContent = seqLibCurrent
+      ? `${seqLibCurrent}${dirty ? ' •' : ''}`
+      : (dirty ? 'unsaved •' : '');
+    seqLibCurrentEl.title = seqLibCurrent
+      ? (dirty
+        ? `The timeline has changes that are not in the saved sequence “${seqLibCurrent}”`
+        : `The timeline matches the saved sequence “${seqLibCurrent}”`)
+      : (dirty ? 'This timeline has never been saved' : '');
+    seqLibCurrentEl.className = dirty ? 'muted seq-dirty' : 'muted';
+    seqLibUpdate.disabled = !seqLibCurrent;
+    seqLibUpdate.textContent = seqLibCurrent ? `Save “${seqLibCurrent}”` : 'Save';
+  }
+
+  function renderSeqLibrary() {
+    if (!seqLibList) return;
+    const lib = loadSeqLib();
+    const names = loadSeqOrder(lib);
+    // An entry deleted from under the timeline leaves it corresponding to
+    // nothing rather than to a ghost the quick Save would re-create.
+    if (seqLibCurrent && !lib[seqLibCurrent]) { seqLibCurrent = null; seqLibBase = null; }
+    syncSeqLibCurrent();
+
+    seqLibList.innerHTML = names.length ? ''
+      : '<span class="muted">No sequences saved yet.</span>';
+    names.forEach((name, i) => {
+      const row = document.createElement('div');
+      row.className = `pose-item${name === seqLibCurrent ? ' current' : ''}`;
+      // textContent, never innerHTML: a name is free text, and one can arrive
+      // from a hand-edited storage key.
+      const nameEl = document.createElement('span');
+      nameEl.className = 'name';
+      nameEl.textContent = name;
+      nameEl.title = `${lib[name]?.states?.length ?? 0} keyframes · ${lib[name]?.drawings?.length ?? 0} floor drawings`;
+
+      const load = document.createElement('button');
+      load.textContent = 'Load';
+      load.title = 'Put this sequence on the timeline, with its drawings and text placement';
+      // The confirm lives HERE and never inside app.seqLibLoad: the headless
+      // scripts drive the scripted path directly, and a dialog in there would
+      // hang every run (the behavioural rule in CLAUDE.md).
+      load.addEventListener('click', () => {
+        if (!confirmLosingTimeline(`Load “${name}”`)) return;
+        app.seqLibLoad(name);
+      });
+
+      const move = (delta) => {
+        const l = loadSeqLib();
+        const order = loadSeqOrder(l);
+        const at = order.indexOf(name);
+        const to = at + delta;
+        if (at < 0 || to < 0 || to >= order.length) return;
+        order.splice(to, 0, ...order.splice(at, 1));
+        saveSeqOrder(order);
+        renderSeqLibrary();
+      };
+      const up = document.createElement('button');
+      up.append(Object.assign(document.createElement('span'), { textContent: '↑', ariaHidden: 'true' }));
+      up.setAttribute('aria-label', `Move “${name}” earlier in the list`);
+      up.title = 'Move this sequence up';
+      up.disabled = i === 0;
+      up.addEventListener('click', () => move(-1));
+      const down = document.createElement('button');
+      down.append(Object.assign(document.createElement('span'), { textContent: '↓', ariaHidden: 'true' }));
+      down.setAttribute('aria-label', `Move “${name}” later in the list`);
+      down.title = 'Move this sequence down';
+      down.disabled = i === names.length - 1;
+      down.addEventListener('click', () => move(1));
+
+      const del = document.createElement('button');
+      del.append(Object.assign(document.createElement('span'), { textContent: '✕', ariaHidden: 'true' }));
+      del.setAttribute('aria-label', `Delete the saved sequence “${name}”`);
+      del.title = 'Delete this saved sequence';
+      // A SINGLE delete does not interrupt — a dialog per row is worse than the
+      // loss it prevents — so it deletes and offers the way back on the status
+      // line, exactly as the slide library's ✕ does. The undo stack holds
+      // couple poses only and could never recover this.
+      del.addEventListener('click', () => {
+        const order = loadSeqOrder(loadSeqLib());
+        const wasCurrent = seqLibCurrent === name;
+        const removed = app.seqLibDelete(name);
+        if (!removed) return;
+        app.status(`Deleted the sequence “${name}”.`, 'info', {
+          label: 'Undo',
+          run: () => {
+            const l = loadSeqLib();
+            l[name] = removed;
+            if (saveSeqLib(l)) saveSeqOrder(order);
+            if (wasCurrent) setSeqLibCurrent(name);
+            else renderSeqLibrary();
+          },
+        });
+      });
+      row.append(nameEl, load, up, down, del);
+      seqLibList.appendChild(row);
+    });
+  }
+
+  // The one question the library ever asks before REPLACING the timeline: Load
+  // and New both risk the same thing, and both are silent when there is
+  // nothing to lose (an untouched sequence loading another must not nag).
+  function confirmLosingTimeline(what) {
+    if (!seqLibDirty()) return true;
+    const n = app.seqStates.length;
+    const which = seqLibCurrent
+      ? `the unsaved changes to “${seqLibCurrent}”`
+      : `${n} unsaved keyframe${n === 1 ? '' : 's'}`;
+    return window.confirm(`${what} and lose ${which}?`);
+  }
+
+  // ---- the scripted API ----------------------------------------------------
+  // On `app`, like the slide deck's slideNames/showSlide, so the headless
+  // scripts and a future presenter can drive the library without the panel.
+  // None of these opens a dialog: the questions belong to the click handlers.
+  app.seqBundle = captureSeqBundle;
+  app.setSeqBundle = applySeqBundle;
+  app.seqLibNames = () => loadSeqOrder(loadSeqLib());
+  app.seqLibEntry = (name) => deepCopy(loadSeqLib()[name] ?? null);
+  app.seqLibCurrent = () => ({ name: seqLibCurrent, dirty: seqLibDirty() });
+
+  app.seqLibSave = (name) => {
+    const key = String(name ?? '').trim();
+    if (!key) return false;
+    const lib = loadSeqLib();
+    const order = loadSeqOrder(lib);
+    const isNew = !lib[key];
+    lib[key] = captureSeqBundle();
+    // The order is written only once the bundle itself is safely stored — an
+    // entry in the running order that is not in the map is a name with nothing
+    // behind it.
+    if (!saveSeqLib(lib)) return false;
+    if (isNew) saveSeqOrder([...order, key]);
+    setSeqLibCurrent(key); // this is now the entry the timeline corresponds to
+    return true;
+  };
+
+  app.seqLibLoad = (name) => {
+    const bundle = loadSeqLib()[name];
+    // A hand-edited store can hold a row that is not a bundle. It costs that
+    // row, not the session — and the timeline goes on corresponding to
+    // whatever it did before, since nothing was replaced.
+    if (!applySeqBundle(bundle)) return false;
+    setSeqLibCurrent(name);
+    return true;
+  };
+
+  // Returns the removed bundle (so the caller can offer it back), or null.
+  app.seqLibDelete = (name) => {
+    const lib = loadSeqLib();
+    const removed = lib[name];
+    if (!removed) return null;
+    delete lib[name];
+    if (!saveSeqLib(lib)) return null;
+    saveSeqOrder(loadSeqOrder(loadSeqLib()).filter((n) => n !== name));
+    if (seqLibCurrent === name) setSeqLibCurrent(null);
+    else renderSeqLibrary();
+    return removed;
+  };
+
+  // Empty the timeline for a fresh figure. It replaces nothing in the library,
+  // and leaves the FLOOR alone: the diagram is its own saved thing with its own
+  // Clear, and wiping a teacher's chalk because they started a new figure over
+  // it would be a surprise no message could excuse.
+  app.seqLibNew = () => {
+    app.setSeqStates([]);
+    app.clearKeyframeExtras();
+    setSeqLibCurrent(null);
+  };
+
+  // ---- the panel's own controls --------------------------------------------
+  $('seq-lib-save').addEventListener('click', () => {
+    const name = seqLibName.value.trim() || `Sequence ${new Date().toLocaleString()}`;
+    // Saving over an existing name DESTROYS that entry, and the undo stack
+    // holds couple poses only — so this one asks, while the quick Save below
+    // does not (overwriting the entry you are working in IS the intent there).
+    if (loadSeqLib()[name]
+      && !window.confirm(`Replace the saved sequence “${name}” with the current timeline?`)) return;
+    if (!app.seqLibSave(name)) return;
+    seqLibName.value = '';
+    app.status(`Saved the sequence “${name}”.`, 'info');
+  });
+  seqLibUpdate.addEventListener('click', () => {
+    if (!seqLibCurrent) return;
+    const name = seqLibCurrent;
+    if (app.seqLibSave(name)) app.status(`Saved “${name}”.`, 'info');
+  });
+  $('seq-lib-new').addEventListener('click', () => {
+    if (!confirmLosingTimeline('Start a new sequence')) return;
+    const n = app.seqStates.length;
+    app.seqLibNew();
+    if (n) app.status('Empty timeline — the saved sequences and the floor drawings are untouched.', 'info');
+  });
+  // Enter in the name field saves, which is what a field beside a Save button
+  // is for.
+  seqLibName.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); $('seq-lib-save').click(); }
+  });
+
+  // The block's own fold, kept in the sidebar's layout store beside the
+  // sections' — one place the panel's shape is remembered, and the key is
+  // ignored by anything that does not know it.
+  const seqLibBlock = $('seq-lib');
+  const seqLibToggle = seqLibBlock.querySelector('.sub-toggle');
+  const foldSeqLib = (folded, persist = true) => {
+    seqLibBlock.classList.toggle('collapsed', folded);
+    seqLibToggle.setAttribute('aria-expanded', String(!folded));
+    if (persist) saveLayout({ seqLibFolded: folded });
+  };
+  seqLibToggle.addEventListener('click', () => foldSeqLib(!seqLibBlock.classList.contains('collapsed')));
+  foldSeqLib(readLayout().seqLibFolded === true, false);
 
   // Restore the previous session's sequence (before the first render below).
   try {
@@ -2410,7 +3205,40 @@ export function initUI(app) {
       app.setSeqStates(saved);
     }
   } catch { /* corrupted storage: start empty */ }
+  // …and where its two on-screen texts sit. The guard is opened AFTER the
+  // restore, so the write it triggers cannot be the one that lands.
+  try {
+    const savedText = JSON.parse(localStorage.getItem(SEQ_TEXT_KEY));
+    if (savedText) app.setSeqTextPositions(savedText);
+  } catch { /* corrupted storage: keep the defaults */ }
+  seqTextReady = true;
+  // …and whether its transitions ease. THREE cases, not two, and the third is
+  // the compatibility one: a stored flag is the user's own choice and wins; no
+  // stored flag with a restored CHAIN is a session from before easing existed,
+  // which must play exactly as it did, so OFF; no stored flag and no chain is a
+  // fresh start, which keeps app's own fresh default. Opened after, like the
+  // texts, so the write this triggers cannot be the one that lands.
+  try {
+    const savedEase = JSON.parse(localStorage.getItem(SEQ_EASE_KEY));
+    if (typeof savedEase === 'boolean') app.setSeqEase(savedEase);
+    else if (app.seqStates.length) app.setSeqEase(false);
+  } catch { /* corrupted storage: keep the default */ }
+  seqEaseReady = true;
+  // …and WHICH saved sequence the restored timeline corresponds to. Read
+  // straight into the variable rather than through setSeqLibCurrent: that
+  // writes the key it is restoring (harmless here, but it is the same trap the
+  // `ready` guards above exist for) and renders a list the first renderSequence
+  // is about to render anyway. A name whose entry has since gone is dropped by
+  // renderSeqLibrary.
+  try {
+    const savedCur = JSON.parse(localStorage.getItem(SEQ_CUR_KEY));
+    if (typeof savedCur === 'string' && savedCur && loadSeqLib()[savedCur]) {
+      seqLibCurrent = savedCur;
+      seqLibBase = seqPartsOf(loadSeqLib()[savedCur]);
+    }
+  } catch { /* corrupted storage: the timeline corresponds to nothing */ }
   renderSequence();
+  renderSeqLibrary(); // the list itself; renderSequence only syncs the heading
 
   // ---------------------------------------------------------------- presets
   const presetSelect = $('preset-select');
@@ -2771,14 +3599,60 @@ export function initUI(app) {
     onSequenceChanged() {
       renderSequence();
     },
+    // The timeline moved onto a DIFFERENT keyframe — a Show, a scrub, or a
+    // player crossing into the next one. Only the row marker and the Add
+    // button's aim depend on it, so it is a class toggle and nothing more:
+    // main.js calls this from applyKeyframeExtras, which runs every frame of a
+    // playback, and re-rendering the list there would rebuild every row
+    // (and every field in it) sixty times a second.
+    onShownKeyframeChanged() {
+      markSeqCurrent();
+    },
+    // A keyframe took the edit focus, or gave it up (✎, Esc, Show, a player,
+    // Present, a delete). Everything that says WHICH keyframe is being edited
+    // is rebuilt from one place: the row's pressed ✎ (in the list), the banner
+    // above it, and the notes in the Muscles panel and the Draw toolbar.
+    onSeqFocusChanged() {
+      renderSequence();
+    },
+    // One of the two on-screen texts was dragged to a new spot (or reset, or
+    // restored from a file) — the single save point for that placement.
+    onSeqTextChanged() {
+      saveSeqText();
+      syncSeqTextRow();
+      syncSeqLibCurrent(); // the placement is part of the bundle, so it can dirty it
+    },
+    // The ease setting changed — from the checkbox, an import, the fresh
+    // default, or a script. Deliberately NOT routed through onSequenceChanged:
+    // no keyframe moved, and that hook rebuilds the COG trail (~289 replays of
+    // the whole chain) for a setting that provably cannot move it.
+    onSeqEaseChanged() {
+      saveSeqEase();
+      syncSeqEase();
+      syncSeqLibCurrent(); // the setting is part of the bundle, so it can dirty it
+    },
+    // A second tap on the name or caption block in the 3D view: colour the text
+    // of the keyframe that is showing (app.pickSeqTextColor found it).
+    pickSeqTextColor,
     // A pin was authored, released, or a pending first spot changed.
     onPinsChanged() {
       renderPins();
     },
-    // A video capture started or finished: refresh the ⏺ buttons.
+    // A video capture started or finished: refresh the ⏺ buttons (and the
+    // ▶ ones, which a capture locks).
     onRecordingChanged() {
       syncRecordButtons();
     },
+    // A player started, was stopped, or reached the end of its chain — from
+    // ANY of the paths in main.js's clearPlaying. The button must follow, or
+    // it is left offering to stop something that is not running.
+    onPlaybackChanged() {
+      syncPlayButtons();
+    },
+    // The scrubbers' own label setters, so a Play with no tick of its own (the
+    // Space key, a script) still moves the slider it belongs to.
+    seqScrubTo: setSeqLabel,
+    interpScrubTo: setInterpLabel,
     // A drawing was added, removed, restyled, re-shaped, hidden or cleared —
     // every mutation lands here, which is what makes this the one save point.
     onDrawingsChanged() {
@@ -2786,6 +3660,10 @@ export function initUI(app) {
       saveDrawings();
       const n = app.drawings.length;
       if (n !== lastDrawCount) { lastDrawCount = n; renderSequence(); }
+      // The diagram is part of a saved sequence, so recolouring a line is
+      // unsaved work like any other. renderSequence already ends there when the
+      // COUNT moved, so this is the "same drawings, different look" case.
+      else syncSeqLibCurrent();
     },
     // A drawing was selected or deselected in the 3D view.
     onDrawSelectionChanged() {

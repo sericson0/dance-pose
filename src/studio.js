@@ -34,6 +34,19 @@ function sidebarWidth() {
   return parseFloat(token) || 320;
 }
 
+// How far the topbar hangs down over the canvas, in CSS px. The window frame
+// runs the canvas up BEHIND the topbar, so anything the overlay pins to the
+// frame's top edge by default (the sequence's keyframe name) would be drawn
+// under the toolbar — half hidden, and unreachable by the very drag that is
+// supposed to move it. MEASURED for the same reason sidebarWidth is: Present
+// mode hides the topbar (0, so a recording keeps the tight corner) and the bar
+// wraps to a second row at narrow widths.
+function topbarOverlap(canvas) {
+  const el = document.getElementById('topbar');
+  if (!el || !el.offsetHeight) return 0;
+  return Math.max(0, el.getBoundingClientRect().bottom - canvas.getBoundingClientRect().top);
+}
+
 const DARK = {
   text: '#f4f6fb', sub: '#c3cad8', pill: 'rgba(18,21,28,0.84)', edge: 'rgba(255,255,255,0.16)',
   line: '#f4f6fb', halo: 'rgba(8,10,14,0.8)', arcFill: 'rgba(244,246,251,0.26)',
@@ -86,7 +99,13 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
     titlePos: null,      // dragged title placement: { x, y } FRACTIONS of the frame
     titleBox: null,      // where the title last drew, canvas px (the drag target)
     caption: '',         // the on-screen caption (a sequence keyframe's own words)
+    captionColor: null,  // that keyframe's own ink for it (null = the backdrop's)
+    captionPos: null,    // dragged caption placement, FRACTIONS — one per sequence
     captionBox: null,    // where the caption last drew, canvas px — LIVE pass only
+    seqName: '',         // the current keyframe's own NAME, drawn over the picture
+    seqNameColor: null,  // that keyframe's own ink for it (null = the backdrop's)
+    seqNamePos: null,    // dragged name placement, FRACTIONS — one per sequence
+    seqNameBox: null,    // where the name last drew, canvas px — LIVE pass only
     recorder: null,
     clip: null,          // the active movement clip (see enterClip)
     onClipTick: null,    // UI callback: (progress 0..1, angleDeg)
@@ -159,20 +178,25 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
   // A line of the teacher's own words over the picture — today a sequence
   // keyframe's `kf.caption`, set through studio.setCaption.
   //
-  // WHY THE BOTTOM BAND. Every other region of the frame is already spoken
-  // for: the clip title hangs over the top of the shot's own points (and the
-  // user can drag it anywhere, which titleBottom tracks), and the callout
-  // columns run down both margins. The bottom strip is the one band nothing
-  // else claims — and it is where a viewer already expects a subtitle, so the
-  // eye finds it without leaving the dancer. It reserves its own height from
-  // the callout layout (`bottom` below), so a long caption pushes the columns
-  // up instead of being written over by them.
+  // WHY THE BOTTOM BAND *BY DEFAULT*. Every other region of the frame is
+  // already spoken for: the clip title hangs over the top of the shot's own
+  // points (and the user can drag it anywhere, which titleBottom tracks), and
+  // the callout columns run down both margins. The bottom strip is the one band
+  // nothing else claims — and it is where a viewer already expects a subtitle,
+  // so the eye finds it without leaving the dancer. It reserves its own height
+  // from the callout layout (`bottom` below), so a long caption pushes the
+  // columns up instead of being written over by them — but ONLY while it is
+  // still down there, exactly as titleBottom only reserves for a title still in
+  // the top band. A caption dragged up beside the dancer is IN the shot, not
+  // under it, and reserving the foot of the frame for it would waste a strip
+  // the caption has left.
   //
   // Sizes are FRACTIONS of the frame height like every other overlay element,
   // so the live view, a 1080p recording and a 4K photo show the same picture.
   const CAPTION_FONT = 0.034;  // cap height / frame height — under the title's 0.052
   const CAPTION_MAX_W = 0.78;  // the text box's width / frame width
   const CAPTION_LINES = 3;     // more than this is a paragraph, not a caption
+  const CAPTION_BAND = 0.78;   // a caption whose foot is below this h still reserves
 
   // Greedy word wrap. A caption longer than the band is the author's problem,
   // not the audience's: keep what fits and say there was more.
@@ -210,8 +234,11 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
     const bw = Math.min(w * CAPTION_MAX_W,
       Math.max(...lines.map((l) => ctx.measureText(l).width)) + padX * 2);
     const bh = lines.length * lineH + padY * 2;
-    const cx = w / 2;
-    const top = h - h * 0.035 - bh;
+    // The placement the user dragged it to, else the bottom band. Stored as a
+    // fraction of the frame (see blockOrigin), so it survives a resize and
+    // lands in the same spot at 4K.
+    const { cx, top } = blockOrigin(studio.captionPos, w, h, bh,
+      { cx: w / 2, top: h - h * 0.035 - bh });
     ctx.beginPath();
     ctx.roundRect(cx - bw / 2, top, bw, bh, font * 0.42);
     ctx.fillStyle = theme.pill;
@@ -219,31 +246,103 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
     ctx.strokeStyle = theme.edge;
     ctx.lineWidth = Math.max(1, font * 0.05);
     ctx.stroke();
-    ctx.fillStyle = theme.text;
+    // The keyframe's own ink beats the backdrop's, and nothing else: the pill
+    // and its edge stay the theme's, or a picked colour would have to carry a
+    // whole readable palette with it.
+    ctx.fillStyle = studio.captionColor || theme.text;
     lines.forEach((l, i) => ctx.fillText(l, cx, top + padY + lineH * (i + 0.5)));
     // Only the LIVE overlay records the box, the same rule studio.titleBox
     // follows: an export redraws the same block at its own resolution.
     if (ctx === hudCtx) {
       studio.captionBox = { left: cx - bw / 2, top, width: bw, height: bh, lines: lines.length };
     }
-    return h - top + h * 0.012;
+    return top + bh > h * CAPTION_BAND ? h - top + h * 0.012 : 0;
   }
 
-  // The caption is applied from the keyframe being travelled FROM, i.e. several
-  // times a second while a sequence plays, so this has to be free when nothing
-  // changed. Returns whether it actually changed (main.js redraws on true).
-  studio.setCaption = (text) => {
+  // The keyframe's own NAME, drawn over the picture while that keyframe is the
+  // current one ("cross", "the collection"). The caption says a SENTENCE to the
+  // class at the foot of the frame; this names the STEP, so it reads as a
+  // heading and sits, by default, in the frame's top-left corner.
+  //
+  // Why there. The clip title centres itself over the dancer, the callout
+  // columns own the two margins from their first row down, and the caption owns
+  // the foot — the top-left corner is the one place a short heading can sit
+  // without being drawn over, and it is where a viewer reads a chapter mark. It
+  // reserves its height from the callout layout exactly as the title does, and
+  // for the same reason: the columns start below whatever is up there.
+  const NAME_FONT = 0.042;    // between the clip title's 0.052 and the caption's 0.034
+  const NAME_MAX_W = 0.42;    // a heading, not a sentence — the row cap is 40 chars
+  const NAME_BAND = 0.22;     // a name above this h reserves callout room, like the title
+
+  function drawSeqName(ctx, w, h, theme) {
+    const text = studio.seqName;
+    if (!text) {
+      if (ctx === hudCtx) studio.seqNameBox = null;
+      return 0;
+    }
+    const font = h * NAME_FONT;
+    ctx.font = `700 ${font}px "Segoe UI", system-ui, sans-serif`;
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'center';
+    const padX = font * 0.7;
+    const padY = font * 0.34;
+    let shown = text;
+    // One line: a name too wide for its own box is clipped rather than wrapped,
+    // since wrapping a heading turns it into the caption it is not.
+    while (shown.length > 1 && ctx.measureText(shown).width > w * NAME_MAX_W - padX * 2) {
+      shown = `${shown.slice(0, -2)}…`;
+    }
+    const bw = ctx.measureText(shown).width + padX * 2;
+    const bh = font * 1.28 + padY * 2;
+    // The DEFAULT spot clears the topbar where the canvas runs behind it; an
+    // export applies the same clearance (as `right` does for the sidebar), so
+    // the photo shows the name where the live view did. A dragged placement is
+    // the user's own and is left exactly where they put it.
+    const clear = topbarOverlap(gl) * (w / (gl.clientWidth || w));
+    const { cx, top } = blockOrigin(studio.seqNamePos, w, h, bh,
+      { cx: w * 0.035 + bw / 2, top: Math.max(h * 0.035, clear + h * 0.012) });
+    ctx.beginPath();
+    ctx.roundRect(cx - bw / 2, top, bw, bh, font * 0.36);
+    ctx.fillStyle = theme.pill;
+    ctx.fill();
+    ctx.strokeStyle = theme.edge;
+    ctx.lineWidth = Math.max(1, font * 0.05);
+    ctx.stroke();
+    ctx.fillStyle = studio.seqNameColor || theme.text;
+    ctx.fillText(shown, cx, top + bh / 2);
+    if (ctx === hudCtx) studio.seqNameBox = { left: cx - bw / 2, top, width: bw, height: bh };
+    return top < h * NAME_BAND ? top + bh + h * 0.012 : 0;
+  }
+
+  // Both are applied from the keyframe being travelled FROM, i.e. several times
+  // a second while a sequence plays, so these have to be free when nothing
+  // changed. Each returns whether it actually changed (main.js redraws on true).
+  // `color` is the keyframe's own ink, null for the backdrop's — hiding is
+  // simply an empty text, which also makes the block un-grabbable for free.
+  const setText = (key, text, color) => {
     const next = typeof text === 'string' ? text.trim() : '';
-    if (next === studio.caption) return false;
-    studio.caption = next;
+    const ink = typeof color === 'string' && color ? color : null;
+    if (next === studio[key] && ink === studio[`${key}Color`]) return false;
+    studio[key] = next;
+    studio[`${key}Color`] = ink;
     return true;
   };
+  studio.setCaption = (text, color = null) => setText('caption', text, color);
+  studio.setSeqName = (text, color = null) => setText('seqName', text, color);
 
   // ------------------------------------------------------------- the overlay
   function drawOverlay(ctx, w, h) {
     ctx.clearRect(0, 0, w, h);
     const theme = studio.theme;
-    const top = studio.clip ? drawClipOverlay(ctx, w, h, theme) : 0;
+    // A clip that is not running draws no title, and its block must not be left
+    // behind as a phantom the pointer can still grab. Cleared on the LIVE pass
+    // only, since an export redraws every block at its own resolution and the
+    // recorded boxes are the on-screen ones.
+    if (ctx === hudCtx && !studio.clip) studio.titleBox = null;
+    const clipTop = studio.clip ? drawClipOverlay(ctx, w, h, theme) : 0;
+    // The two reserve the same strip, so the columns start below whichever
+    // reaches furthest down.
+    const top = Math.max(clipTop, drawSeqName(ctx, w, h, theme));
     const bottom = drawCaption(ctx, w, h, theme);
     // In the window frame the sidebar covers the canvas's right edge; keep the
     // callouts out from under it (the slide frame already sits beside it).
@@ -837,7 +936,9 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
     studio.saved = null;
     studio.titlePos = null;
     studio.titleBox = null;
-    titleGrab = null;
+    // A grab that was on the title has nothing left to carry. The name and the
+    // caption belong to the sequence, not to the stage, so they are untouched.
+    if (studio.blockDragging()) studio.endBlockDrag();
     labels.clear({ temp: true });
     labels.unfreeze();
     labels.boundsPoints = null;
@@ -991,46 +1092,92 @@ export function createStudio({ renderer, scene, camera, orbit, floor, container,
     };
   }
 
-  // ------------------------------------------------------- dragging the title
-  // studio owns the block; main.js owns the pointer events. Coordinates in are
-  // CSS px relative to the canvas; the placement is stored as a FRACTION of the
-  // frame, so it survives a resize and lands in the same spot in a 4K export.
-  let titleGrab = null;
+  // ------------------------------------------------- dragging an overlay block
+  // THREE blocks now answer the same gesture — the clip's title, a keyframe's
+  // NAME and its CAPTION — so the machinery is one thing parameterised by key
+  // rather than the same twenty lines written three times. studio owns the
+  // geometry; main.js owns the pointer events. Coordinates in are CSS px
+  // relative to the canvas; a placement is stored as a FRACTION of the frame,
+  // so it survives a resize and lands in the same spot in a 4K export.
+  //
+  // Each block's `box` is recorded by the LIVE overlay pass only and is null
+  // whenever nothing is drawn there, so "is there a block under the cursor" is
+  // answered by the picture rather than by a separate flag that could disagree
+  // with it — a hidden caption is inert because it drew nothing.
+  const BLOCKS = {
+    title: { box: 'titleBox', pos: 'titlePos' },
+    name: { box: 'seqNameBox', pos: 'seqNamePos' },
+    caption: { box: 'captionBox', pos: 'captionPos' },
+  };
+  // Order matters only where two blocks overlap; last drawn wins, which is the
+  // one the user sees.
+  const BLOCK_ORDER = ['caption', 'name', 'title'];
+  let blockGrab = null;
   const toCanvas = (x, y) => ({
     x: x * (hud.width / (gl.clientWidth || hud.width)),
     y: y * (hud.height / (gl.clientHeight || hud.height)),
   });
 
-  studio.titleHit = (cssX, cssY) => {
-    const b = studio.titleBox;
-    if (!b || !studio.clip?.opts.title) return false;
+  // Where a block draws: the spot the user dragged it to, else its own default.
+  // `pos.x` is the block's CENTRE and `pos.y` its TOP, for every block, which is
+  // what lets one drag routine carry all three.
+  function blockOrigin(pos, w, h, blockH, fallback) {
+    if (!pos) return fallback;
+    const clamp = THREE.MathUtils.clamp;
+    return { cx: pos.x * w, top: clamp(pos.y * h, 0, h - blockH) };
+  }
+
+  // Which block is under the cursor, or null. A block is only grabbable while
+  // it is actually on screen (its box is live).
+  studio.blockHit = (cssX, cssY) => {
     const p = toCanvas(cssX, cssY);
     const pad = hud.height * 0.012;
-    return p.x >= b.left - pad && p.x <= b.left + b.width + pad
-      && p.y >= b.top - pad && p.y <= b.top + b.height + pad;
+    for (const key of BLOCK_ORDER) {
+      const b = studio[BLOCKS[key].box];
+      if (!b) continue;
+      if (p.x >= b.left - pad && p.x <= b.left + b.width + pad
+        && p.y >= b.top - pad && p.y <= b.top + b.height + pad) return key;
+    }
+    return null;
   };
 
-  studio.beginTitleDrag = (cssX, cssY) => {
-    if (!studio.titleHit(cssX, cssY)) return false;
+  studio.beginBlockDrag = (cssX, cssY) => {
+    const key = studio.blockHit(cssX, cssY);
+    if (!key) return null;
     const p = toCanvas(cssX, cssY);
-    const b = studio.titleBox;
-    titleGrab = { dx: p.x - (b.left + b.width / 2), dy: p.y - b.top };
-    return true;
+    const b = studio[BLOCKS[key].box];
+    blockGrab = { key, dx: p.x - (b.left + b.width / 2), dy: p.y - b.top, moved: false };
+    return key;
   };
 
-  studio.dragTitleTo = (cssX, cssY) => {
-    if (!titleGrab) return false;
+  studio.dragBlockTo = (cssX, cssY) => {
+    if (!blockGrab) return false;
     const p = toCanvas(cssX, cssY);
     const clamp = THREE.MathUtils.clamp;
-    studio.titlePos = {
-      x: clamp((p.x - titleGrab.dx) / hud.width, 0.06, 0.94),
-      y: clamp((p.y - titleGrab.dy) / hud.height, 0.01, 0.94),
+    blockGrab.moved = true;
+    studio[BLOCKS[blockGrab.key].pos] = {
+      x: clamp((p.x - blockGrab.dx) / hud.width, 0.06, 0.94),
+      y: clamp((p.y - blockGrab.dy) / hud.height, 0.01, 0.94),
     };
     return true;
   };
 
-  studio.endTitleDrag = () => { titleGrab = null; };
-  studio.titleDragging = () => !!titleGrab;
+  // Returns the block that actually moved, else null — a press that never
+  // travelled is a TAP, which main.js turns into the colour picker.
+  studio.endBlockDrag = () => {
+    const key = blockGrab?.moved ? blockGrab.key : null;
+    blockGrab = null;
+    return key;
+  };
+  studio.blockDragging = () => !!blockGrab;
+  studio.blockPos = (key) => (BLOCKS[key] ? studio[BLOCKS[key].pos] : null);
+  studio.setBlockPos = (key, pos) => {
+    if (!BLOCKS[key]) return null;
+    studio[BLOCKS[key].pos] = pos && Number.isFinite(pos.x) && Number.isFinite(pos.y)
+      ? { x: pos.x, y: pos.y } : null;
+    return studio[BLOCKS[key].pos];
+  };
+
 
   // ---------------------------------------------------- dragging a callout
   // A callout can be moved to the other side of the figure by dragging its

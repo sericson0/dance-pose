@@ -4,11 +4,14 @@
 // either end lerps freely) and the keyboard nudges in the editing modes
 // (selected joint rotation, IK-handle moves, hips crouch with planted feet).
 // Screenshots + console errors + numeric diagnostics.
+// Honours DEV_URL and BROWSER_PATH.
 import puppeteer from 'puppeteer-core';
 
 const outDir = process.argv[2] || '.';
+const DEV_URL = process.env.DEV_URL || 'http://localhost:5173';
 const browser = await puppeteer.launch({
-  executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+  executablePath: process.env.BROWSER_PATH
+    || 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
   headless: 'new',
   args: ['--window-size=1500,950'],
 });
@@ -18,7 +21,7 @@ const logs = [];
 page.on('console', (m) => { if (m.type() === 'error') logs.push(m.text()); });
 page.on('pageerror', (e) => logs.push(`PAGEERROR: ${e.message}`));
 
-await page.goto('http://localhost:5173', { waitUntil: 'networkidle0', timeout: 20000 });
+await page.goto(DEV_URL, { waitUntil: 'networkidle0', timeout: 20000 });
 await new Promise((r) => setTimeout(r, 2000));
 
 const problems = [];

@@ -821,20 +821,42 @@ export class Drawings {
       const n = /^d(\d+)$/.exec(raw?.id ?? '');
       if (n) this.serial = Math.max(this.serial, Number(n[1]));
     }
-    for (const raw of list) {
-      if (!raw || !TYPES.has(raw.type)) continue;
-      // #build reads these without asking; a record missing its own geometry
-      // is not a drawing, and silently skipping it keeps the rest of the file.
-      if ((raw.type === 'line' || raw.type === 'arrow') && !(raw.a && raw.b)) continue;
-      if (raw.type === 'circle' && !(raw.center && Number.isFinite(raw.radius))) continue;
-      // A text needs somewhere to be: its floor point (every text ever saved
-      // has one, and an anchored one keeps it filled in beside the anchor) or,
-      // for a hand-written record, the anchor alone — endWorld tolerates a
-      // missing floor pair, so that one still builds.
-      if (raw.type === 'text' && !((raw.pos || raw.posAt) && typeof raw.text === 'string')) continue;
-      const ann = this.#styled(JSON.parse(JSON.stringify(raw)));
-      this.#commit(this.#build(ann, false), ann, false);
-    }
+    for (const raw of list) this.#restoreOne(raw);
     return this.count;
+  }
+
+  // Put records BACK on the floor without touching the ones already there —
+  // the Undo of a delete, which has to restore exactly the drawings that went
+  // (ids included, so every keyframe still naming them finds them again). The
+  // serial is bumped first for the same reason fromJSON bumps it. Restored
+  // shapes land at the END of the children, which is the undo order ⌫ Last
+  // reads: a drawing brought back is the most recent thing that happened to
+  // the diagram, so that is where it belongs. Returns how many landed.
+  restore(list) {
+    if (!Array.isArray(list)) return 0;
+    for (const raw of list) {
+      const n = /^d(\d+)$/.exec(raw?.id ?? '');
+      if (n) this.serial = Math.max(this.serial, Number(n[1]));
+    }
+    let added = 0;
+    for (const raw of list) if (this.#restoreOne(raw)) added++;
+    return added;
+  }
+
+  // One record → one committed drawing, with the validation both entry points
+  // need. Shared so a restore can never accept a record a load would refuse.
+  #restoreOne(raw) {
+    if (!raw || !TYPES.has(raw.type)) return null;
+    // #build reads these without asking; a record missing its own geometry
+    // is not a drawing, and silently skipping it keeps the rest of the file.
+    if ((raw.type === 'line' || raw.type === 'arrow') && !(raw.a && raw.b)) return null;
+    if (raw.type === 'circle' && !(raw.center && Number.isFinite(raw.radius))) return null;
+    // A text needs somewhere to be: its floor point (every text ever saved
+    // has one, and an anchored one keeps it filled in beside the anchor) or,
+    // for a hand-written record, the anchor alone — endWorld tolerates a
+    // missing floor pair, so that one still builds.
+    if (raw.type === 'text' && !((raw.pos || raw.posAt) && typeof raw.text === 'string')) return null;
+    const ann = this.#styled(JSON.parse(JSON.stringify(raw)));
+    return this.#commit(this.#build(ann, false), ann, false);
   }
 }
